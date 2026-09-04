@@ -1,0 +1,18 @@
+{
+  "name": "browser-control-kit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Tooling to drive the browser you are already using. Monorepo: browser-control (transport + page control) and antd-kit (Ant Design v6 helpers).",
+  "license": "MIT",
+  "engines": { "node": ">=22" },
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "test": "node --test packages/*/test/",
+    "test:unit": "node --test packages/browser-control/test/dom-input.test.mjs",
+    "test:pool": "node --test packages/browser-control/test/pool.test.mjs",
+    "selftest": "node packages/browser-control/selftest.mjs",
+    "hooks:install": "node scripts/install-hooks.mjs",
+    "check": "node scripts/check.mjs"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "browser-control",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Drive the browser the operator is already using: real profile, no launch flags, no approval clicks, works on a background tab.",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./fixtures": "./src/fixtures.mjs",
+    "./pool": "./src/pool.mjs",
+    "./shim": "./src/cdp-shim.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "selftest": "node selftest.mjs",
+    "shim": "node src/cdp-shim.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "1.63.0-alpha-2026-08-31"
+  },
+  "license": "MIT",
+  "files": [
+    "index.mjs",
+    "src",
+    "README.md",
+    "ARCHITECTURE.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

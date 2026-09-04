@@ -1,0 +1,5 @@
+#!/bin/sh
+# Local CI, tier 2: offline checks + the real-browser test suites.
+# Chrome closed or no extension token? The browser tier is skipped with a notice
+# instead of blocking the push.
+exec node "$(git rev-parse --show-toplevel)/scripts/check.mjs"

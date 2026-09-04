@@ -1,0 +1,4 @@
+#!/bin/sh
+# Local CI, tier 1: fast offline checks only — a commit must never depend on a
+# running browser.
+exec node "$(git rev-parse --show-toplevel)/scripts/check.mjs" --offline

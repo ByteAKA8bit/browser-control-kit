@@ -1,0 +1,14 @@
+{
+  "name": "antd-kit",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ant Design v6 interaction helpers (modals, selects, date pickers, toasts) for browser-control pages.",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
