@@ -14,8 +14,9 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test --test-concurrency=1 test/dom-input.test.mjs test/pool.test.mjs",
     "selftest": "node selftest.mjs",
+    "cleanup": "node cleanup.mjs",
     "shim": "node src/cdp-shim.mjs"
   },
   "dependencies": {
@@ -25,6 +26,7 @@
   "files": [
     "index.mjs",
     "src",
+    "cleanup.mjs",
     "README.md",
     "ARCHITECTURE.md"
   ],

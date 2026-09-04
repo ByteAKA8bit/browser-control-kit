@@ -21,8 +21,10 @@ packages/browser-control/   怎么控制浏览器（与应用无关）
   src/pool.mjs                 并行：多标签任务池（含扩展通道的安全约束）
   src/cdp-shim.mjs             仅 cdp 通道需要的 /json/* 发现端点补丁
   test/                        24 个 node:test 用例（跑在真实浏览器上）
+  cleanup.mjs                  收尾清理（只动本工具留下的标签，绝不碰你的页面）
 packages/antd-kit/          怎么操作 Ant Design v6（与业务无关）
 scripts/check.mjs           本地 CI（离线检查 + 真实浏览器测试）
+scripts/crash-repro.mjs     崩溃二分定位（会故意搞崩浏览器，需 BC_CRASH_REPRO=1）
 .githooks/                  pre-commit = 离线检查，pre-push = + 浏览器测试
 examples/                   最小示例
 ```
@@ -40,6 +42,8 @@ mkdir -p ~/.config/browser-control && pbpaste > ~/.config/browser-control/token 
 npm run test:unit        # DOM 输入 16 例
 npm run test:pool        # 并行 8 例
 npm run selftest         # 端到端自检
+npm run cleanup          # 收尾：关掉本工具留下的标签、清掉探测用的站点权限
+                         # （--dry-run 只报告不动手）
 ```
 
 ```js
@@ -72,7 +76,8 @@ const results = await pool.map(items, async (item, tab) => tab.evaluate(/* … *
 | 多标签**并发导航**崩浏览器 | `controlPage` 进程级导航串行化（`BC_PARALLEL_NAV=1` 可解） |
 | 反复创建/关闭标签、多个池累积附着标签 → 扩展断连，浏览器可能直接退出 | 每连接**只允许一个池**；扩展通道**不关闭**标签（留给下次复用）；`BC_MAX_TABS_EXTENSION=3` |
 | 池的标签是浏览器里唯一的标签时，桥一断 Chrome 就退出 | 启动池前要求存在至少一个普通标签 |
-| 每次 `attach()` 都会在你浏览器里留下一个**标签组**（扩展行为） | 一个进程只 attach 一次；文档明示 |
+| 每次 `attach()` 都会在你浏览器里留下一个**标签组**（扩展行为） | 一个进程只 attach 一次；`npm run cleanup` 收尾 |
+| **扩展一次只接受一个客户端**：并发跑两个测试文件时后者连不上、前者被打断 | 测试串行执行（`--test-concurrency=1`） |
 | `setViewport` 会下发 `Emulation.setDeviceMetricsOverride`，把页面锁小、右侧留白 | 默认不生效，需 `BC_VIEWPORT=1` |
 
 ## 本地 CI（git hook，不用 GitHub Actions）

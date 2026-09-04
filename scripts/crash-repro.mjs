@@ -7,7 +7,16 @@
 //
 //   PLAYWRIGHT_MCP_EXTENSION_TOKEN=… node test/crash-repro.mjs [patternName]
 import { execSync } from "node:child_process";
-import { attach } from "../src/attach.mjs";
+import { attach } from "../packages/browser-control/src/attach.mjs";
+
+// This script exists to KILL the browser it attaches to (that is the point: it
+// bisects which chrome.debugger operation takes Chrome down). It lives outside
+// test/ so `node --test` never picks it up, and it refuses to run without an
+// explicit opt-in.
+if (process.env.BC_CRASH_REPRO !== "1") {
+  console.error("refusing to run: this harness deliberately crashes your browser. Re-run with BC_CRASH_REPRO=1");
+  process.exit(2);
+}
 
 const alive = () => {
   try {

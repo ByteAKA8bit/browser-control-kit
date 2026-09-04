@@ -23,6 +23,10 @@ let pool;
 let extension;
 
 before(async () => {
+  // This suite exercises tab creation on purpose, so it opts through the gate
+  // itself (see src/pool.mjs SAFETY GATE). Everything it creates is left open
+  // for reuse; `npm run cleanup` removes them.
+  process.env.BC_ALLOW_TAB_CREATE = "1";
   const attached = await attach();
   browser = attached.browser;
   context = attached.context;

@@ -92,9 +92,13 @@ async function probeCapabilities(context, mode) {
     } catch {}
     await session.detach().catch(() => {});
   }
+  // Probing must not leave state behind: granting a permission to detect the
+  // capability would persist a site setting in the operator's profile, so it is
+  // cleared again immediately.
   try {
-    await context.grantPermissions(["notifications"], { origin: "https://example.com" });
+    await context.grantPermissions(["notifications"], { origin: "https://bc-capability-probe.invalid" });
     capabilities.browserPermissions = true;
+    await context.clearPermissions().catch(() => {});
   } catch {}
   return capabilities;
 }
