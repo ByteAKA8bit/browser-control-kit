@@ -13,6 +13,7 @@ import { createServer } from "node:http";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { ensureShim, probeShim, transportSupport } from "../src/attach.mjs";
 
 /** A stub that answers /json/version like the shim does, on an OS-chosen port. */
@@ -133,7 +134,11 @@ describe("ensureShim after it spawns a child", () => {
   let tmp;
   const spawnedPidFiles = [];
 
-  const requireFlag = (file) => `--require "${path.join(tmp, file)}"`;
+  // NOT `--require <path>`: NODE_OPTIONS treats a backslash inside quotes as an
+  // escape, so a Windows temp path arrives with its separators eaten and the
+  // child dies on MODULE_NOT_FOUND instead of on cue. A file: URL has no
+  // backslashes and percent-encodes spaces, so it needs no quotes at all.
+  const preloadFlag = (file) => `--import ${pathToFileURL(path.join(tmp, file)).href}`;
   /** Kill the child the test asked to stay alive; safe to call twice. */
   const reap = (pidFile) => {
     try {
@@ -146,15 +151,18 @@ describe("ensureShim after it spawns a child", () => {
     // Leaves a receipt, then dies before cdp-shim.mjs can load: proof that the
     // spawn branch ran, without a shim ever existing.
     writeFileSync(
-      path.join(tmp, "die.cjs"),
-      'require("node:fs").writeFileSync(process.env.BCTEST_PIDFILE, String(process.pid));\nprocess.exit(0);\n',
+      path.join(tmp, "die.mjs"),
+      'import { writeFileSync } from "node:fs";\nwriteFileSync(process.env.BCTEST_PIDFILE, String(process.pid));\nprocess.exit(0);\n',
     );
     writeFileSync(
-      path.join(tmp, "linger.cjs"),
-      // Blocks the main thread, so cdp-shim.mjs never runs and no port is bound,
-      // while the process stays visibly alive for ensureShim's deadline.
-      'require("node:fs").writeFileSync(process.env.BCTEST_PIDFILE, String(process.pid));\n' +
-        "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.BCTEST_BLOCK_MS));\n" +
+      path.join(tmp, "linger.mjs"),
+      // Node awaits an --import module before loading the main entry, so this
+      // timer holds cdp-shim.mjs back and no port is ever bound, while the
+      // pending timer keeps the process visibly alive past ensureShim's
+      // deadline. It exits on its own afterwards, so a missed reap cannot leak.
+      'import { writeFileSync } from "node:fs";\n' +
+        "writeFileSync(process.env.BCTEST_PIDFILE, String(process.pid));\n" +
+        "await new Promise((resolve) => setTimeout(resolve, Number(process.env.BCTEST_BLOCK_MS)));\n" +
         "process.exit(0);\n",
     );
   });
@@ -177,7 +185,7 @@ describe("ensureShim after it spawns a child", () => {
     process.env.BC_SHIM_AUTOSTART = "1";
     process.env.BC_SHIM_PROBE_MS = "300";
     process.env.BC_SHIM_START_MS = "5000";
-    process.env.NODE_OPTIONS = requireFlag("die.cjs");
+    process.env.NODE_OPTIONS = preloadFlag("die.mjs");
     const latecomer = new Promise((resolve) => setTimeout(() => resolve(stubShim(port)), 300));
     try {
       const shim = await ensureShim(url);
@@ -196,7 +204,7 @@ describe("ensureShim after it spawns a child", () => {
     process.env.BC_SHIM_AUTOSTART = "1";
     process.env.BC_SHIM_PROBE_MS = "100";
     process.env.BC_SHIM_START_MS = "600";
-    process.env.NODE_OPTIONS = requireFlag("die.cjs");
+    process.env.NODE_OPTIONS = preloadFlag("die.mjs");
     await assert.rejects(
       () => ensureShim(url),
       (err) => {
@@ -218,7 +226,7 @@ describe("ensureShim after it spawns a child", () => {
     process.env.BC_SHIM_AUTOSTART = "1";
     process.env.BC_SHIM_PROBE_MS = "100";
     process.env.BC_SHIM_START_MS = "600";
-    process.env.NODE_OPTIONS = requireFlag("linger.cjs");
+    process.env.NODE_OPTIONS = preloadFlag("linger.mjs");
     try {
       await assert.rejects(
         () => ensureShim(url),
