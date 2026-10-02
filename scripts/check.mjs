@@ -123,17 +123,30 @@ if (!offlineOnly) {
     notes.push(`skipped browser tests (${!chromeUp ? "Chrome not running" : "no extension token"})`);
     console.log(`  – skipped: ${notes[notes.length - 1]}`);
   } else {
+    // A missing local prerequisite must never block a commit — same policy as a
+    // closed Chrome. The extension can be absent from the profile (or the
+    // profile unreadable, which playwright reports as the same error), and that
+    // says nothing about the code under review.
     for (const suite of ["test/dom-input.test.mjs", "test/pool.test.mjs"]) {
       step(suite, () => {
-        const out = execSync(`node --test ${suite}`, {
-          cwd: path.join(ROOT, "packages/browser-control"),
-          env: { ...process.env, BC_ALLOW_TAB_CREATE: "1" },
-          stdio: "pipe",
-        }).toString();
-        const pass = /# pass (\d+)/.exec(out)?.[1] ?? "?";
+        let out;
+        try {
+          out = execSync(`node --test ${suite}`, {
+            cwd: path.join(ROOT, "packages/browser-control"),
+            env: { ...process.env, BC_ALLOW_TAB_CREATE: "1" },
+            stdio: "pipe",
+          }).toString();
+        } catch (err) {
+          out = `${err.stdout ?? ""}${err.stderr ?? ""}`;
+          if (out.includes("Playwright Extension not found")) {
+            notes.push("skipped browser tests (Playwright Extension not installed in this profile)");
+            return "skipped: extension not installed";
+          }
+          throw new Error(/# fail (\d+)/.exec(out)?.[1] ? `${/# fail (\d+)/.exec(out)[1]} failing tests` : "suite did not run");
+        }
         const fail = /# fail (\d+)/.exec(out)?.[1] ?? "?";
         if (fail !== "0") throw new Error(`${fail} failing tests`);
-        return `${pass} passed`;
+        return `${/# pass (\d+)/.exec(out)?.[1] ?? "?"} passed`;
       });
     }
   }
