@@ -151,8 +151,8 @@ first. Rules, each opt-outable and none silent (`BC_TAB_GUARD=0` disables the lo
 blind spot: a tab the extension may not attach to (`chrome://`, Web Store, other
 extensions, `file://` without access) never becomes a Playwright page, so the guard
 cannot see it. `cleanup.mjs` finishes the job out of band: it closes only marked/scratch
-tabs, one at a time with a settle delay, never the last ordinary tab, never the extension
-bridge tab, and clears granted permissions. `--dry-run` reports only.
+tabs, one at a time with a settle delay, never the last tab in the browser, and clears
+granted permissions. `--dry-run` reports only.
 
 ## 6. Crash-derived guards (2026-09-05, Chrome 152 + Playwright Extension, 11 crashes)
 
@@ -166,7 +166,7 @@ internal Chrome `CHECK`, i.e. the browser process dies with the operator's windo
 | Tab creation on extension gated | `src/pool.mjs` | `BC_ALLOW_TAB_CREATE=1` |
 | Extension tab ceiling `MAX_TABS_EXTENSION` | `src/pool.mjs` | `BC_MAX_TABS_EXTENSION` |
 | Only ONE pool per extension connection | `src/pool.mjs` | use `BC_MODE=cdp` |
-| Never close the last ordinary tab (`ordinary.length <= 1`) | `src/tab-guard.mjs`, `cleanup.mjs` | none |
+| Never leave the browser with no tabs (`alive.length <= 1`, counting the relay's tab) | `src/pool.mjs`, `src/tab-guard.mjs`, `cleanup.mjs` | none |
 | Operator's tabs off limits (`protectedPages`) | `src/tab-guard.mjs` | none |
 
 Only navigation is serialised — concurrent `evaluate`, clicks, screenshots and tab

@@ -72,7 +72,7 @@ step("crash guards still in place", () => {
     [page, "serialiseNavigation", "navigation lock"],
     [page, "BC_ALLOW_INIT_SCRIPT", "addInitScript gate"],
     [guard, "protectedPages", "operator's tabs are off limits"],
-    [guard, "ordinary.length <= 1", "never close the last ordinary tab"],
+    [guard, "alive.length <= 1", "never leave the browser with no tabs"],
   ];
   for (const [src, needle, label] of required) if (!src.includes(needle)) throw new Error(`${label} missing (${needle})`);
   return `${required.length} guards`;

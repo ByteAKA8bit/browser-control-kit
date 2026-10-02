@@ -4,7 +4,7 @@
 //   * pool tabs — the extension transport never closes them (tab churn over
 //     chrome.debugger destabilised Chrome 152), so they pile up across runs.
 //     Here they are closed deliberately, one at a time with a settle delay, and
-//     never the last ordinary tab.
+//     never the last tab in the browser.
 //   * scratch tabs — about:blank / example.com pages created by tests.
 //   * site settings — permissions granted for capability probing.
 // It NEVER touches a tab that is not ours (anything with real content stays).
@@ -36,10 +36,12 @@ for (const page of pages) {
     report.kept.push(url.slice(0, 70));
     continue;
   }
-  // Keep at least one ordinary tab: with none left the browser exits.
-  const ordinaryLeft = context.pages().filter((p) => !p.url().startsWith("chrome-extension://")).length;
-  if (ordinaryLeft <= 1) {
-    report.kept.push(`${url.slice(0, 60)} (last ordinary tab)`);
+  // Keep at least one tab: with none left the browser exits. The extension's own
+  // connect.html counts — it is a real tab, and on that transport the operator's
+  // tabs are not even enumerable, so excluding it stranded one tab per run.
+  const tabsLeft = context.pages().filter((p) => !p.isClosed?.()).length;
+  if (tabsLeft <= 1) {
+    report.kept.push(`${url.slice(0, 60)} (last tab in the browser)`);
     continue;
   }
   if (dryRun) {

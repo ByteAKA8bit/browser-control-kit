@@ -138,7 +138,7 @@ await browser.close();   // hands back the tabs we opened, then disconnects
 
 Measured (real Chrome, cdp transport): an agent opening 10 tabs ends with 2 (budget 2, 8 evicted); `window.open` popups are adopted and fall back inside the budget; after 1 s idle all of ours are reaped; the operator's pre-existing tabs are never touched.
 
-Blind spot: tabs the extension cannot attach to (`chrome://`, the Web Store, other extensions' pages, `file://` without file access) never appear in `context.pages()`, so the guard can neither see nor close them.
+Two measured facts about the extension transport that shape all of this (2026-10-02): `context.pages()` lists **only the relay's own tab plus tabs opened during this connection** — the operator's existing tabs are not enumerable, so they are safe but also invisible to `cleanup.mjs`; and the relay opens a `connect.html` tab per `attach()` that nothing used to close. Tabs the extension cannot attach to at all (`chrome://`, the Web Store, other extensions' pages, `file://` without access) never appear either.
 
 ## MCP server
 
@@ -180,8 +180,8 @@ On 2026-09-05, Chrome 152 + the Playwright Extension were crashed or made to qui
 | `page.addInitScript()` over `chrome.debugger` kills the browser process (2/2 reproduced, `EXC_BREAKPOINT` on `CrBrowserMain`) | Refused on the extension transport; `BC_ALLOW_INIT_SCRIPT=1` to override. Pool tabs are marked after navigation with `evaluate` instead |
 | **Concurrent navigation** across tabs crashes the browser | `controlPage` serialises navigation process-wide (`BC_PARALLEL_NAV=1` to opt out) |
 | Churning tabs, or several pools accumulating attached tabs → the extension disconnects and Chrome may quit | **One pool per connection**; size ≤ `BC_MAX_TABS_EXTENSION` (3); create/close is serial with a 400 ms settle |
-| Closing the last ordinary tab takes the bridge down and Chrome exits | A pool refuses to start unless an ordinary (non-`chrome-extension://`) tab exists; that tab is never closed |
-| Every `attach()` leaves a **tab group** behind (extension behaviour) | One `attach()` per process; `npm run cleanup` to tidy up |
+| Leaving the browser with no tabs takes the bridge down and Chrome exits | Closing stops while only one tab is left — counting **every** tab we can see, the relay's own included |
+| Every `attach()` leaves the relay's `connect.html` tab behind (sixteen runs left sixteen tabs) | `browser.close()` closes it too, and the guard reclaims on `beforeExit`/`SIGINT`/`SIGTERM`; `BC_KEEP_BRIDGE_TAB=1` to keep it |
 | **The extension accepts one client at a time**: two test files in parallel means one cannot connect and the other is interrupted | Suites run serially (`--test-concurrency=1`) |
 | `setViewport` issues `Emulation.setDeviceMetricsOverride` and shrinks the operator's page | No-op unless `BC_VIEWPORT=1` |
 

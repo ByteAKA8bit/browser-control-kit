@@ -77,10 +77,15 @@ export class TabPool {
       if (poolsStartedOnExtension > 1) {
         throw new Error("TabPool: only ONE pool per connection is supported on the extension transport (repeated pools accumulate attached tabs until the bridge drops). Reuse the pool, or use BC_MODE=cdp.");
       }
-      // Losing every tab makes Chrome quit; insist on a tab that is not ours.
-      const foreign = this.context.pages().filter((p) => !p.url().startsWith("chrome-extension://"));
-      if (foreign.length === 0) {
-        throw new Error("TabPool: the browser has no ordinary tab open. Open at least one page first — if the pool's tabs are the only ones, Chrome exits when the bridge closes.");
+      // Losing every tab makes Chrome quit, so insist that the browser holds a
+      // tab that is not one of ours. The extension's connect.html counts: it is
+      // a real tab, and on this transport it is usually the only one we can see
+      // — context.pages() does not enumerate the operator's tabs (measured
+      // 2026-10-02). Demanding a visible "ordinary" tab here only taught callers
+      // to create one, and that tab was then leaked on every run.
+      const visible = this.context.pages().filter((p) => !p.isClosed?.());
+      if (visible.length === 0) {
+        throw new Error("TabPool: the browser has no tabs at all. Open a page first — if the pool's tabs are the only ones, Chrome exits when the bridge closes.");
       }
     }
     const claimed = this.reuse ? await this.#claimReusableTabs() : [];
@@ -199,8 +204,14 @@ export class TabPool {
     let closed = 0;
     for (const page of candidates) {
       if (page.isClosed?.()) continue;
-      const ordinary = this.context.pages().filter((p) => !p.isClosed?.() && !p.url().startsWith("chrome-extension://"));
-      if (ordinary.length <= 1) break;
+      // "Never leave the browser with no tabs" — but count EVERY tab we can see,
+      // including the extension's own connect.html, which is a real tab holding
+      // Chrome open. Counting only non-extension tabs leaked one tab per run on
+      // the extension transport, where context.pages() shows nothing but our own
+      // tabs plus the bridge (measured 2026-10-02: the operator's tabs are not
+      // enumerable there, so "the last ordinary tab" was always one of ours).
+      const alive = this.context.pages().filter((p) => !p.isClosed?.());
+      if (alive.length <= 1) break;
       await page.close().catch(() => {});
       await sleep(TAB_SETTLE_MS);
       closed += 1;

@@ -18,8 +18,8 @@
 //     working tab is never evicted or reaped out from under it.
 //
 // Constraints inherited from src/pool.mjs (learned by killing Chrome 152):
-// closing is serialised with a settle delay, and the last ordinary tab is never
-// closed because the browser then exits and takes the extension bridge with it.
+// closing is serialised with a settle delay, and the browser is never left with
+// no tabs at all, because then it exits and takes the extension bridge with it.
 //
 // Known blind spot on the extension transport: a tab the extension may not
 // attach to (chrome:// WebUI, the Web Store, another extension's page, file://
@@ -61,6 +61,12 @@ export class TabGuard {
     this.settleMs = settleMs;
     /** Pages that existed before we attached: the operator's, off limits. */
     this.protectedPages = new Set(context.pages());
+    /**
+     * The relay's own tabs, remembered BY IDENTITY: a caller that navigates one
+     * away (the dom-input suite used to grab `pages()[0]`) would otherwise hide
+     * it from a URL match, and it leaked one tab per run.
+     */
+    this.bridgePages = new Set(context.pages().filter((p) => p.url().startsWith("chrome-extension://")));
     /** page -> { origin, bornAt, lastUsed, holds } */
     this.owned = new Map();
     this.stats = { created: 0, spawned: 0, evicted: 0, reaped: 0, refused: 0, closed: 0, overflow: 0 };
@@ -73,6 +79,23 @@ export class TabGuard {
       this._timer = setInterval(() => void this.reap(), REAP_EVERY_MS);
       this._timer.unref?.(); // never keep the process alive just to reap
     }
+    // Last line of defence. A caller that forgets browser.close(), a test that
+    // throws, a Ctrl-C — none of them may leave tabs in the operator's browser,
+    // and sixteen leaked bridge tabs say politeness is not a strategy.
+    this._reclaim = async () => {
+      if (this._reclaiming) return;
+      this._reclaiming = true;
+      await this.closeOwned().catch(() => {});
+      if (this.mode === "extension" && process.env.BC_KEEP_BRIDGE_TAB !== "1") await this.closeBridge().catch(() => {});
+    };
+    this._onBeforeExit = () => void this._reclaim();
+    this._onSignal = async () => {
+      await this._reclaim();
+      process.exit(130);
+    };
+    process.once("beforeExit", this._onBeforeExit);
+    process.once("SIGINT", this._onSignal);
+    process.once("SIGTERM", this._onSignal);
   }
 
   /** Start tracking a tab we are responsible for. */
@@ -177,6 +200,9 @@ export class TabGuard {
     clearInterval(this._timer);
     this._timer = null;
     this.context.off?.("page", this._onPage);
+    process.off("beforeExit", this._onBeforeExit);
+    process.off("SIGINT", this._onSignal);
+    process.off("SIGTERM", this._onSignal);
   }
 
   async #makeRoom(wanted) {
@@ -238,8 +264,11 @@ export class TabGuard {
         this.owned.delete(page);
         return false;
       }
-      const ordinary = this.context.pages().filter((p) => !p.isClosed?.() && !p.url().startsWith("chrome-extension://"));
-      if (ordinary.length <= 1) return false; // with no tabs left the browser exits
+      // Count every tab we can see, the bridge's connect.html included: it is a
+      // real tab holding Chrome open, and on the extension transport it is often
+      // the ONLY other tab we can see (the operator's are not enumerable).
+      const alive = this.context.pages().filter((p) => !p.isClosed?.());
+      if (alive.length <= 1) return false; // with no tabs left the browser exits
       await page.close().catch(() => {});
       await sleep(this.settleMs);
       this.owned.delete(page);
@@ -256,6 +285,20 @@ export class TabGuard {
   /** Marker is set after navigation — NEVER via addInitScript on extension. */
   async #mark(page) {
     await page.evaluate?.((m) => sessionStorage.setItem(m, "1"), MARKER).catch(() => {});
+  }
+
+  /**
+   * The relay opens its own chrome-extension://…/connect.html tab for every
+   * attach() and never closes it: sixteen runs left sixteen tabs in the
+   * operator's browser (measured 2026-10-02). Letting go of the browser means
+   * letting go of that tab too — deliberately ignoring the keep-one-tab rule,
+   * because this tab only exists to serve a connection we are abandoning.
+   */
+  async closeBridge() {
+    const live = this.context.pages().filter((p) => !p.isClosed?.());
+    const bridges = live.filter((p) => this.bridgePages.has(p) || /chrome-extension:\/\/.*\/(connect|status)\.html/.test(p.url()));
+    for (const page of bridges) await page.close().catch(() => {}); // the relay may already be tearing down
+    return bridges.length;
   }
 }
 
@@ -285,8 +328,10 @@ export function guardBrowser(browser, guard) {
       if (prop === "close") {
         return async (...args) => {
           await guard.closeOwned().catch(() => {});
+          // BC_KEEP_BRIDGE_TAB=1 keeps the relay's tab for debugging the bridge.
+          if (guard.mode === "extension" && process.env.BC_KEEP_BRIDGE_TAB !== "1") await guard.closeBridge().catch(() => {});
           guard.dispose();
-          return target.close(...args);
+          return await target.close(...args).catch(() => {}); // closing the bridge tab can race the relay's own teardown
         };
       }
       const value = Reflect.get(target, prop, receiver);

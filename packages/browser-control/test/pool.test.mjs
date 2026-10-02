@@ -17,9 +17,10 @@ import { attachOrSkip } from "./attached.mjs";
 import { MAX_TABS_EXTENSION, TabPool } from "../src/pool.mjs";
 
 // This suite exercises tab creation on purpose, so it opts through the gate
-// itself (see src/pool.mjs SAFETY GATE) before attaching. Everything it creates
-// is left open for reuse; `npm run cleanup` removes them. A machine without the
-// extension installed skips the suite with that reason rather than failing it.
+// itself (see src/pool.mjs SAFETY GATE) before attaching. It must leave the
+// browser exactly as it found it — the suite used to open an "anchor" tab and
+// leak it on every run, which is how the operator ended up with a pile of
+// about:blank tabs. A machine without the extension skips with that reason.
 process.env.BC_ALLOW_TAB_CREATE = "1";
 const { attached, skip } = await attachOrSkip();
 const browser = attached?.browser;
@@ -27,13 +28,11 @@ const context = attached?.context;
 const capabilities = attached?.capabilities ?? {};
 const extension = (capabilities.mode ?? "extension") === "extension";
 let pool;
+let baseline = 0;
 
 before(async () => {
   if (!attached) return;
-  // Anchor tab: without an ordinary tab of its own the browser exits when the
-  // bridge closes. Also gives the pool something to reuse.
-  const anchor = context.pages().find((p) => !p.url().startsWith("chrome-extension://")) ?? (await context.newPage());
-  await anchor.goto("https://example.com/", { waitUntil: "domcontentloaded" }).catch(() => {});
+  baseline = context.pages().filter((p) => !p.isClosed()).length;
   pool = await new TabPool(context, { size: 2, capabilities }).start();
 });
 
@@ -65,24 +64,30 @@ describe("TabPool guard rails", { skip }, () => {
 
 describe("TabPool parallelism", { skip }, () => {
   it("runs page work on separate tabs concurrently", async () => {
-    // Warm every tab first: the first evaluate on a freshly attached tab pays
-    // for the chrome.debugger attach, which has nothing to do with parallelism
-    // and was enough to push a cold run over the bound.
-    await pool.map([...Array(pool.size).keys()], (_, page) => page.evaluate(() => 1));
-    const started = Date.now();
-    // 4 tasks × 600ms over 2 tabs: serial ≈ 2.4s, parallel ≈ 1.2s.
+    // Measure the invariant, not a stopwatch. Wall-clock speed-up is a bad
+    // instrument here: every pool tab is a BACKGROUND tab, and Chrome throttles
+    // background timers, so an in-page sleep(1000) measured 1570ms and the
+    // "serial vs parallel" bound drifted with the browser's mood (2026-10-02).
+    // Concurrency itself is crisp: two tasks on two tabs must OVERLAP in time.
+    const spans = [];
     const results = await pool.map([...Array(4).keys()], async (i, page) => {
-      await page.evaluate(() => new Promise((r) => setTimeout(r, 600)));
-      return page.evaluate((n) => {
+      const start = Date.now();
+      await page.evaluate((ms) => new Promise((r) => setTimeout(r, ms)), 500);
+      const value = await page.evaluate((n) => {
         window.__slot = n;
         return n;
       }, i);
+      spans.push({ tab: pool.pages.indexOf(page), start, end: Date.now() });
+      return value;
     });
-    const ms = Date.now() - started;
+
     assert.ok(results.every((r) => r.ok), JSON.stringify(results.filter((r) => !r.ok)));
     assert.deepEqual(results.map((r) => r.value).sort(), [0, 1, 2, 3]);
     assert.equal(new Set(results.map((r) => r.tab)).size, 2, "work spread over both tabs");
-    assert.ok(ms < 2000, `expected parallel speed-up, took ${ms}ms`);
+    const overlapping = spans.some((a) =>
+      spans.some((b) => a !== b && a.tab !== b.tab && a.start < b.end && b.start < a.end),
+    );
+    assert.ok(overlapping, `work on different tabs never overlapped: ${JSON.stringify(spans)}`);
   });
 
   it("keeps per-tab state separate", async () => {
@@ -113,12 +118,13 @@ describe("TabPool parallelism", { skip }, () => {
     assert.match(results[1].error, /task blew up/);
   });
 
-  it("closes the tabs it opened and leaves the browser as it was", async () => {
-    const ordinaryBefore = context.pages().filter((p) => !p.url().startsWith("chrome-extension://")).length;
+  it("closes the tabs it opened and leaves the browser exactly as it was", async () => {
+    const before = context.pages().filter((p) => !p.isClosed()).length;
     const res = await pool.close();
     assert.ok(res.closed >= 1, `expected the pool to close its tabs, got ${JSON.stringify(res)}`);
-    const ordinaryAfter = context.pages().filter((p) => !p.isClosed() && !p.url().startsWith("chrome-extension://")).length;
-    assert.equal(ordinaryAfter, ordinaryBefore - res.closed, "tab count must drop by exactly what we closed");
-    assert.ok(ordinaryAfter >= 1, "never close the last ordinary tab");
+    const after = context.pages().filter((p) => !p.isClosed()).length;
+    assert.equal(after, before - res.closed, "tab count must drop by exactly what we closed");
+    assert.equal(after, baseline, `the suite must leave no tab behind: started at ${baseline}, ended at ${after}`);
+    assert.ok(after >= 1, "never leave the browser with no tabs");
   });
 });

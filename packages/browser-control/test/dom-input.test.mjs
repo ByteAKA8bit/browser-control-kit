@@ -48,7 +48,11 @@ let page;
 
 before(async () => {
   if (!attached) return;
-  const raw = attached.context.pages()[0] ?? (await attached.context.newPage());
+  // Never the relay's own connect.html tab: navigating that away hid it from
+  // teardown and leaked one tab per run. Take an ordinary tab, or open one —
+  // an opened tab is owned by the guard and handed back on close.
+  const raw =
+    attached.context.pages().find((p) => !p.url().startsWith("chrome-extension://")) ?? (await attached.context.newPage());
   page = controlPage(raw, { ...attached.capabilities, focusEmulation: false }); // force the DOM path
   await raw.goto("about:blank");
   await raw.setContent(`<body>${FIXTURE}</body>`);
