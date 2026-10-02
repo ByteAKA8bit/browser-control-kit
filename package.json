@@ -21,8 +21,8 @@
     "packages/*"
   ],
   "scripts": {
-    "test": "node --test --test-concurrency=1 packages/browser-control/test/tab-guard.test.mjs packages/browser-control/test/ws-server.test.mjs packages/browser-control/test/shim-autostart.test.mjs packages/browser-control/test/shim-policy.test.mjs packages/mcp-server/test/protocol.test.mjs packages/browser-control/test/dom-input.test.mjs packages/browser-control/test/pool.test.mjs",
-    "test:offline": "node --test packages/browser-control/test/tab-guard.test.mjs packages/browser-control/test/ws-server.test.mjs packages/browser-control/test/shim-autostart.test.mjs packages/browser-control/test/shim-policy.test.mjs packages/mcp-server/test/protocol.test.mjs",
+    "test": "node --test --test-concurrency=1 packages/browser-control/test/tab-guard.test.mjs packages/browser-control/test/ws-server.test.mjs packages/browser-control/test/shim-autostart.test.mjs packages/browser-control/test/shim-policy.test.mjs packages/browser-control/test/shim-recovery.test.mjs packages/browser-control/test/shim-service.test.mjs packages/browser-control/test/shim-session.test.mjs packages/mcp-server/test/protocol.test.mjs packages/browser-control/test/dom-input.test.mjs packages/browser-control/test/pool.test.mjs",
+    "test:offline": "node --test packages/browser-control/test/tab-guard.test.mjs packages/browser-control/test/ws-server.test.mjs packages/browser-control/test/shim-autostart.test.mjs packages/browser-control/test/shim-policy.test.mjs packages/browser-control/test/shim-recovery.test.mjs packages/browser-control/test/shim-service.test.mjs packages/browser-control/test/shim-session.test.mjs packages/mcp-server/test/protocol.test.mjs",
     "test:unit": "node --test packages/browser-control/test/dom-input.test.mjs",
     "test:pool": "node --test packages/browser-control/test/pool.test.mjs",
     "selftest": "node packages/browser-control/selftest.mjs",

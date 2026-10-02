@@ -1,32 +1,19 @@
 // The agent-facing surface: one browser session, pages addressed by NAME, ten
 // tools.
 //
-// Non-goal: tab handles. The earlier version of this file handed the agent tab
-// indices and then spent three tool descriptions policing them — don't open
-// one, don't close the operator's, close yours when you are done. Agents leak
-// handles; that is what handles are for. So there is no handle: `as` names the
-// page a navigation should keep, `on` goes back to a named page, and omitting
-// both lands on the scratch page that the next unnamed navigation reuses.
-// Lifetime belongs to browser-control's TabGuard — named pages are pinned,
-// unnamed ones recycled, idle ones blanked and reclaimed — which is why no tool
-// here can open or close a tab and nothing has to be explained to the agent.
-//
-// browser-control — and through it playwright-core — is imported lazily inside
-// #connect(), so a server that an agent has merely listed tools on costs
-// nothing but a Node process.
+// Non-goal: tab handles. Agents leak handles, and the earlier version spent
+// three tool descriptions policing them; instead `as` names a page, `on`
+// returns to a named page, and omitting both lands on the scratch page the
+// next unnamed navigation reuses. Lifetime belongs to browser-control's
+// TabGuard — named pinned, unnamed recycled, idle reclaimed — so no tool here
+// can open or close a tab. browser-control (and playwright-core) is imported
+// lazily in #connect(), so merely listing tools costs nothing but a process.
 const ATTACH_TIMEOUT_MS = () => Number(process.env.BC_MCP_ATTACH_TIMEOUT_MS ?? 60_000);
 const TEXT_LIMIT = () => Number(process.env.BC_MCP_TEXT_LIMIT ?? 20_000);
 const WAIT_TIMEOUT_MS = () => Number(process.env.BC_MCP_WAIT_MS ?? 20_000);
-// Nothing to configure here on purpose: an MCP session does one thing at a
-// time, and TabGuard already measures that rhythm and sizes its own windows
-// from it. Adding "tuned for MCP" constants would just be a second opinion.
+// Nothing to tune here on purpose: TabGuard already sizes its own windows.
 
-/**
- * The one paragraph a client shows before the first tool call (MCP
- * `initialize.instructions`). It exists so the per-call descriptions do not
- * have to nag: state the addressing model once, say that nothing needs
- * closing, stop.
- */
+/** Shown by a client before the first tool call (MCP `initialize.instructions`). */
 export const INSTRUCTIONS =
   "Pages are addressed by name, never by handle. Pass `as` to browser_navigate to keep that page under a name, and `on` to come back to it from any later call; leave both out and you get the scratch page, which the next unnamed navigation reuses. Nothing needs closing — named pages are kept while you use them, unnamed ones are recycled, idle ones are reclaimed — and browser_surfaces lists what is named right now.";
 
@@ -43,13 +30,10 @@ function withTimeout(promise, ms, what) {
 const flatten = (err) => String(err?.message ?? err).split("\n")[0];
 
 /**
- * One attached browser per server process, created on the first tool call that
- * needs it and re-created if the browser goes away.
- *
- * It keeps no page state of its own — no "active tab", nothing to desynchronise
- * from the browser. Every call resolves its page through the guard's name
- * table, so a page that closed underneath us simply comes back as a fresh one
- * under the same name.
+ * One attached browser per server process, created on the first tool call and
+ * re-created if the browser goes away. It keeps no page state of its own:
+ * every call resolves through the guard's name table, so a page that closed
+ * underneath us comes back as a fresh one under the same name.
  */
 export class Session {
   #live = null;
@@ -83,22 +67,18 @@ export class Session {
   }
 
   /**
-   * The page a call should act on, wrapped by controlPage.
-   *
-   * `as` binds (or re-binds) a name, `on` must already exist, and neither means
-   * the scratch page. The guard creates, recycles or hands back as needed; this
-   * method never opens or closes anything itself.
-   * @returns {Promise<{ page: object, surface: string | null, evicted: number }>}
+   * The page a call should act on, wrapped by controlPage: `as` binds or
+   * re-binds a name, `on` must already exist, neither means the scratch page.
+   * Never opens or closes anything itself.
    */
   async target({ as, on } = {}) {
     const live = await this.browser();
     const guard = this.#guard(live);
-    // Trimmed because that is what the guard keys on; a blank name is the
-    // guard's error to raise, not a second opinion here.
+    // Trimmed because that is what the guard keys on; a blank name is the guard's error to raise.
     const name = (as ?? on)?.trim() ?? null;
     if (name && as === undefined) this.#assertNamed(guard, name);
     const raw = await guard.surface(name ?? undefined);
-    return { page: this.#wrap(raw, live), surface: name, evicted: this.#freshEvictions(guard) };
+    return { page: this.#wrap(raw, live), surface: name };
   }
 
   /** What is bound right now, and the reassurance that it needs no cleanup. */
@@ -148,9 +128,13 @@ export class Session {
     );
   }
 
-  /** Evictions the agent has not been told about yet (losing a name must be visible). */
-  #freshEvictions(guard) {
-    const total = guard.stats?.surfacesEvicted ?? 0;
+  /**
+   * Evictions not yet reported. Consumed once per tool call by callTool, never
+   * by target(): losing a named surface MUST stay visible, and a run() that
+   * forgot to pass `evicted` through used to swallow the notice.
+   */
+  freshEvictions() {
+    const total = this.#live?.tabs?.stats?.surfacesEvicted ?? 0;
     const fresh = total - this.#evicted;
     this.#evicted = total;
     return fresh > 0 ? fresh : 0;
@@ -175,13 +159,40 @@ export class Session {
 
 const text = (value) => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
 
+/**
+ * Marks content a tool already built as MCP content. A marker class rather
+ * than sniffing `result?.content`, because browser_evaluate returns whatever
+ * the page says: a page evaluating to `({content:[…]})` could forge an image
+ * or send content malformed enough to drop the connection.
+ */
+class Payload {
+  constructor(content) {
+    this.content = content;
+  }
+}
+
+/**
+ * Losing a named page MUST stay visible, so a result appends what was evicted
+ * as its own block — a screenshot's payload is not ours to rewrite — and says
+ * nothing when nothing was lost.
+ */
+const withEvictions = (payload, evicted) =>
+  evicted
+    ? {
+        ...payload,
+        content: [
+          ...payload.content,
+          { type: "text", text: `surfacesEvicted: ${evicted} — that many least-recently-used names were dropped and their pages reused; navigate again with \`as\` to bind a name back.` },
+        ],
+      }
+    : payload;
+
 /** `on` is the same parameter on every acting tool, so it is written once. */
 const ON = { type: "string", description: "Name of a page you kept with `as`; omit for the scratch page" };
 
 /**
- * Tool definitions. `run(args, session)` returns a value (wrapped as text) or a
- * ready-made content payload; throwing is fine — the server turns it into
- * isError, never a transport error.
+ * Tool definitions. `run(args, session)` returns a value (wrapped as text) or
+ * a `new Payload([...])`; throwing becomes isError, never a transport error.
  */
 export const TOOLS = [
   {
@@ -192,8 +203,7 @@ export const TOOLS = [
       try {
         return await session.status();
       } catch (err) {
-        // Status is a diagnostic: "cannot attach, here is why" is the answer,
-        // not a failure.
+        // Status is a diagnostic: "cannot attach, here is why" is the answer.
         return session.offlineStatus(err);
       }
     },
@@ -213,15 +223,13 @@ export const TOOLS = [
       additionalProperties: false,
     },
     async run({ url, as, on, waitUntil }, session) {
-      const { page, surface, evicted } = await session.target({ as, on });
+      const { page, surface } = await session.target({ as, on });
       const response = await page.goto(url, waitUntil ? { waitUntil } : {});
       return {
         surface,
         url: page.url(),
         title: await page.title(),
         status: response?.status() ?? null,
-        // Only ever present when a name was actually lost, never as a reminder.
-        ...(evicted ? { surfacesEvicted: evicted } : {}),
       };
     },
   },
@@ -317,7 +325,7 @@ export const TOOLS = [
     async run({ selector, on }, session) {
       const { page } = await session.target({ on });
       const buffer = selector ? await page.locator(selector).first().screenshot({ type: "png" }) : await page.screenshot();
-      return { content: [{ type: "image", data: buffer.toString("base64"), mimeType: "image/png" }] };
+      return new Payload([{ type: "image", data: buffer.toString("base64"), mimeType: "image/png" }]);
     },
   },
   {
@@ -362,28 +370,34 @@ function validate(tool, args) {
     if (args[key] === undefined) throw new InvalidParams(`${tool.name} requires "${key}"`);
   }
   for (const [key, value] of Object.entries(args)) {
+    // hasOwn, because inherited "constructor"/"toString" used to be read off
+    // Object.prototype and reported as a parameter of the wrong type.
+    if (!Object.hasOwn(tool.inputSchema.properties, key)) throw new InvalidParams(`${tool.name} has no parameter "${key}"`);
     const schema = tool.inputSchema.properties[key];
-    if (!schema) throw new InvalidParams(`${tool.name} has no parameter "${key}"`);
-    const kind = schema.type === "integer" ? "number" : schema.type;
-    if (typeof value !== kind) throw new InvalidParams(`${tool.name}.${key} must be a ${schema.type}`);
+    const wanted = schema.type === "integer" ? "an integer" : `a ${schema.type}`;
+    const ok = schema.type === "integer" ? Number.isInteger(value) : typeof value === schema.type;
+    if (!ok) throw new InvalidParams(`${tool.name}.${key} must be ${wanted}`);
     if (schema.enum && !schema.enum.includes(value)) throw new InvalidParams(`${tool.name}.${key} must be one of ${schema.enum.join(", ")}`);
   }
+  // A call carrying both names two different pages, and honouring `as` alone would act somewhere the client never asked for.
+  if (args.as !== undefined && args.on !== undefined) throw new InvalidParams(`${tool.name} takes either "as" or "on", not both`);
 }
 
 /**
  * Run a tool. Protocol mistakes throw InvalidParams; everything else — no
- * browser, bad selector, page exploded — comes back as an isError result,
- * because a failing page is not a broken connection.
- * @returns {Promise<{ content: object[], isError?: true }>}
+ * browser, bad selector, page exploded — comes back as an isError result.
  */
 export async function callTool(name, args, session) {
   const tool = byName.get(name);
   if (!tool) throw new InvalidParams(`unknown tool "${name}"`);
   validate(tool, args);
+  let payload;
   try {
     const result = await tool.run(args, session);
-    return result?.content ? result : text(result);
+    payload = result instanceof Payload ? { content: result.content } : text(result);
   } catch (err) {
-    return { ...text(`${name} failed: ${flatten(err)}`), isError: true };
+    payload = { ...text(`${name} failed: ${flatten(err)}`), isError: true };
   }
+  // One place consumes the eviction counter; seven tools used to drop the notice on the floor.
+  return withEvictions(payload, session.freshEvictions());
 }

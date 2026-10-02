@@ -12,17 +12,6 @@
 // multi-arg evaluate, waitForSelector({ visible }).
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ---------------------------------------------------------------------------
-// Ant Design v6 interaction helpers.
-//
-// Two traps this build sets, both handled here:
-//  1. Modal bodies live in `.ant-modal-container` (v5's `.ant-modal-content`
-//     does not exist).
-//  2. Closed modals stay mounted — only their `.ant-modal-wrap` is hidden — so
-//     naive selectors keep hitting the previous, invisible dialog. Every helper
-//     first tags the VISIBLE dialog with `data-qa-modal="active"` and works
-//     inside that tag.
-// ---------------------------------------------------------------------------
 export const MODAL = '[data-qa-modal="active"]';
 
 /** Tag the visible modal; returns false when no modal is on screen. */

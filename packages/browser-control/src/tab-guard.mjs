@@ -1,53 +1,15 @@
-// Keep an agent from eating the operator's RAM one tab at a time.
+// Cap the tabs this process opens in the operator's browser, so an agent that
+// opens a tab per step cannot fill it with renderer processes (~40-80 MB each).
 //
-// The failure mode this exists for: an LLM agent driving this library opens a
-// tab per step ("let me check that in a new tab"), never closes anything, and
-// twenty minutes later Chrome is holding 40 renderer processes — in the browser
-// the operator is personally using. Agents do not reliably clean up, so the
-// discipline lives here instead of being asked for politely.
+// Non-goals: measuring the machine's memory (every platform reports it
+// differently and other applications move the number), and governing tabs this
+// process did not open — every tab that existed at attach() time is the
+// operator's: never closed, never navigated, never counted.
 //
-// A fixed "you get N tabs" would be both rude and wrong: the right number is
-// however many tabs are doing work right now. And the machine's own memory is
-// not this tool's business to measure — every platform reports it differently
-// and other applications move the number under you. So the policy is only
-// about what this process can know exactly, which is its own footprint:
-//
-//   * RECYCLE FIRST — a tab we own that nobody is using is not a free tab to
-//     keep, it is the tab the next request gets. Reuse costs no memory; a new
-//     renderer process costs ~40-80 MB of the operator's RAM.
-//   * MEASURED, NOT DECLARED — "idle" is expressed in the caller's own rhythm
-//     (see "cadence" below), never in a constant somebody guessed.
-//   * TRANSPORT CEILING — the one hard number, and it is not a style choice:
-//     the extension bridge drops the connection past ~3 attached tabs
-//     (MAX_TABS_EXTENSION, measured 2026-09-05). Stability, not policy.
-//   * OWNERSHIP — only tabs this process opened (or popups they spawned) are
-//     ours. Every tab that existed at attach() time is the operator's and is
-//     never closed, never navigated, never counted.
-//   * MEMORY BEFORE CLOSURE — an idle tab is parked on about:blank well before
-//     it is closed, which hands the renderer's page back immediately. Both
-//     windows are measured, not declared (see "cadence" below).
-//   * HOLDS — TabPool (and anyone else with a long-lived tab) calls hold() so a
-//     working tab is never evicted or reaped out from under it.
-//   * NAMES — the measured cadence answers "is this tab still wanted?" for
-//     scratch pages, where the only evidence is how recently someone touched
-//     them. For a long-lived page that question has a better answer than any
-//     measurement: the caller said so. surface("docs") binds a name to a tab
-//     and that binding IS the wanting — a named surface is pinned, never
-//     recycled and never reaped, until release("docs") or until the ceiling
-//     forces the least-recently-used name out (recorded as surfacesEvicted,
-//     because losing a named surface must be visible). Naming is also why the
-//     agent never handles a tab: it asks for a name, the guard owns lifetimes.
-//
-// Constraints inherited from src/pool.mjs (learned by killing Chrome 152):
-// closing is serialised with a settle delay, and the browser is never left with
-// no tabs at all, because then it exits and takes the extension bridge with it.
-//
-// Known blind spot on the extension transport: a tab the extension may not
-// attach to (chrome:// WebUI, the Web Store, another extension's page, file://
-// without file access) never becomes a Playwright page, so it never shows up in
-// context.pages() and this guard cannot see or close it. Those are also the
-// tabs an agent is least likely to spawn in bulk.
-import { MAX_TABS, MAX_TABS_EXTENSION } from "./pool.mjs";
+// Invariant: the guard may only touch tabs it adopted, and it cannot adopt what
+// it cannot see — a page the extension may not attach to (chrome:// WebUI, the
+// Web Store, another extension's page, file://) never reaches context.pages().
+import { MARKER, MAX_TABS, MAX_TABS_EXTENSION, TAB_SETTLE_MS, wouldEmptyBrowser } from "./pool.mjs";
 import { serialiseNavigation } from "./page.mjs";
 
 /** A tab already parked on about:blank holds no page memory worth reclaiming. */
@@ -56,23 +18,17 @@ const isBlank = (page) => {
   return url === "" || url === "about:blank";
 };
 
-// Same sessionStorage marker as src/pool.mjs and cleanup.mjs: tabs we own stay
-// recognisable across runs, so `npm run cleanup` can finish the job if a process
-// is killed before it can tidy up.
-const MARKER = "bcPoolTab";
-const TAB_SETTLE_MS = Number(process.env.BC_TAB_SETTLE_MS ?? 400);
+// MARKER / TAB_SETTLE_MS / wouldEmptyBrowser come from src/pool.mjs, which owns
+// the crash constants. The sessionStorage marker keeps tabs we own recognisable
+// across runs (so `npm run cleanup` can finish after a kill); a second spelling
+// of it is the difference between reclaiming a tab and leaking it.
 
-// "Is this tab still wanted?" has no correct constant. A crawler touches a tab
-// every 200 ms; an agent that stops to think touches one every 30 s. Five
-// seconds would steal the second one's tab and never reuse the first one's.
-//
-// So the windows are measured, not declared: the guard tracks the gap between
-// operations on the tabs it owns (an EWMA, ignoring gaps so long they are
-// obviously pauses rather than rhythm) and expresses each decision as a
-// multiple of THAT. A tab is reusable once it has been quiet for several of the
-// caller's own beats; blanked after a few dozen; closed after a few hundred.
-// Floors and caps keep a pathological cadence from producing a silly window,
-// and BC_TAB_*_MS pins any of them when the operator wants a number.
+// "Is this tab still wanted?" has no correct constant: a crawler touches a tab
+// every 200 ms, an agent that stops to think every 30 s. So the windows are
+// measured — an EWMA of the gap between operations, ignoring gaps long enough
+// to be pauses rather than rhythm — and each decision is a multiple of that
+// beat. Floors and caps bound a pathological cadence; BC_TAB_*_MS pins a window
+// outright when the operator wants a number.
 const CADENCE_SEED_MS = 1_000; // before anything is measured
 const CADENCE_ALPHA = 0.3; // EWMA weight of the newest gap
 const CADENCE_PAUSE_MS = 120_000; // a gap longer than this is a pause, not rhythm
@@ -89,10 +45,8 @@ function window_(spec, cadence) {
 }
 
 /**
- * The hard ceiling, which exists for transport stability only — the extension
- * bridge drops the connection past MAX_TABS_EXTENSION attached tabs. Everything
- * else follows from reuse and the measured idle windows. BC_TAB_BUDGET pins
- * this explicitly when the operator wants a number.
+ * The hard ceiling, for transport stability only: the extension bridge drops
+ * the connection past MAX_TABS_EXTENSION attached tabs. BC_TAB_BUDGET pins it.
  */
 export function tabCeiling(mode) {
   const pinned = Number(process.env.BC_TAB_BUDGET ?? NaN);
@@ -121,9 +75,8 @@ export class TabGuard {
   ) {
     this.context = context;
     this.mode = mode;
-    /** Transport stability limit, not a policy number (see the header). */
     this.ceiling = ceiling ?? tabCeiling(mode);
-    /** Explicit overrides win; otherwise every window is measured (see the header). */
+    /** Explicit overrides win; otherwise every window is measured. */
     this.pinned = { idleMs, blankMs, recycleMs };
     /** The caller's rhythm: an EWMA of the gap between operations we observe. */
     this.cadence = CADENCE_SEED_MS;
@@ -133,13 +86,12 @@ export class TabGuard {
     this.protectedPages = new Set(context.pages());
     /**
      * The relay's own tabs, remembered BY IDENTITY: a caller that navigates one
-     * away (the dom-input suite used to grab `pages()[0]`) would otherwise hide
-     * it from a URL match, and it leaked one tab per run.
+     * away hides it from a URL match, and it leaked one tab per run.
      */
     this.bridgePages = new Set(context.pages().filter((p) => p.url().startsWith("chrome-extension://")));
     /** page -> { origin, bornAt, lastUsed, holds, name } */
     this.owned = new Map();
-    /** name -> page. One name, one tab; the binding is a hold (see the header). */
+    /** name -> page. One name, one tab; the binding is a hold. */
     this.named = new Map();
     this.stats = { created: 0, recycled: 0, spawned: 0, evicted: 0, reaped: 0, blanked: 0, refused: 0, closed: 0, overflow: 0, surfacesEvicted: 0 };
     this._closeChain = Promise.resolve();
@@ -151,9 +103,8 @@ export class TabGuard {
       this._timer = setInterval(() => void this.reap(), REAP_EVERY_MS);
       this._timer.unref?.(); // never keep the process alive just to reap
     }
-    // Last line of defence. A caller that forgets browser.close(), a test that
-    // throws, a Ctrl-C — none of them may leave tabs in the operator's browser,
-    // and sixteen leaked bridge tabs say politeness is not a strategy.
+    // Last line of defence: a forgotten browser.close(), a throwing test or a
+    // Ctrl-C must not leave tabs behind in the operator's browser.
     this._reclaim = async () => {
       if (this._reclaiming) return;
       this._reclaiming = true;
@@ -177,9 +128,7 @@ export class TabGuard {
     const now = Date.now();
     this.owned.set(page, { origin, bornAt: now, lastUsed: now, holds: 0 });
     this.stats[origin === "created" ? "created" : "spawned"] += 1;
-    // A tab can go away under us (operator closes it, renderer dies). The name
-    // must not survive the page it meant, or the next surface(name) hands back
-    // a corpse.
+    // A tab can go away under us; the name must not outlive the page it meant.
     page.on?.("close", () => {
       this.#unbind(page);
       this.owned.delete(page);
@@ -194,18 +143,13 @@ export class TabGuard {
     return page;
   }
 
-  /**
-   * Record activity, and learn from it. The gap since the previous operation is
-   * this caller's beat; every idle decision is expressed in those beats, so a
-   * fast crawler and a slow, thinking agent each get a window that fits them.
-   */
+  /** Record activity; the gap since the previous operation is this caller's beat. */
   touch(page) {
     const now = Date.now();
     const entry = this.owned.get(page);
     if (this._lastTouch) {
       const gap = now - this._lastTouch;
-      // A long silence is a pause, not a rhythm: learning from it would make the
-      // guard hoard tabs for the rest of the session.
+      // A long silence is a pause, not a rhythm: learning it would hoard tabs.
       if (gap >= 0 && gap < CADENCE_PAUSE_MS) this.cadence = CADENCE_ALPHA * gap + (1 - CADENCE_ALPHA) * this.cadence;
     }
     this._lastTouch = now;
@@ -240,14 +184,7 @@ export class TabGuard {
     if (entry) entry.holds = Math.max(0, entry.holds - 1);
   }
 
-  /**
-   * The governed replacement for context.newPage().
-   *
-   * Recycling comes first: handing back a tab we already own costs nothing,
-   * while a new one costs the operator a renderer process. Only when every tab
-   * we own is busy does this consider growing, and only while the machine has
-   * room for it.
-   */
+  /** Governed context.newPage(): recycle an idle tab we own before opening one. */
   async newPage() {
     const recycled = this.#idlest();
     if (recycled) return this.#recycle(recycled);
@@ -272,15 +209,9 @@ export class TabGuard {
   }
 
   /**
-   * The page bound to `name`, creating or recycling one if needed.
-   *
-   * This is the whole tab-handle problem turned inside out: the caller says
-   * what a tab is FOR, not which tab it is, so there is no handle to leak and
-   * no close() to forget. A bound name is a hold, so a named surface is never
-   * recycled and never reaped while it is bound — the name is the evidence the
-   * cadence cannot supply. Called with no name this is exactly newPage(): the
-   * scratch surface, governed by the measured windows like everything else.
-   * @param {string} [name] non-empty surface name, or nothing for scratch
+   * The page bound to `name`, creating or recycling one if needed; with no name
+   * this is exactly newPage(). A bound name is a hold, so a named surface is
+   * never recycled and never reaped until release(name) or surface eviction.
    */
   async surface(name) {
     if (name === undefined || name === null) return this.newPage();
@@ -300,8 +231,7 @@ export class TabGuard {
   }
 
   /**
-   * Drop a binding. The tab stays open and becomes an ordinary owned tab again:
-   * recyclable, reapable, no longer pinned.
+   * Drop a binding; the tab stays open as an ordinary owned tab.
    * @returns {boolean} whether the name was bound
    */
   release(name) {
@@ -345,28 +275,15 @@ export class TabGuard {
   }
 
   /**
-   * The ceiling is full and every tab we own is a bound surface.
-   *
-   * Refusing here would be the wrong answer: the caller asked for a name, not
-   * for a tab, and "no" is not something a naming API should ever say. So the
-   * least-recently-used name loses its binding and its tab is handed to the new
-   * one — no close, no new renderer. That is a real loss for whoever held the
-   * old name, so it is counted (surfacesEvicted) and shown in report().
+   * The ceiling is full and every tab we own is a bound surface: the LRU name
+   * loses its binding and its tab is handed over, no close and no new renderer.
+   * Counted as surfacesEvicted, because losing a named surface must be visible.
    */
   #surfaceToEvict() {
     if (this.owned.size < this.ceiling) return null;
     if (this.#idlest() || this.#lru()) return null; // an unbound tab can pay instead
-    let best = null;
-    let bestAt = Infinity;
-    for (const [, page] of this.named) {
-      const entry = this.owned.get(page);
-      // holds > 1 means somebody else (TabPool) is working in this tab too.
-      if (!entry || entry.holds > 1 || page.isClosed?.()) continue;
-      if (entry.lastUsed < bestAt) {
-        best = page;
-        bestAt = entry.lastUsed;
-      }
-    }
+    // holds > 1 means somebody else (TabPool) is working in this tab too.
+    const best = this.#oldest(this.named.values(), (entry) => entry.holds <= 1);
     if (!best) return null;
     const name = this.#unbind(best);
     this.unhold(best);
@@ -376,21 +293,31 @@ export class TabGuard {
     return best;
   }
 
-  /** An unheld tab nobody has touched for a while: the natural one to reuse. */
-  #idlest() {
-    const after = this.recycleAfter();
-    if (after <= 0) return null;
-    const quiet = Date.now() - after;
+  /**
+   * The tab we own that has been quiet longest among those `keep` accepts. Every
+   * eviction choice here is this one argmin, so they cannot drift apart over
+   * questions like "is a closed tab eligible?".
+   */
+  #oldest(pages, keep) {
     let best = null;
     let bestAt = Infinity;
-    for (const [page, entry] of this.owned) {
-      if (entry.holds > 0 || page.isClosed?.() || entry.lastUsed > quiet) continue;
+    for (const page of pages) {
+      const entry = this.owned.get(page);
+      if (!entry || page.isClosed?.() || !keep(entry)) continue;
       if (entry.lastUsed < bestAt) {
         best = page;
         bestAt = entry.lastUsed;
       }
     }
     return best;
+  }
+
+  /** An unheld tab nobody has touched for a while: the natural one to reuse. */
+  #idlest() {
+    const after = this.recycleAfter();
+    if (after <= 0) return null;
+    const quiet = Date.now() - after;
+    return this.#oldest(this.owned.keys(), (entry) => entry.holds === 0 && entry.lastUsed <= quiet);
   }
 
   /** Close every tab we own (called before browser.close()). */
@@ -404,15 +331,10 @@ export class TabGuard {
   }
 
   /**
-   * Give the memory back before the tab is gone, then take the tab.
-   *
-   * A Chrome tab parked on a real application holds a renderer process with the
-   * whole DOM, JS heap and caches in it; closing is not the only lever and not
-   * the first one. An idle tab we own is blanked once it has been quiet for the
-   * blank window, which drops that renderer's page, and closed once it has been
-   * quiet for the idle window. Both are the caller's measured cadence in beats
-   * (see the header). Blanking goes through the process-wide navigation lock,
-   * because concurrent navigation over the extension bridge crashes Chrome.
+   * Give the memory back before the tab is gone, then take the tab: an idle tab
+   * is blanked after the blank window (which drops its renderer's page) and
+   * closed after the idle window. Blanking goes through the process-wide
+   * navigation lock, because concurrent navigation over the bridge crashes Chrome.
    */
   async reap() {
     const idleAfter = this.idleAfter();
@@ -475,15 +397,9 @@ export class TabGuard {
   }
 
   /**
-   * Make room for one more tab.
-   *
-   * There is nothing to decide about the machine here: this guard governs its
-   * OWN footprint, not the operator's RAM, and a tool that measured system
-   * memory would be guessing on every platform while other applications moved
-   * the number under it. What it can know exactly is which of its tabs are idle
-   * — those are handed back before anything is opened. The only refusal is the
-   * transport's ceiling, where one more attached tab drops the connection: that
-   * is physics, not policy.
+   * Make room for one more tab: idle tabs we own are handed back first. The only
+   * refusal is the transport ceiling, where one more attached tab drops the
+   * connection.
    */
   async #admit() {
     while (this.owned.size >= this.ceiling) {
@@ -522,16 +438,7 @@ export class TabGuard {
   /** Least-recently-used tab we own and are allowed to close. */
   #lru() {
     if (!this.evict) return null;
-    let best = null;
-    let bestAt = Infinity;
-    for (const [page, entry] of this.owned) {
-      if (entry.holds > 0 || page.isClosed?.()) continue;
-      if (entry.lastUsed < bestAt) {
-        best = page;
-        bestAt = entry.lastUsed;
-      }
-    }
-    return best;
+    return this.#oldest(this.owned.keys(), (entry) => entry.holds === 0);
   }
 
   /** Serialised, settle-delayed close that refuses to empty the browser. */
@@ -542,11 +449,8 @@ export class TabGuard {
         this.owned.delete(page);
         return false;
       }
-      // Count every tab we can see, the bridge's connect.html included: it is a
-      // real tab holding Chrome open, and on the extension transport it is often
-      // the ONLY other tab we can see (the operator's are not enumerable).
-      const alive = this.context.pages().filter((p) => !p.isClosed?.());
-      if (alive.length <= 1) return false; // with no tabs left the browser exits
+      // Same last-tab rule as pool.mjs, imported so there is only one copy of it.
+      if (wouldEmptyBrowser(this.context)) return false;
       await page.close().catch(() => {});
       await sleep(this.settleMs);
       this.owned.delete(page);
@@ -566,11 +470,10 @@ export class TabGuard {
   }
 
   /**
-   * The relay opens its own chrome-extension://…/connect.html tab for every
-   * attach() and never closes it: sixteen runs left sixteen tabs in the
-   * operator's browser (measured 2026-10-02). Letting go of the browser means
-   * letting go of that tab too — deliberately ignoring the keep-one-tab rule,
-   * because this tab only exists to serve a connection we are abandoning.
+   * The relay opens its own chrome-extension://…/connect.html tab per attach()
+   * and never closes it: sixteen runs left sixteen tabs (measured 2026-10-02).
+   * Deliberately ignores the keep-one-tab rule — this tab only serves the
+   * connection we are abandoning.
    */
   async closeBridge() {
     const live = this.context.pages().filter((p) => !p.isClosed?.());
@@ -580,11 +483,7 @@ export class TabGuard {
   }
 }
 
-/**
- * A BrowserContext that routes tab creation through the guard. Everything else
- * passes straight through, so callers cannot tell the difference — except that
- * `context.newPage()` now respects the budget and `context.tabGuard` exists.
- */
+/** A BrowserContext whose newPage() routes through the guard; all else passes through. */
 export function guardContext(context, guard) {
   return new Proxy(context, {
     get(target, prop, receiver) {
@@ -596,10 +495,7 @@ export function guardContext(context, guard) {
   });
 }
 
-/**
- * A Browser whose close() hands the tabs back first. An agent that forgets to
- * tidy up still leaves the browser as it found it.
- */
+/** A Browser whose close() hands the tabs back first. */
 export function guardBrowser(browser, guard) {
   return new Proxy(browser, {
     get(target, prop, receiver) {

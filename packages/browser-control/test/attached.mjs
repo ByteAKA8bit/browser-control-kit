@@ -11,7 +11,7 @@ import { attach } from "../src/attach.mjs";
 const NOT_SET_UP = [
   [/did not connect within|Playwright Extension not found/, "the Playwright Extension did not connect (not installed, or Chrome's profile directory is unreadable)"],
   [/no extension token|PLAYWRIGHT_MCP_EXTENSION_TOKEN/, "no Playwright Extension token (see README: Token)"],
-  [/ECONNREFUSED|never accepted a connection|No CDP shim/, "no CDP shim is reachable (npm run shim)"],
+  [/ECONNREFUSED|never accepted a connection|No CDP shim|no approved Chrome connection|stopped answering/, "no CDP shim is reachable with an approved Chrome connection (npm run shim)"],
 ];
 
 /**

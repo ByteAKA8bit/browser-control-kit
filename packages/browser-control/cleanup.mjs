@@ -1,17 +1,15 @@
-// Leave the operator's browser as we found it.
-//
-// What this tool can leave behind, and what this script does about it:
-//   * pool tabs — the extension transport never closes them (tab churn over
-//     chrome.debugger destabilised Chrome 152), so they pile up across runs.
-//     Here they are closed deliberately, one at a time with a settle delay, and
-//     never the last tab in the browser.
-//   * scratch tabs — about:blank / example.com pages created by tests.
-//   * site settings — permissions granted for capability probing.
-// It NEVER touches a tab that is not ours (anything with real content stays).
+// Close the tabs this tool created and clear the permissions it granted.
+// Non-goal: it NEVER touches a tab that is not ours — anything with real content
+// stays, and never the last tab in the browser (that would exit Chrome).
+// Pool tabs pile up by design: the extension transport never closes them (tab churn
+// over chrome.debugger destabilised Chrome 152), so they are closed here one at a
+// time with a settle delay. sessionStorage lives in the Chrome process, so tabs
+// marked by an older build are reclaimed only when their URL matches SCRATCH below.
 //
 //   node cleanup.mjs            close our tabs + clear granted permissions
 //   node cleanup.mjs --dry-run  report only
 import { attach } from "./src/attach.mjs";
+import { MARKER, wouldEmptyBrowser } from "./src/pool.mjs";
 
 const dryRun = process.argv.includes("--dry-run");
 const SCRATCH = [/^about:blank/, /^https?:\/\/example\.(com|org)\//, /^chrome:\/\/new-tab-page/];
@@ -29,28 +27,25 @@ for (const page of pages) {
   }
   let marked = false;
   try {
-    marked = await page.evaluate(() => sessionStorage.getItem("bcPoolTab") === "1" || sessionStorage.getItem("tfTestTab") === "1");
-  } catch {}
+    marked = await page.evaluate((m) => sessionStorage.getItem(m) === "1", MARKER);
+  } catch {} // an unreadable tab (extension/devtools page, closed mid-sweep) is simply not ours
   const scratch = SCRATCH.some((re) => re.test(url));
   if (!marked && !scratch) {
     report.kept.push(url.slice(0, 70));
     continue;
   }
-  // Keep at least one tab: with none left the browser exits. The extension's own
-  // connect.html counts — it is a real tab, and on that transport the operator's
-  // tabs are not even enumerable, so excluding it stranded one tab per run.
-  const tabsLeft = context.pages().filter((p) => !p.isClosed?.()).length;
-  if (tabsLeft <= 1) {
+  // src/pool.mjs owns the rule and explains which tabs count.
+  if (wouldEmptyBrowser(context)) {
     report.kept.push(`${url.slice(0, 60)} (last tab in the browser)`);
     continue;
   }
   if (dryRun) {
-    report.closed.push(`${url.slice(0, 60)} (would close, ${marked ? "pool/test marker" : "scratch"})`);
+    report.closed.push(`${url.slice(0, 60)} (would close, ${marked ? "pool marker" : "scratch"})`);
     continue;
   }
   await page.close().catch(() => {});
   await sleep(400);
-  report.closed.push(`${url.slice(0, 60)} (${marked ? "pool/test marker" : "scratch"})`);
+  report.closed.push(`${url.slice(0, 60)} (${marked ? "pool marker" : "scratch"})`);
 }
 
 if (!dryRun) {

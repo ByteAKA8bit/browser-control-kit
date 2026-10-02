@@ -208,6 +208,51 @@ describe("TabGuard admission", () => {
     assert.equal(next._closed, false);
     guard.dispose();
   });
+
+  it("keeps a tab that was used more recently than the recycle window", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 4, recycleMs: 60_000 });
+
+    const working = await guard.newPage();
+    age(guard, working, 1_000); // quiet for a second, not for a window
+    const next = await guard.newPage();
+
+    assert.notEqual(next, working, "a tab somebody used a second ago is not spare capacity");
+    assert.equal(guard.stats.recycled, 0);
+    assert.equal(guard.owned.size, 2);
+    guard.dispose();
+  });
+
+  it("never recycles a tab whose renderer died without telling us", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 4, recycleMs: 50 });
+
+    const dead = await guard.newPage();
+    age(guard, dead, 10_000);
+    dead._closed = true; // renderer gone; no "close" event ever arrives
+
+    const next = await guard.newPage();
+    assert.notEqual(next, dead, "the idlest tab we own is still a corpse");
+    assert.equal(next.isClosed(), false);
+    assert.equal(guard.stats.recycled, 0);
+    guard.dispose();
+  });
+
+  it("breaks a tie between equally idle tabs on the older one, not the newer", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 2 });
+
+    const first = await guard.newPage();
+    const second = await guard.newPage();
+    age(guard, first, 10_000);
+    guard.owned.get(second).lastUsed = guard.owned.get(first).lastUsed; // exactly as idle
+
+    await guard.newPage();
+    assert.equal(first._closed, true, "a tie goes to the tab we have had longest");
+    assert.equal(second._closed, false);
+    assert.equal(guard.stats.evicted, 1);
+    guard.dispose();
+  });
 });
 
 describe("TabGuard reclaiming", () => {
@@ -324,6 +369,54 @@ describe("TabGuard last-tab rule", () => {
     assert.equal(closed, 0);
     assert.equal(kept, 1);
     assert.equal(only._closed, false);
+    guard.dispose();
+  });
+
+  it("refuses to evict the last tab, and stops counting a tab it cannot close", async () => {
+    const context = fakeContext([]); // the browser has nothing else of its own
+    const guard = guardFor(context, { ceiling: 1 });
+
+    const first = await guard.newPage();
+    const second = await guard.newPage(); // the ceiling says evict; the browser says no
+
+    assert.equal(first._closed, false, "closing it would exit the browser and take the bridge with it");
+    assert.equal(guard.stats.evicted, 0);
+    assert.equal(guard.stats.closed, 0);
+    assert.equal(guard.owned.has(first), false, "a tab we cannot close is no longer counted as ours");
+    assert.equal(guard.owned.size, 1, "so the new tab still fits");
+    assert.equal(second._closed, false);
+    guard.dispose();
+  });
+
+  it("the reaper obeys the same rule: the last tab survives being idle", async () => {
+    const context = fakeContext([]);
+    const guard = guardFor(context, { ceiling: 3, idleMs: 50 });
+
+    const only = await guard.newPage();
+    age(guard, only, 10_000);
+    assert.deepEqual(await guard.reap(), { reaped: 0, blanked: 0 });
+    assert.equal(only._closed, false);
+    assert.equal(guard.owned.size, 1, "kept, and still ours: the refusal is about the browser, not the tab");
+
+    await guard.newPage(); // now there is something else to keep Chrome alive
+    age(guard, only, 10_000);
+    assert.equal((await guard.reap()).reaped, 1);
+    assert.equal(only._closed, true);
+    guard.dispose();
+  });
+
+  it("does not count a tab the operator already closed towards the survivor", async () => {
+    const theirs = fakePage("https://news.example/");
+    const context = fakeContext([theirs]);
+    const guard = guardFor(context, { ceiling: 2 });
+    const mine = await guard.newPage();
+
+    await theirs.close(); // the operator closed their own tab while we worked
+    const { closed, kept } = await guard.closeOwned();
+
+    assert.equal(closed, 0, "a closed tab keeps nothing alive");
+    assert.equal(kept, 1);
+    assert.equal(mine._closed, false);
     guard.dispose();
   });
 });
@@ -504,6 +597,101 @@ describe("named surfaces", () => {
     const guard = guardFor(context, { ceiling: 3 });
     await assert.rejects(() => guard.surface("   "), /non-empty string name/);
     assert.equal(guard.owned.size, 0, "a bad name opens nothing");
+    guard.dispose();
+  });
+
+  it("spends an unbound tab at the ceiling before it breaks any binding", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 2 });
+
+    const docs = await guard.surface("docs");
+    const scratch = await guard.newPage();
+    age(guard, docs, 10_000); // the name is the stalest thing we own
+    age(guard, scratch, 1_000);
+
+    const notes = await guard.surface("notes");
+    assert.equal(scratch._closed, true, "the unbound tab pays, however fresh it is");
+    assert.notEqual(notes, docs);
+    assert.equal(guard.stats.surfacesEvicted, 0, "no name was lost");
+    assert.deepEqual(
+      guard.surfaces().map((s) => s.name),
+      ["docs", "notes"],
+    );
+    guard.dispose();
+  });
+
+  it("leaves a surface alone while a second holder is working in it", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 2 });
+
+    const busy = await guard.surface("busy");
+    guard.hold(busy); // TabPool is driving this tab too
+    const spare = await guard.surface("spare");
+    age(guard, busy, 10_000); // the stalest name, and still not the victim
+    age(guard, spare, 1_000);
+
+    const third = await guard.surface("third");
+    assert.equal(third, spare, "only the name itself holds `spare`, so it is the one that can go");
+    assert.deepEqual(
+      guard.surfaces().map((s) => s.name),
+      ["busy", "third"],
+    );
+    assert.equal(guard.stats.surfacesEvicted, 1);
+    assert.equal(guard.owned.size, 2);
+    guard.dispose();
+  });
+
+  it("refuses rather than taking the tab somebody else is working in", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 1 });
+
+    const only = await guard.surface("one");
+    guard.hold(only); // held by the name AND by a worker
+
+    await assert.rejects(() => guard.surface("two"), /transport tolerates 1 attached tabs/);
+    assert.equal(guard.stats.surfacesEvicted, 0, "an in-use surface is not evictable capacity");
+    assert.equal(guard.stats.refused, 1);
+    assert.equal(only._closed, false);
+    assert.deepEqual(
+      guard.surfaces().map((s) => s.name),
+      ["one"],
+    );
+    guard.dispose();
+  });
+
+  it("breaks a tie between equally idle names on the one bound first", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 2 });
+
+    const one = await guard.surface("one");
+    const two = await guard.surface("two");
+    age(guard, one, 10_000);
+    guard.owned.get(two).lastUsed = guard.owned.get(one).lastUsed; // exactly as idle
+
+    const three = await guard.surface("three");
+    assert.equal(three, one, "a tie goes to the oldest binding");
+    assert.deepEqual(
+      guard.surfaces().map((s) => s.name),
+      ["two", "three"],
+    );
+    guard.dispose();
+  });
+
+  it("never hands a name the tab of a surface whose renderer died", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 2 });
+
+    const gone = await guard.surface("gone");
+    const live = await guard.surface("live");
+    age(guard, gone, 10_000); // stalest, but dead
+    age(guard, live, 1_000);
+    gone._closed = true; // renderer gone; no "close" event ever arrives
+
+    const fresh = await guard.surface("fresh");
+    assert.equal(fresh, live, "a dead tab is not capacity to hand out");
+    assert.equal(fresh.isClosed(), false);
+    assert.equal(guard.stats.surfacesEvicted, 1);
+    assert.equal(guard.owned.size, 2, "and no new renderer was opened either");
     guard.dispose();
   });
 });

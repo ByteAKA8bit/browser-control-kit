@@ -57,10 +57,10 @@ npm i && node scripts/install-hooks.mjs   # Node >= 22. Not Bun: its WebSocket c
 # one-time: install the Playwright Extension, store the token from its status page
 mkdir -p ~/.config/browser-control && pbpaste > ~/.config/browser-control/token && chmod 600 $_
 
-npm run test:offline   # tab governance, websocket codec, shim, MCP protocol — 69 cases, no browser needed
+npm run test:offline   # tab governance, websocket codec, shim, MCP protocol — 140 cases, no browser needed
 npm run test:unit      # DOM input, 16 cases   (needs Chrome + token)
 npm run test:pool      # parallel pool, 8 cases (needs Chrome + token)
-npm test               # all four suites, --test-concurrency=1
+npm test               # all ten suites, --test-concurrency=1
 npm run selftest       # end-to-end smoke; writes ./selftest.png
 npm run cleanup        # closes the tabs this tool left behind (--dry-run reports only)
 npm run shim           # /json/* rebuild + CDP proxy; only for BC_MODE=cdp
@@ -185,7 +185,7 @@ Ten tools, one terse line each: `browser_status`, `browser_navigate` (`{url, as?
 
 ```bash
 npm run mcp            # run it by hand
-node --test packages/mcp-server/test/protocol.test.mjs   # protocol cases, no browser needed
+node --test packages/mcp-server/test/protocol.test.mjs   # 25 protocol cases, no browser needed
 ```
 
 ## Guards derived from crashes
@@ -208,7 +208,7 @@ On 2026-09-05, Chrome 152 + the Playwright Extension were crashed or made to qui
 node scripts/install-hooks.mjs   # git config core.hooksPath .githooks
 ```
 
-- `pre-commit` → `node scripts/check.mjs --offline`: `node --check` on every `.mjs`, no stray `console.debug` / `debugger;`, **the crash guards are still in the source**, licence metadata, and the 21 browserless cases
+- `pre-commit` → `node scripts/check.mjs --offline`: `node --check` on every `.mjs`, no stray `console.debug` / `debugger;`, **the crash guards are still in the source**, licence metadata, and the 140 browserless cases
 - `pre-push` → the same plus the real-browser suites; when Chrome is closed or the token is missing they are **skipped with a notice**, never blocking the push
 
 `.github/workflows/ci.yml` runs the offline tier on Node 22. The browser tier cannot run in CI — it needs the operator's Chrome and an extension token.

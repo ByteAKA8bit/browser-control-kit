@@ -15,8 +15,8 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 test/tab-guard.test.mjs test/ws-server.test.mjs test/shim-autostart.test.mjs test/shim-policy.test.mjs test/dom-input.test.mjs test/pool.test.mjs",
-    "test:offline": "node --test test/tab-guard.test.mjs test/ws-server.test.mjs test/shim-autostart.test.mjs test/shim-policy.test.mjs",
+    "test": "node --test --test-concurrency=1 test/tab-guard.test.mjs test/ws-server.test.mjs test/shim-autostart.test.mjs test/shim-policy.test.mjs test/shim-recovery.test.mjs test/shim-service.test.mjs test/shim-session.test.mjs test/dom-input.test.mjs test/pool.test.mjs",
+    "test:offline": "node --test test/tab-guard.test.mjs test/ws-server.test.mjs test/shim-autostart.test.mjs test/shim-policy.test.mjs test/shim-recovery.test.mjs test/shim-service.test.mjs test/shim-session.test.mjs",
     "selftest": "node selftest.mjs",
     "cleanup": "node cleanup.mjs",
     "shim": "node src/cdp-shim.mjs"

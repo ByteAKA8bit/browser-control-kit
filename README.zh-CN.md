@@ -47,7 +47,7 @@ npm i && node scripts/install-hooks.mjs      # Node ≥ 22；不要用 Bun（其
 # 一次性：装 Playwright Extension，把 status 页的 token 存起来
 mkdir -p ~/.config/browser-control && pbpaste > ~/.config/browser-control/token && chmod 600 $_
 
-npm run test:offline     # 标签治理 + WebSocket 编解码 21 例（不需要浏览器，pre-commit 也跑）
+npm run test:offline     # 标签治理、WebSocket 编解码、shim、MCP 协议 140 例（不需要浏览器，pre-commit 也跑）
 npm run test:unit        # DOM 输入 16 例
 npm run test:pool        # 并行 8 例
 npm run selftest         # 端到端自检
@@ -181,7 +181,7 @@ Agent 总爱把这个仓库现场包成 MCP,然后连接断断续续、标签越
 
 ```bash
 npm run mcp            # 手动跑
-node --test packages/mcp-server/test/protocol.test.mjs   # 协议用例,不需要浏览器
+node --test packages/mcp-server/test/protocol.test.mjs   # 25 个协议用例,不需要浏览器
 ```
 
 ## 本地 CI（git hook + GitHub Actions 的 offline 层）

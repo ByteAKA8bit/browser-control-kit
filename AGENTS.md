@@ -34,7 +34,7 @@ graph LR
 
 **Pool.** `new TabPool(context, { size, capabilities, prepare, reuse, mode }).start()` reclaims tabs marked `sessionStorage.bcPoolTab === "1"`, creates the rest only when allowed, and `map()` runs `min(size, items.length)` runners over a shared cursor. `map()` **never rejects** — failures land as `{ ok: false, error, ms, tab }`.
 
-**cdp mode.** `npm run shim` serves `127.0.0.1:9333`: it reads `DevToolsActivePort`, holds **one** auto-reconnecting websocket to Chrome, rebuilds `/json/version`, `/json`, `/json/list`, `/json/new`, `/json/activate|close/<id>` on top of `Target.*`, **and proxies every automation client over that single socket** (hand-rolled RFC 6455 server in `src/ws-server.mjs`). This is load-bearing, not a nicety: Chrome prompts the operator to approve each new external CDP connection and never persists the answer, so advertising Chrome's own websocket URL would mean one dialog per `attach()`. Client ids are rewritten to shim-global ids; `/devtools/page/<targetId>` clients get a flat `Target.attachToTarget` session with `sessionId` injected inbound and stripped outbound. An unapproved Chrome 404s all `/json/*` and hangs the websocket handshake — that, not a disabled endpoint, is what the shim works around.
+**cdp mode.** `npm run shim` serves `127.0.0.1:9333`: it reads `DevToolsActivePort`, holds **one** auto-reconnecting websocket to Chrome, rebuilds `/json/version`, `/json`, `/json/list`, `/json/new`, `/json/activate|close/<id>` on top of `Target.*`, **and proxies every automation client over that single socket** (hand-rolled RFC 6455 server in `src/ws-server.mjs`). `GET /shim/status` → `{ attached, reason, chrome, portFile }` is the shim's own diagnostic surface, not part of DevTools discovery, and is answered ahead of the Chrome round-trip so it still replies when Chrome is unreachable — that is how `attach({ mode: "cdp" })` tells "no shim" from "no `--remote-debugging-port`" from "waiting for the operator's Allow". This is load-bearing, not a nicety: Chrome prompts the operator to approve each new external CDP connection and never persists the answer, so advertising Chrome's own websocket URL would mean one dialog per `attach()`. Client ids are rewritten to shim-global ids; `/devtools/page/<targetId>` clients get a flat `Target.attachToTarget` session with `sessionId` injected inbound and stripped outbound. An unapproved Chrome 404s all `/json/*` and hangs the websocket handshake — that, not a disabled endpoint, is what the shim works around.
 
 **Shim autostart.** `attach({ mode: "cdp" })` calls `ensureShim()` (both `ensureShim`/`probeShim` are exported from `src/attach.mjs`): it probes `BC_CDP_URL ?? http://localhost:9333` (`/json/version`, `BC_SHIM_PROBE_MS` = 1 s) and, when nothing answers, spawns `src/cdp-shim.mjs` **detached and unref'd** so it outlives this run, waiting up to `BC_SHIM_START_MS` (15 s). `BC_SHIM_AUTOSTART=0` turns a missing shim back into an error; a non-local `BC_CDP_URL` always errors. `capabilities.shim = { url, started, pid }` records whether the operator saw a dialog. The shim keeps its approved socket warm with a `Browser.getVersion` every `BC_SHIM_KEEPALIVE_MS` (30 s, `0` disables) — unref'd, and never fired before the first client, so it cannot pop the approval dialog on its own.
 
@@ -43,7 +43,7 @@ graph LR
 | Path | Purpose |
 | --- | --- |
 | `packages/browser-control/src/` | All library code (10 modules, see below) |
-| `packages/browser-control/test/` | `node:test` suites, flat, `<area>.test.mjs` (6 files; only `dom-input` and `pool` need a browser) |
+| `packages/browser-control/test/` | `node:test` suites, flat, `<area>.test.mjs` (9 files; only `dom-input` and `pool` need a browser) |
 | `packages/mcp-server/` | `browser-control-mcp`: MCP stdio server wrapping `browser-control` (`bin/`, `src/server.mjs` + `tools.mjs` + `transport.mjs`, `test/protocol.test.mjs`), its only dependency |
 | `packages/antd-kit/` | Single-file `index.mjs`, antd v6 overlay helpers |
 | `scripts/` | Local CI (`check.mjs`), hook installer, launchd shim installer, `crash-repro.mjs` |
@@ -54,8 +54,8 @@ graph LR
 ```bash
 npm i && node scripts/install-hooks.mjs   # one-time: git config core.hooksPath .githooks
 
-npm test            # 7 suites in one process, --test-concurrency=1 (dom-input + pool need Chrome + token)
-npm run test:offline # browserless tier: tab-guard (31) + ws-server (8) + shim-autostart (8) + shim-policy (6) + mcp protocol (16) = 69
+npm test            # 10 suites in one process, --test-concurrency=1 (dom-input + pool need Chrome + token)
+npm run test:offline # browserless tier: tab-guard (42) + ws-server (17) + shim-autostart (11) + shim-policy (6) + shim-recovery (19) + shim-service (8) + shim-session (12) + mcp protocol (25) = 140
 npm run test:unit   # dom-input.test.mjs  (16 cases)
 npm run test:pool   # pool.test.mjs       (8 cases)
 npm run selftest    # end-to-end smoke; writes ./selftest.png, exits 1 on failure
@@ -75,9 +75,9 @@ There is **no ESLint, Prettier, tsc, or bundler**. `scripts/check.mjs` is the en
 
 1. `node --check` on every `*.mjs` (skips `node_modules` and dot-dirs — a `.js`/`.ts` file would silently escape it).
 2. Rejects lines starting with `console.debug` or `debugger;`.
-3. **Crash-guard string audit** — seven literals must survive in source: `BC_ALLOW_TAB_CREATE`, `MAX_TABS_EXTENSION`, `only ONE pool per connection` in `src/pool.mjs`; `serialiseNavigation`, `BC_ALLOW_INIT_SCRIPT` in `src/page.mjs`; `protectedPages`, `ordinary.length <= 1` in `src/tab-guard.mjs`. Renaming them without updating `scripts/check.mjs` breaks pre-commit.
+3. **Crash-guard string audit** — eight literals must survive in source: `BC_ALLOW_TAB_CREATE`, `MAX_TABS_EXTENSION`, `only ONE pool per connection`, `function wouldEmptyBrowser` in `src/pool.mjs`; `serialiseNavigation`, `BC_ALLOW_INIT_SCRIPT` in `src/page.mjs`; `protectedPages`, `wouldEmptyBrowser(` in `src/tab-guard.mjs`. Renaming them without updating `scripts/check.mjs` breaks pre-commit.
 4. `LICENSE` exists and `packages/browser-control/package.json` `license === "MIT"`.
-5. The browserless `browser-control` suites `tab-guard.test.mjs` (13), `ws-server.test.mjs` (8), `shim-autostart.test.mjs` (8), each its own `step()`.
+5. The browserless suites `tab-guard.test.mjs` (42), `ws-server.test.mjs` (17), `shim-autostart.test.mjs` (11), `shim-policy.test.mjs` (6), `shim-recovery.test.mjs` (19), `shim-service.test.mjs` (8), `shim-session.test.mjs` (12) and `packages/mcp-server/test/protocol.test.mjs` (25), each its own `step()`.
 
 Browser tier is gated on `pgrep -f 'MacOS/Google Chrome'` plus a token; missing either → *skipped with a notice, exit 0*. Never blocks a push.
 
@@ -89,10 +89,16 @@ Browser tier is gated on `pgrep -f 'MacOS/Google Chrome'` plus a token; missing 
 - **Playwright internals are quarantined** in `src/extension-transport.mjs` ("THE ONLY FILE THAT TOUCHES PLAYWRIGHT INTERNALS"). Version bumps land there and nowhere else.
 - **Errors**: `throw new Error("<full sentence naming the env-var escape hatch and why>")`, e.g. `` `click(${selector}) failed: ${res?.reason}` ``. Flatten with `String(err?.message ?? err).split("\n")[0]`. Expected failures use terse `catch {}` / `.catch(() => {})` **with a comment explaining why**.
 - **Degraded ops return, not throw**: `{ skipped: true, reason: "attached-browser-keeps-its-own-size" }` (`setViewport`, `evaluateOnNewDocument`).
-- **In-page primitives** (`dom-input.mjs`, `transfer.mjs`) are `UPPER_SNAKE` consts returning `{ ok: true, ... } | { ok: false, reason }` with stable reason strings (`not-found`, `zero-size`, `disabled`, `pointer-events-none`, `hidden`, `readonly`, `obscured-by:<TAG>.<class>`, `rejected-by-accept:<accept>`). They **must stay self-contained** — no imports, no closure captures — and `deepSrc` (then `transferSrc`) is always the **last** argument. Changing an arg list means changing `inAnyFrame`/`inAnyFrame2` in `page.mjs`.
+- **In-page primitives** (`dom-input.mjs`, `transfer.mjs`) are `UPPER_SNAKE` consts returning `{ ok: true, ... } | { ok: false, reason }` with stable reason strings (`not-found`, `zero-size`, `disabled`, `pointer-events-none`, `hidden`, `readonly`, `obscured-by:<TAG>.<class>`, `rejected-by-accept:<accept>`). They **must stay self-contained** — no imports, no closure captures — and `deepSrc` (then `transferSrc`) is always the **last** argument. Changing an arg list means changing `inAnyFrame` in `page.mjs`.
 - **Multi-arg `evaluate` is emulated** (`applyInPage` + `new Function`) because Playwright accepts exactly one arg. Do not "simplify" it.
 - **Config** is read inline at call time: `process.env.BC_X ?? default`, booleans as `=== "1"`, each flag documented in the adjacent comment.
-- **Docs live in comments**: per-file `//` header stating goal/non-goal, dated incident notes (`2026-09-05: …`), `NEVER`/`DANGEROUS` warnings. One-line `/** */` JSDoc on nearly every export; `@param {{…}}` for options bags. No `.d.ts`.
+- **Docs live in comments**, under hard limits — the repo's comment/code ratio is a reviewed number, and an unbounded version of this rule is what pushed `src` to 0.38. No `.d.ts`.
+  - File header **≤ 12 lines**: the goal, the explicit non-goal, the single most important invariant. No stories, no analogies.
+  - Incident notes are **one line**: `// 2026-09-05: <observed fact> → <resulting constraint>`. Dates, crash evidence and measured numbers **stay** — what gets compressed is the rhetoric, not the evidence.
+  - **One-line `/** */` JSDoc** on exports; `@param {{…}}` only when the parameter is an options bag. Never restate what the function name already says.
+  - Any single run of comment lines outside the header is **≤ 8 lines**. Longer means the function should be split, or the comment deleted.
+  - Banned: narrating what the code does; aphorisms and second-person lecturing; the same fact stated both in the file header and at the function — keep the copy nearest the code.
+  - Keep `NEVER`/`DANGEROUS` warnings, env-var escape hatches, and why a seemingly redundant guard exists. Test for everything else: delete the comment — would someone taking over in six months write a bug because of it? Yes → keep it, compressed to one line. No → delete it.
 - **Reporting**: scripts accumulate `step(name, ok, detail)` records and print a single `JSON.stringify(report, null, 2)` at the end. No logger, no levels.
 - **Module-level mutable state is process-wide**, not per-connection: `navChain` (`page.mjs`), `poolsStartedOnExtension` (`pool.mjs`), `socket`/`seq`/`pending` (`cdp-shim.mjs`).
 
@@ -123,8 +129,8 @@ antd **v6**: modal bodies are `.ant-modal-container` (v5's `.ant-modal-content` 
 | `src/ws-server.mjs` | Dependency-free RFC 6455 server: `accept`, `upgrade`, `WsConnection`, `encodeFrame`, `decodeFrame` |
 | `src/page.mjs` | `controlPage` Proxy, nav lock, frame fan-out, `blockUrls` |
 | `src/dom-input.mjs` / `src/transfer.mjs` | Stringified in-page click/type/upload/drag primitives |
-| `src/pool.mjs` | `TabPool`, `parallelMap`, tab ceilings |
-| `src/tab-guard.mjs` | `TabGuard`: named surfaces (`surface`/`release`/`surfaces`, LRU release at the ceiling), recycling, measured idle windows, blank-then-close reclaiming, `guardContext`, `guardBrowser`, `tabCeiling` |
+| `src/pool.mjs` | `TabPool`, `parallelMap`, tab ceilings, and the single source of `wouldEmptyBrowser`, `MARKER` (`bcPoolTab`) and `TAB_SETTLE_MS` |
+| `src/tab-guard.mjs` | `TabGuard`: named surfaces (`surface`/`release`/`surfaces`, LRU release at the ceiling), recycling, measured idle windows, blank-then-close reclaiming, `guardContext`, `guardBrowser`, `tabCeiling`; imports the crash constants from `src/pool.mjs` |
 | `src/fixtures.mjs` | `makeXlsx/makeCsv/makePng/asUpload`, hand-rolled ZIP+CRC32 |
 | `selftest.mjs` / `cleanup.mjs` | Operator scripts (not published tests) |
 | `scripts/check.mjs` | The CI |
@@ -141,11 +147,15 @@ Subpath exports: `browser-control/fixtures`, `/pool`, `/tab-guard`, `/shim`. Add
 - **npm** workspaces; `package-lock.json` is committed (CI runs `npm ci`) — lockfile changes belong in the commit. The root manifest is `private: true` but still carries `license`/`author`/`repository`/`homepage`/`bugs`.
 - All source is `.mjs`. Do not introduce `.js`, `.ts`, or a build step.
 - Cross-platform where it counts: the shim resolves Chrome's user-data-dir per platform (`CHROME_PROFILE_DIRS` in `src/cdp-shim.mjs`, override with `CHROME_PORT_FILE`), and `scripts/check.mjs` probes for a running Chrome on win32/posix. `scripts/install-shim-service.mjs` is launchd-only and says so; `scripts/crash-repro.mjs` is macOS-only by design.
-- Key env flags: `BC_MODE`, `BC_CDP_URL`, `BC_TRACE`, `BC_MAX_TABS`, `BC_MAX_TABS_EXTENSION`, `BC_TAB_SETTLE_MS`, `BC_ALLOW_TAB_CREATE`, `BC_REUSE_ANY`, `BC_PARALLEL_NAV`, `BC_VIEWPORT`, `BC_ALLOW_INIT_SCRIPT`, `BC_TAB_GUARD`, `BC_TAB_BUDGET`, `BC_TAB_RECYCLE_MS`, `BC_TAB_BLANK_MS`, `BC_TAB_IDLE_MS`, `BC_TAB_EVICT`, `BC_KEEP_BRIDGE_TAB`, `BC_TOKEN_FILE`, `PLAYWRIGHT_MCP_EXTENSION_TOKEN`, `SHIM_PORT`, `CHROME_PORT_FILE`, `BC_SHIM_AUTOSTART`, `BC_SHIM_KEEPALIVE_MS`, `BC_SHIM_PROBE_MS`, `BC_SHIM_START_MS`, `BC_CRASH_REPRO`.
+- Key env flags: `BC_MODE`, `BC_CDP_URL`, `BC_TRACE`, `BC_MAX_TABS`, `BC_MAX_TABS_EXTENSION`, `BC_TAB_SETTLE_MS`, `BC_ALLOW_TAB_CREATE`, `BC_REUSE_ANY`, `BC_PARALLEL_NAV`, `BC_VIEWPORT`, `BC_ALLOW_INIT_SCRIPT`, `BC_TAB_GUARD`, `BC_TAB_BUDGET`, `BC_TAB_RECYCLE_MS`, `BC_TAB_BLANK_MS`, `BC_TAB_IDLE_MS`, `BC_TAB_EVICT`, `BC_KEEP_BRIDGE_TAB`, `BC_TOKEN_FILE`, `PLAYWRIGHT_MCP_EXTENSION_TOKEN`, `SHIM_PORT`, `CHROME_PORT_FILE`, `BC_SHIM_AUTOSTART`, `BC_SHIM_KEEPALIVE_MS`, `BC_SHIM_PROBE_MS`, `BC_SHIM_START_MS`, `BC_SHIM_PROXY_TIMEOUT_MS`, `BC_CRASH_REPRO`.
 
 ## Testing & QA
 
-Framework: built-in `node:test` (BDD) + `node:assert/strict`. No mocks, no snapshots, no coverage tooling, no reporters. Browserless: `tab-guard` (13), `ws-server` (8), `shim-autostart` (8), `shim-policy`, and `packages/mcp-server/test/protocol`. Needing a running Chrome and an extension token: `dom-input` (16), `pool` (8).
+Framework: built-in `node:test` (BDD) + `node:assert/strict`. No mocks, no snapshots, no coverage tooling, no reporters. Browserless: `tab-guard` (42), `ws-server` (17), `shim-autostart` (11), `shim-policy` (6), `shim-recovery` (19), `shim-service` (8), `shim-session` (12), and `packages/mcp-server/test/protocol` (25). Needing a running Chrome and an extension token: `dom-input` (16), `pool` (8).
+
+`shim-recovery.test.mjs` pins the shim's recovery semantics: every pending call ends definitely (a timeout, the browser socket dropping, the client dropping all produce an id-matched error reply), a late real answer is neither delivered twice nor fatal, the `EADDRINUSE` loser exits 0 without ever having dialled Chrome — so losing the race costs no approval click — `/shim/status` still answers while Chrome is unreachable, and the three cdp `attach()` failures give three different messages. `shim-service.test.mjs` pins launchd plist generation: XML escaping that does not change the value launchd actually receives, `KeepAlive` paired with `ThrottleInterval` so a crashing shim cannot loop, and only the environment variables that were really set being captured. Its `plutil` cross-check is darwin-only and skips rather than fails elsewhere, because the offline tier runs on a Linux runner.
+
+`shim-session.test.mjs` pins who gets which CDP event: a session a client opened itself (`Target.attachToTarget`, flattened) belongs to that client alone, a page client's nested session reaches the page client rather than the browser endpoint, ownership is given back on detach, on `Target.detachedFromTarget` and when the owner disconnects, and an event for a session nobody owns still reaches every browser-endpoint client instead of vanishing. Same hermetic shape as the two above: fake Chrome, real shim child, raw clients.
 
 `--test-concurrency=1` is mandatory: the extension accepts exactly one client, so two parallel suite processes mean one cannot connect and the other is interrupted. One `attach()` per process.
 
@@ -160,9 +170,3 @@ Writing a new test:
 7. **Register the file in all three hardcoded lists — there is no discovery**: root `package.json` `scripts.test`, `packages/browser-control/package.json` `scripts.test`, and the suite array in `scripts/check.mjs`. A browserless suite also belongs in both `test:offline` scripts and gets its own `step()` in the offline tier of `scripts/check.mjs`, so it runs on every commit and in GitHub Actions.
 
 `selftest.mjs` is the acceptance smoke (attach → navigate → background-tab input → screenshot), not a `node:test` file. Run `npm run cleanup` after test runs: tabs reused from a previous run are kept by design, and the guard's marker makes them findable.
-
-### Known doc drift (verified against source)
-
-- `examples/parallel-screenshots.mjs:26` claims `pool.close()` is a no-op on the extension transport; it is not — only *reused* tabs are kept (`closeReused` defaults `false`), and `pool.test.mjs` asserts tabs are actually closed.
-- `scripts/crash-repro.mjs` and `src/pool.mjs` comments cite `test/crash-repro.mjs`; the file lives at `scripts/crash-repro.mjs` and requires `BC_CRASH_REPRO=1`.
-- `scripts/check.mjs`'s offline tier and the root `test:offline` script both run all five browserless suites; `.github/workflows/ci.yml`'s header no longer quotes a case count.

@@ -1,16 +1,13 @@
 // File upload and drag & drop for the DOM-input path.
 //
-// Both are normally CDP/OS-level operations:
-//   * Playwright's setInputFiles uses DOM.setFileInputFiles
-//   * dragAndDrop moves the real mouse
-// Neither is available when we only have a background tab (extension transport),
-// so they are rebuilt from web APIs that need no privileged access:
-//
-//   files  → new File(bytes) → DataTransfer → input.files + change/input events
-//   drop   → the same DataTransfer delivered as dragenter/dragover/drop
-//   drag   → HTML5 (dragstart/dragover/drop/dragend) AND pointer-event drags,
-//            because dnd-kit / react-dnd style libraries listen to pointers, not
-//            to the HTML5 drag API
+// Normally CDP/OS-level (setInputFiles → DOM.setFileInputFiles; dragAndDrop
+// moves the real mouse), unavailable with only a background tab (extension
+// transport), so they are rebuilt from unprivileged web APIs:
+//   files → new File(bytes) → DataTransfer → input.files + input/change events
+//   drop  → the same DataTransfer delivered as dragenter/dragover/drop
+//   drag  → HTML5 (dragstart/dragover/drop/dragend) AND pointer-event drags,
+//           because dnd-kit / react-dnd style libraries listen to pointers,
+//           not to the HTML5 drag API
 //
 // Stringified into the page, so: self-contained, no imports, no closures.
 

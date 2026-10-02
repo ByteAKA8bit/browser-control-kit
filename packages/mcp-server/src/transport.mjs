@@ -1,16 +1,8 @@
-// Newline-delimited JSON over stdin/stdout — the framing layer only.
-//
-// Non-goal: JSON-RPC semantics (src/server.mjs) and anything to do with a
-// browser (src/tools.mjs). Nothing here imports browser-control, so an idle
-// server never loads playwright-core.
-//
-// Two properties every MCP client silently depends on, and that hand-rolled
-// servers usually get wrong:
-//   * stdout carries protocol bytes and NOTHING else. One stray diagnostic
-//     print from any module in the process desynchronises the stream and the
-//     client reports "server disconnected" with no explanation.
-//   * a response larger than the pipe buffer (a screenshot) must be queued on
-//     backpressure, never written while an earlier one is still draining.
+// NDJSON framing over stdin/stdout. Non-goal: JSON-RPC semantics
+// (./server.mjs) and browsers (./tools.mjs) — nothing here imports
+// browser-control, so an idle server never loads playwright-core.
+// Invariant: stdout carries protocol bytes and nothing else; one stray print
+// desynchronises the stream and the client reports "server disconnected".
 
 /** Split arbitrary stdin chunks into whole lines; blank lines are ignored. */
 export function createLineDecoder(onLine) {
@@ -28,17 +20,21 @@ export function createLineDecoder(onLine) {
 }
 
 /**
- * Take over `stdout`: returns the only function that still reaches it, and
- * reroutes everyone else's writes (a stray print, a dependency's banner) to
- * stderr instead of letting them corrupt the protocol stream.
+ * Take over `stdout`: the returned `write` is the only one still reaching it,
+ * everyone else is rerouted to stderr. `restore()` is mandatory — a host can
+ * start a second server in-process, and a capture left in place would be taken
+ * for the real write, sending that server's protocol bytes to stderr.
  */
 export function captureStdout(stdout = process.stdout, stderr = process.stderr) {
-  const real = stdout.write.bind(stdout);
-  stdout.write = (chunk, encoding, cb) => stderr.write(chunk, encoding, cb);
-  return real;
+  const original = stdout.write;
+  const write = original.bind(stdout);
+  const reroute = (chunk, encoding, cb) => stderr.write(chunk, encoding, cb);
+  stdout.write = reroute;
+  // Only our own capture is ours to undo; a later wrapper owns what it added.
+  return { write, restore: () => { if (stdout.write === reroute) stdout.write = original; } };
 }
 
-/** Serialise writes behind backpressure so no two messages interleave. */
+/** Queue writes behind backpressure so a screenshot never interleaves with the next reply. */
 export function createWriter(write, stream) {
   const queue = [];
   let blocked = false;
@@ -66,35 +62,20 @@ export function log(message) {
 }
 
 /**
- * An MCP stdio server is owned by its client: the protocol hands the other end
- * of these pipes to that client, so the pipes ARE the lifetime. stdin ending —
- * or either stream breaking — means the client is gone, including when it was
- * killed outright, because the kernel closes its end for it.
- *
- * What this deliberately does NOT do is watch `process.ppid` for re-parenting.
- * It reads like a fact and is a guess: plenty of clients are started behind a
- * launcher that exits immediately, and exiting then would end a session that is
- * still working — trading a wasted process for lost work. It is also unreliable
- * exactly where it would matter (Windows has no re-parenting; a container whose
- * parent is already PID 1 never changes) and it would put a polling timer in a
- * server that promises to have none.
- *
- * The one case pipes cannot cover is a caller that hands us a stdin it shares
- * with something else (`stdio: "inherit"`), which nobody will ever close. That
- * is a bug in the spawn, and it is said out loud instead of guessed around.
+ * The client owns these pipes, so stdin ending or either stream breaking means
+ * it is gone — including when killed, since the kernel closes its end. NEVER
+ * swap this for `process.ppid` watching: launchers that exit immediately would
+ * end live sessions, it is a no-op on Windows and under PID 1, and it needs a
+ * polling timer. A stdin shared via `stdio: "inherit"` is a bug in the spawn.
  */
 export function clientOwnsStdin(input = process.stdin) {
   return !input.isTTY;
 }
 
-/**
- * Wire stdin/stdout into one message stream.
- * @param {{ input?: NodeJS.ReadableStream, output?: NodeJS.WritableStream,
- *           onMessage: (message: unknown) => void, onParseError: (line: string) => void,
- *           onEnd: () => void }} handlers
- */
+/** Wire stdin/stdout into one message stream. */
 export function createStdioTransport({ input = process.stdin, output = process.stdout, onMessage, onParseError, onEnd }) {
-  const send = createWriter(captureStdout(output), output);
+  const captured = captureStdout(output);
+  const send = createWriter(captured.write, output);
   const decode = createLineDecoder((line) => {
     let message;
     try {
@@ -108,8 +89,7 @@ export function createStdioTransport({ input = process.stdin, output = process.s
   });
   input.setEncoding("utf8");
   input.on("data", decode);
-  // Every way the client can vanish, not just the polite one: stdin ends, stdin
-  // breaks, or stdout refuses our writes (EPIPE — nobody is reading any more).
+  // Every way the client can vanish: stdin ends, stdin breaks, stdout EPIPEs.
   input.on("end", onEnd);
   input.on("error", onEnd);
   output.on("error", onEnd);
@@ -118,6 +98,7 @@ export function createStdioTransport({ input = process.stdin, output = process.s
     stop: () => {
       input.pause();
       input.destroy?.();
+      captured.restore();
     },
   };
 }

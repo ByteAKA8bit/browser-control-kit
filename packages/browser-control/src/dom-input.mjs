@@ -1,16 +1,15 @@
 // DOM-level input primitives, used when the transport has no focus emulation
 // (Playwright's real input needs a foreground/emulated-focus tab).
 //
-// These functions are stringified and evaluated inside the page, so they must be
-// self-contained — no imports, no closures.
+// Stringified and evaluated inside the page: self-contained, no imports, no
+// closures. `deepSrc` is always the last argument.
 //
-// Two things they deliberately re-implement, because losing them would make
-// tests pass where a human cannot click:
+// Deliberately re-implemented, because losing them makes tests pass where a
+// human cannot click:
 //   * actionability: size, disabled, pointer-events, visibility, and a real
-//     elementFromPoint hit test (reported as `obscured-by:<tag>.<class>`)
+//     elementFromPoint hit test (reported as `obscured-by:<TAG>.<class>`)
 //   * reach: open shadow roots are pierced (document.querySelector cannot);
-//     cross-document frames are handled by the caller, which retries the same
-//     op in every frame.
+//     cross-document frames are retried op-by-op by the caller.
 
 /** Collect matches from the document AND every open shadow root. */
 export const DEEP_QUERY_ALL = function deepQueryAll(root, selector, out) {

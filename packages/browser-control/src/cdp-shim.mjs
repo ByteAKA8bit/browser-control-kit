@@ -1,25 +1,13 @@
 // Long-lived CDP shim for the operator's real Chrome: ONE approved connection.
-//
-// Runs on Node (>= 22, for the global WebSocket) — same runtime as the rest of
-// the harness, which is pinned by ../.nvmrc.
-//
-// Why it exists, in order of how much pain each point caused:
-//
-//   1. Chrome asks the operator to approve EVERY new external CDP connection to
-//      the default profile, and the grant is not persisted. Until it is
-//      approved, /json/* answers 404 and the websocket handshake just hangs.
-//      So the shim keeps ONE approved browser socket and *proxies* every client
-//      over it: approve once per Chrome restart, not once per run. Handing out
-//      Chrome's own websocket URL (what this file used to do) meant a fresh
-//      dialog per attach — the shim only ever saved the HTTP half of the job.
-//   2. The same Chrome serves the DevTools websocket but 404s /json discovery,
-//      which puppeteer-style clients need; those endpoints are rebuilt here on
-//      top of the one socket.
-//
-// Multiplexing rules: command ids are rewritten to shim-global ids and mapped
-// back per client; events without a session go to every browser-endpoint
-// client; a client attached to /devtools/page/<targetId> gets its own flat CDP
-// session, with sessionId stripped on the way out and injected on the way in.
+// Chrome asks the operator to approve EVERY new external CDP connection to the
+// default profile and never remembers the answer; an unapproved Chrome 404s all
+// /json/* and hangs the ws handshake. So the shim holds one approved browser
+// socket, proxies every client over it (ids rewritten, events routed by session)
+// and rebuilds /json/* on top of it. NEVER advertise Chrome's own ws URL: that
+// is a dialog per attach, which is what this file used to cost.
+// Non-goal: starting, quitting or configuring the operator's Chrome.
+// Invariant: approval clicks = shim processes, so one shim owns the port.
+// Runs on Node >= 22 (global WebSocket), pinned by ../.nvmrc.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
@@ -39,19 +27,15 @@ const ACTIVE_PORT_FILE =
   process.env.CHROME_PORT_FILE ?? path.join((CHROME_PROFILE_DIRS[os.platform()] ?? CHROME_PROFILE_DIRS.linux)(), "DevToolsActivePort");
 
 let chromePort = Number(process.env.CHROME_PORT ?? 9222);
-// A browser socket that drops costs the operator another "Allow" click, and an
-// idle websocket is exactly what intermediaries and sleep states reap. One
-// Browser.getVersion per interval keeps it warm; 0 disables the timer.
+// A dropped browser socket costs another "Allow" click, and idle websockets are
+// what sleep states reap; one Browser.getVersion per interval keeps it warm.
+// BC_SHIM_KEEPALIVE_MS=0 switches the timer off.
 const KEEPALIVE_MS = Number(process.env.BC_SHIM_KEEPALIVE_MS ?? 30_000);
 let connects = 0;
 
-// Browser-destroying commands the shim answers ITSELF instead of forwarding.
-// The operator's Chrome is not ours to quit: a playwright `browser.close()` on
-// a connectOverCDP connection sends Browser.close, and over this shared socket
-// that killed the operator's real browser (and then the shim, reconnecting into
-// nothing) — measured twice on 2026-10-02. A `{}` reply is what the client
-// wants anyway; it drops its own socket next, which is all closing a *client*
-// ever needed. Crash/crashGpuProcess are the same weapon with a worse exit.
+// Browser-destroying commands the shim answers ITSELF with `{}` rather than
+// forward: playwright's browser.close() sends Browser.close, which over this
+// shared socket killed the operator's real browser — measured twice 2026-10-02.
 const REFUSED_METHODS = new Set(["Browser.close", "Browser.crash", "Browser.crashGpuProcess"]);
 
 async function endpoint() {
@@ -63,11 +47,34 @@ async function endpoint() {
 
 let socket = null;
 let connecting = null;
+// Why the one socket is down, phrased for the operator, or null while healthy.
+// /shim/status hands it to attach.mjs: "no debugging port" vs "click Allow".
+let notAttached = null;
 let seq = 0;
-/** shimId -> { resolve, reject } for our own calls, or { client, id } for proxied ones. */
+// Ceiling for a proxied command Chrome never answers, looser than our own 15s
+// because a client's navigation may be slow. BC_SHIM_PROXY_TIMEOUT_MS moves it.
+const PROXY_TIMEOUT_MS = Number(process.env.BC_SHIM_PROXY_TIMEOUT_MS ?? 60_000);
+/** shimId -> { resolve, reject } for our own calls, or { client, id, timer, attach, detaching } for proxied ones. */
 const pending = new Map();
 /** Every attached automation client. A page client also carries its CDP session. */
 const clients = new Set();
+// sessionId -> owning client, learnt only from attach REPLIES (Chrome names the
+// session there) and forgotten on detach. Untracked client-opened sessions sent
+// one run's page events to every other browser-endpoint client instead.
+const sessionOwner = new Map();
+const ATTACH_METHODS = new Set(["Target.attachToTarget", "Target.attachToBrowserTarget"]);
+
+/** Why connect() failed: a hung handshake means Chrome is listening and waiting on Allow, ENOENT/refusal means no debugging port at all. */
+function whyNotAttached(err) {
+  const detail = String(err?.message ?? err).split("\n")[0];
+  if (detail.includes("connect timeout")) {
+    return `Chrome is listening but never finished the websocket handshake, which is what it does while an approval dialog is open: click Allow in Chrome (${detail})`;
+  }
+  if (detail.includes("ENOENT")) {
+    return `no DevToolsActivePort at ${ACTIVE_PORT_FILE}, so this Chrome was not started with --remote-debugging-port, or it runs on another profile — set CHROME_PORT_FILE to that profile's file (${detail})`;
+  }
+  return `nothing usable answered on ${CHROME_HOST}:${chromePort} — set CHROME_HOST/CHROME_PORT if Chrome's debugging port is not the default one (${detail})`;
+}
 
 async function connect() {
   if (socket?.readyState === WebSocket.OPEN) return socket;
@@ -95,11 +102,13 @@ async function connect() {
       socket = null;
       for (const [id, waiter] of pending) {
         pending.delete(id);
-        waiter.reject?.(new Error("browser socket closed"));
+        if (waiter.client) failProxied(waiter, "the shim's browser socket closed before Chrome answered this command; the next attach reconnects and Chrome will ask the operator to click Allow once more");
+        else waiter.reject(new Error("browser socket closed"));
       }
       // Reconnecting costs the operator another approval dialog, so say so.
       for (const client of clients) client.conn.close(1001);
       clients.clear();
+      sessionOwner.clear(); // every session died with the socket they lived on
       console.error("browser socket closed; the next request reconnects and Chrome will ask the operator to click Allow ONCE more");
     };
     socket = ws;
@@ -109,7 +118,12 @@ async function connect() {
     return ws;
   })();
   try {
-    return await connecting;
+    const ws = await connecting;
+    notAttached = null;
+    return ws;
+  } catch (err) {
+    notAttached = whyNotAttached(err);
+    throw err;
   } finally {
     connecting = null;
   }
@@ -121,6 +135,11 @@ function route(msg) {
   if (waiter) {
     pending.delete(msg.id);
     if (waiter.client) {
+      clearTimeout(waiter.timer);
+      // The reply is the only place a client-opened session can be learnt.
+      if (waiter.attach && msg.result?.sessionId) sessionOwner.set(msg.result.sessionId, waiter.client);
+      // A refused detach left the session alive, so only a clean reply forgets.
+      if (waiter.detaching && !msg.error) sessionOwner.delete(waiter.detaching);
       send(waiter.client, { ...msg, id: waiter.id });
     } else if (msg.error) {
       waiter.reject(new Error(msg.error.message));
@@ -130,16 +149,20 @@ function route(msg) {
     return;
   }
   if (msg.id !== undefined) return; // a reply nobody is waiting for
-  for (const client of clients) {
-    if (client.sessionId) {
-      if (msg.sessionId === client.sessionId) send(client, msg);
-    } else if (!msg.sessionId || !ownedSession(msg.sessionId)) {
-      send(client, msg);
-    }
+  // A crashed or closed target never replies to detach, so this event is the
+  // only notice; it rides the PARENT session, so forgetting the child is safe.
+  if (msg.method === "Target.detachedFromTarget" && msg.params?.sessionId) sessionOwner.delete(msg.params.sessionId);
+  const owner = msg.sessionId ? sessionOwner.get(msg.sessionId) : null;
+  if (owner) {
+    send(owner, msg);
+    return;
   }
+  // No session, or one nobody claims: browser-endpoint clients see it (page
+  // clients are deaf to the rest of the browser). Broadcasting beats dropping —
+  // a spare copy shows up in a client's log, a vanished event shows up nowhere.
+  for (const client of clients) if (!client.sessionId) send(client, msg);
 }
 
-const ownedSession = (sessionId) => [...clients].some((c) => c.sessionId === sessionId);
 /** How many clients speak to the BROWSER endpoint (page clients own a session instead). */
 const browserClients = () => [...clients].filter((c) => !c.sessionId).length;
 
@@ -149,6 +172,14 @@ function send(client, msg) {
   if (client.sessionId && payload.sessionId === client.sessionId) delete payload.sessionId;
   if (payload.sessionId === undefined) delete payload.sessionId;
   client.conn.send(JSON.stringify(payload));
+}
+
+/** Answer a proxied call with a CDP error; dropped silently it hangs the client's run forever. */
+function failProxied(waiter, message) {
+  clearTimeout(waiter.timer);
+  try {
+    send(waiter.client, { id: waiter.id, error: { code: -32_000, message } });
+  } catch {} // a closed client connection is the normal case here, not a fault
 }
 
 async function cdp(method, params = {}) {
@@ -173,11 +204,7 @@ async function cdp(method, params = {}) {
   });
 }
 
-/**
- * Attach an automation client to the one approved socket.
- * `targetId` set → the client believes it is talking straight to a page, so it
- * gets a flat session and never sees a sessionId.
- */
+/** Attach a client to the one approved socket; with `targetId` it gets a flat session and never sees a sessionId. */
 async function attachClient(conn, targetId) {
   const ws = await connect();
   const client = { conn, sessionId: null };
@@ -186,6 +213,7 @@ async function attachClient(conn, targetId) {
     client.sessionId = sessionId;
   }
   clients.add(client);
+  if (client.sessionId) sessionOwner.set(client.sessionId, client);
   conn.onMessage = (raw) => {
     let msg;
     try {
@@ -199,24 +227,32 @@ async function attachClient(conn, targetId) {
       return;
     }
     const id = ++seq;
-    pending.set(id, { client, id: msg.id });
+    const timer = setTimeout(() => {
+      if (!pending.delete(id)) return;
+      failProxied({ client, id: msg.id }, `cdp timeout: Chrome did not answer ${msg.method ?? "the command"} within ${PROXY_TIMEOUT_MS}ms; raise BC_SHIM_PROXY_TIMEOUT_MS if this command is legitimately slower`);
+    }, PROXY_TIMEOUT_MS);
     const out = { ...msg, id };
     if (client.sessionId && !msg.sessionId) out.sessionId = client.sessionId;
+    // route() reads `attach`/`detaching` off the REPLY; the request is the last
+    // place to learn them. The deprecated detach form names no session: use ours.
+    pending.set(id, { client, id: msg.id, timer, attach: ATTACH_METHODS.has(msg.method), detaching: msg.method === "Target.detachFromTarget" ? (msg.params?.sessionId ?? out.sessionId) : null });
     ws.send(JSON.stringify(out));
   };
   conn.onClose = () => {
     clients.delete(client);
-    for (const [id, waiter] of pending) if (waiter.client === client) pending.delete(id);
+    // Left-behind sessions would route Chrome's events into a socket nobody reads.
+    for (const [sessionId, owner] of sessionOwner) if (owner === client) sessionOwner.delete(sessionId);
+    for (const [id, waiter] of pending) {
+      if (waiter.client !== client) continue;
+      clearTimeout(waiter.timer); // nobody is left to answer; the socket is gone
+      pending.delete(id);
+    }
     // Detaching keeps Chrome tidy; the approved browser socket stays open.
     if (client.sessionId) cdp("Target.detachFromTarget", { sessionId: client.sessionId }).catch(() => {});
-    // Target.setAutoAttach is per-CONNECTION state, and every client shares this
-    // one connection: after the first client enabled it Chrome treats every page
-    // as already attached and reports nothing to the NEXT client, which then
-    // sees an empty browser (measured 2026-10-02: run 1 saw 2 pages, run 2 saw
-    // 0). Clearing it when the last browser-endpoint client leaves makes the
-    // next run — the whole point of keeping the shim alive — see the real tabs.
-    // Only ever on a live socket: calling cdp() here would otherwise reconnect
-    // and pop an approval dialog with nobody waiting for it.
+    // Target.setAutoAttach is per-CONNECTION state and every client shares this
+    // one: after the first client enabled it the next run saw 0 pages where run
+    // 1 saw 2 (measured 2026-10-02), so the last one out clears it. Only on a
+    // live socket — cdp() would reconnect and pop a dialog with nobody waiting.
     if (!client.sessionId && !browserClients() && socket?.readyState === WebSocket.OPEN) {
       cdp("Target.setAutoAttach", { autoAttach: false, waitForDebuggerOnStart: false, flatten: true }).catch(() => {});
     }
@@ -229,8 +265,7 @@ async function attachClient(conn, targetId) {
 const json = (body, status = 200) => ({ status, type: "application/json; charset=UTF-8", body: JSON.stringify(body, null, 2) });
 const text = (body, status = 200) => ({ status, type: "text/plain; charset=UTF-8", body });
 
-// Every advertised websocket URL points at the SHIM, never at Chrome: a client
-// that dials Chrome directly would trigger a fresh approval dialog.
+// Every advertised ws URL points at the SHIM: dialling Chrome pops a new dialog.
 const SHIM_WS = `ws://127.0.0.1:${LISTEN_PORT}`;
 
 const describe = (t) => ({
@@ -251,9 +286,13 @@ async function pages() {
 async function handle(rawUrl) {
   const url = new URL(rawUrl, `http://127.0.0.1:${LISTEN_PORT}`);
   const searchParams = url.searchParams;
-  // playwright's connectOverCDP requests "/json/version/" (trailing slash),
-  // other clients request "/json/version" — normalise so both work.
+  // playwright asks for "/json/version/", other clients "/json/version".
   const pathname = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
+  // Ahead of the try on purpose: this must answer while Chrome is unreachable,
+  // which is exactly when attach.mjs asks. Not /json/*, which is DevTools'.
+  if (pathname === "/shim/status") {
+    return json({ attached: socket?.readyState === WebSocket.OPEN, reason: notAttached, chrome: `${CHROME_HOST}:${chromePort}`, portFile: ACTIVE_PORT_FILE });
+  }
   try {
     if (pathname === "/json/version") {
       const v = await cdp("Browser.getVersion");
@@ -305,11 +344,8 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
-  // node's http server hands over upgraded sockets in half-open mode, so a
-  // client that dies without a close frame (an automation run that just exits)
-  // leaves us in CLOSE_WAIT and "attached" forever — and a client that is still
-  // attached in Chrome's eyes keeps the shared socket's Target.setAutoAttach
-  // state, which makes the NEXT run see an empty browser. Measured 2026-10-02.
+  // node hands over upgraded sockets half-open: a client that exits without a
+  // close frame stays "attached" and keeps setAutoAttach set (2026-10-02).
   socket.on("end", () => conn.close(1001));
   try {
     await attachClient(conn, page?.[1]);
@@ -319,13 +355,45 @@ server.on("upgrade", async (req, socket, head) => {
   }
 });
 
-server.listen(LISTEN_PORT, "127.0.0.1");
+// EADDRINUSE is a verdict, not a stray error: another shim owns the port and
+// serves our clients, so this one stands down instead of holding an approval
+// grant nobody can reach. The loser only dials Chrome from the listen callback
+// below, so it spends no dialog; attach.mjs's probeShim() sees the winner's port.
+server.on("error", (err) => {
+  if (err?.code !== "EADDRINUSE") {
+    // Any other listen error: a resident service does not get to die of one.
+    console.error(
+      `shim http server error: ${String(err?.message ?? err).split("\n")[0]} — the shim stays up so the approved Chrome socket survives; set SHIM_PORT to move it to a port it can have`,
+    );
+    return;
+  }
+  console.error(
+    `another shim already serves 127.0.0.1:${LISTEN_PORT}, so this process is standing down rather than sitting on an approved Chrome socket nobody can reach; set SHIM_PORT to run a second shim on a free port`,
+  );
+  socket?.close(1001); // give the approval grant back before leaving
+  process.exit(0); // the port ended up in the state we wanted, so this is no failure
+});
 
-await connect();
+// Same rule one layer up: a stray rejection is fatal on Node 22 otherwise.
+process.on("unhandledRejection", (err) => {
+  console.error(`shim ignored an unhandled rejection: ${String(err?.message ?? err).split("\n")[0]} — the shim stays up so the approved Chrome socket survives`);
+});
 
-// Keep the approved socket warm. Only ever pings an OPEN socket: reconnecting
-// from a background timer would pop the approval dialog in the operator's face
-// with nothing waiting on it. BC_SHIM_KEEPALIVE_MS=0 switches it off.
+// Dialling Chrome only after the bind succeeds is what keeps approval clicks =
+// shim processes: the EADDRINUSE loser must not spend a grant it takes to the
+// grave. Connecting is an optimisation, not a precondition — Chrome may not be
+// running yet, so failure is logged and the port keeps listening for a retry.
+server.listen(LISTEN_PORT, "127.0.0.1", () => {
+  console.log(
+    `cdp-shim ready on http://127.0.0.1:${LISTEN_PORT} (one approved Chrome connection, proxied; keep-alive ${KEEPALIVE_MS || "off"}${KEEPALIVE_MS ? "ms" : ""})`,
+  );
+  connect().catch(() => {
+    console.error(`not attached to Chrome yet — ${notAttached}; the shim is listening on ${LISTEN_PORT} and retries on the first request`);
+  });
+});
+
+// Keep the approved socket warm, and only ever ping an OPEN one: reconnecting
+// from a timer would pop the approval dialog with nobody waiting on it.
 if (KEEPALIVE_MS > 0) {
   const beat = setInterval(() => {
     if (socket?.readyState !== WebSocket.OPEN) return;
@@ -333,7 +401,3 @@ if (KEEPALIVE_MS > 0) {
   }, KEEPALIVE_MS);
   beat.unref(); // never the reason this process stays alive
 }
-
-console.log(
-  `cdp-shim ready on http://127.0.0.1:${LISTEN_PORT} (one approved Chrome connection, proxied; keep-alive ${KEEPALIVE_MS || "off"}${KEEPALIVE_MS ? "ms" : ""})`,
-);

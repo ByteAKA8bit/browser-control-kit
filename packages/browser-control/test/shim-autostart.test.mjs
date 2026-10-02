@@ -10,17 +10,20 @@
 import { after, afterEach, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { ensureShim, probeShim, transportSupport } from "../src/attach.mjs";
 
 /** A stub that answers /json/version like the shim does, on an OS-chosen port. */
-async function stubShim() {
+async function stubShim(port = 0) {
   let hits = 0;
   const server = createServer((req, res) => {
     hits += 1;
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ Browser: "Chrome/stub", webSocketDebuggerUrl: "ws://127.0.0.1/devtools/browser/shim" }));
   });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => server.listen(port, "127.0.0.1", resolve));
   const url = `http://127.0.0.1:${server.address().port}`;
   return { url, server, hits: () => hits, close: () => new Promise((resolve) => server.close(resolve)) };
 }
@@ -36,7 +39,7 @@ async function deadUrl() {
 
 const savedEnv = { ...process.env };
 const restoreEnv = () => {
-  for (const key of ["BC_CDP_URL", "BC_SHIM_AUTOSTART", "BC_SHIM_PROBE_MS", "BC_SHIM_START_MS"]) {
+  for (const key of ["BC_CDP_URL", "BC_SHIM_AUTOSTART", "BC_SHIM_PROBE_MS", "BC_SHIM_START_MS", "NODE_OPTIONS", "BCTEST_PIDFILE", "BCTEST_BLOCK_MS"]) {
     if (savedEnv[key] === undefined) delete process.env[key];
     else process.env[key] = savedEnv[key];
   }
@@ -117,9 +120,118 @@ describe("ensureShim", () => {
     await assert.rejects(() => ensureShim("http://shim.example.invalid:9333"), /not this machine/);
   });
 
-  // Not covered here: actually spawning the shim. It needs Chrome's
-  // DevToolsActivePort to be of any use, and a detached process that survives
-  // the test run is the opposite of hermetic — that path is proven live.
+  // Not covered here: a shim that actually serves CDP. It needs Chrome's
+  // DevToolsActivePort to be of any use — that path is proven live. The spawn
+  // branch itself IS covered below, with a child that cannot outlive the test.
+});
+
+// The spawn branch, with the child's fate forced instead of waited for: a
+// preload runs before cdp-shim.mjs ever loads, so no shim, no Chrome, no port
+// is ever bound by the child — only its liveness varies, which is exactly what
+// ensureShim() reads to decide who paid for the approval click.
+describe("ensureShim after it spawns a child", () => {
+  let tmp;
+  const spawnedPidFiles = [];
+
+  const requireFlag = (file) => `--require "${path.join(tmp, file)}"`;
+  /** Kill the child the test asked to stay alive; safe to call twice. */
+  const reap = (pidFile) => {
+    try {
+      process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL");
+    } catch {} // already gone, or never got far enough to write its pid
+  };
+
+  before(() => {
+    tmp = mkdtempSync(path.join(os.tmpdir(), "bc-shim-child-"));
+    // Leaves a receipt, then dies before cdp-shim.mjs can load: proof that the
+    // spawn branch ran, without a shim ever existing.
+    writeFileSync(
+      path.join(tmp, "die.cjs"),
+      'require("node:fs").writeFileSync(process.env.BCTEST_PIDFILE, String(process.pid));\nprocess.exit(0);\n',
+    );
+    writeFileSync(
+      path.join(tmp, "linger.cjs"),
+      // Blocks the main thread, so cdp-shim.mjs never runs and no port is bound,
+      // while the process stays visibly alive for ensureShim's deadline.
+      'require("node:fs").writeFileSync(process.env.BCTEST_PIDFILE, String(process.pid));\n' +
+        "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(process.env.BCTEST_BLOCK_MS));\n" +
+        "process.exit(0);\n",
+    );
+  });
+  after(() => {
+    for (const pidFile of spawnedPidFiles) reap(pidFile);
+    rmSync(tmp, { recursive: true, force: true });
+    restoreEnv();
+  });
+  afterEach(restoreEnv);
+
+  it("refuses to call the answering shim its own when the child it spawned is already gone", async () => {
+    // EADDRINUSE in slow motion: our child stands down, somebody else's shim
+    // answers the port afterwards. Claiming started/pid here would tell the
+    // operator we paid for an approval click that another process paid for.
+    const url = await deadUrl(); // dead at the first probe, so the spawn branch is taken
+    const port = Number(new URL(url).port);
+    const receipt = path.join(tmp, "died.pid");
+    rmSync(receipt, { force: true });
+    process.env.BCTEST_PIDFILE = receipt;
+    process.env.BC_SHIM_AUTOSTART = "1";
+    process.env.BC_SHIM_PROBE_MS = "300";
+    process.env.BC_SHIM_START_MS = "5000";
+    process.env.NODE_OPTIONS = requireFlag("die.cjs");
+    const latecomer = new Promise((resolve) => setTimeout(() => resolve(stubShim(port)), 300));
+    try {
+      const shim = await ensureShim(url);
+      assert.equal(shim.url, url);
+      assert.ok(Number(readFileSync(receipt, "utf8")) > 0, "a child really was spawned and really died");
+      assert.equal(shim.started, false, "the port is served by a process we did not start");
+      assert.equal(shim.pid, null, "a dead child's pid must never be handed back");
+    } finally {
+      await (await latecomer).close();
+    }
+  });
+
+  it("blames the child's exit when the deadline passes and the child is gone", async () => {
+    const url = await deadUrl();
+    process.env.BCTEST_PIDFILE = path.join(tmp, "died-late.pid");
+    process.env.BC_SHIM_AUTOSTART = "1";
+    process.env.BC_SHIM_PROBE_MS = "100";
+    process.env.BC_SHIM_START_MS = "600";
+    process.env.NODE_OPTIONS = requireFlag("die.cjs");
+    await assert.rejects(
+      () => ensureShim(url),
+      (err) => {
+        assert.ok(err.message.includes(url), "names the address that stayed silent");
+        assert.match(err.message, /exit|kill|signal/i, "reports that the child terminated");
+        assert.doesNotMatch(err.message, /still running/i, "must not send the operator after a live process");
+        return true;
+      },
+    );
+  });
+
+  it("blames a hung child when the deadline passes and the child is still alive", async () => {
+    const url = await deadUrl();
+    const pidFile = path.join(tmp, "linger.pid");
+    rmSync(pidFile, { force: true });
+    spawnedPidFiles.push(pidFile);
+    process.env.BCTEST_PIDFILE = pidFile;
+    process.env.BCTEST_BLOCK_MS = "4000"; // outlives the deadline below; killed in the finally
+    process.env.BC_SHIM_AUTOSTART = "1";
+    process.env.BC_SHIM_PROBE_MS = "100";
+    process.env.BC_SHIM_START_MS = "600";
+    process.env.NODE_OPTIONS = requireFlag("linger.cjs");
+    try {
+      await assert.rejects(
+        () => ensureShim(url),
+        (err) => {
+          assert.match(err.message, /still running/i, "a hung child reads differently than a dead one");
+          assert.doesNotMatch(err.message, /exited with|killed by/i, "nothing terminated, so nothing may be blamed on it");
+          return true;
+        },
+      );
+    } finally {
+      reap(pidFile);
+    }
+  });
 });
 
 describe("transportSupport", () => {

@@ -52,7 +52,7 @@ Ten, and that is the whole surface.
 | `browser_wait_for` | `selector`, `state?`, `timeoutMs?`, `on?` | Wait for a selector to reach a state. |
 | `browser_surfaces` | — | List the named pages with their URL and idle time. |
 
-A tool that fails — no browser, no such selector, a page that threw — answers with `isError: true` and a sentence saying why. Only a protocol mistake (unknown tool, missing or mistyped argument) is a JSON-RPC error. An `on` that names a page you never kept is a tool error listing the names that do exist:
+A tool that fails — no browser, no such selector, a page that threw — answers with `isError: true` and a sentence saying why. Only a protocol mistake (unknown tool, missing or mistyped argument, or `as` and `on` in the same call, which would name two different pages) is a JSON-RPC error. An `on` that names a page you never kept is a tool error listing the names that do exist:
 
 ```text
 browser_text failed: no page is named "a"; these are: b, c, d
@@ -80,9 +80,9 @@ Everything `browser-control` reads (`BC_MODE`, `BC_CDP_URL`, `BC_TAB_IDLE_MS`, �
 ## Test
 
 ```bash
-node --test packages/mcp-server/test/protocol.test.mjs   # 16 cases, no browser needed
+node --test packages/mcp-server/test/protocol.test.mjs   # 25 cases, no browser needed
 ```
 
-The suite speaks real stdio to the real binary: version negotiation, non-empty `initialize.instructions`, the exact ten tools, no tool name or argument that could be a tab handle, the deleted tab tools answering "unknown tool", notifications answered with silence, two messages in one chunk, one message split across two, `-32601`/`-32700`/`-32602`, a browser tool degrading to `isError`, and every stdout line parsing as JSON.
+The suite speaks real stdio to the real binary: version negotiation, the version a client is told matching the manifest, the exact ten tools, no tool name or argument that could be a tab handle, the deleted tab tools answering "unknown tool", notifications answered with silence, two messages in one chunk, one message split across two, `-32601`/`-32700`/`-32602` (including `as` with `on`, an inherited property name, and a fractional integer), a browser tool degrading to `isError`, stdout handed back when the transport stops, and every stdout line parsing as JSON. Three cases call `callTool` directly, where a page's own `{content:[…]}` must come back as data and an eviction notice must survive every tool.
 
 MIT — see [LICENSE](../../LICENSE).

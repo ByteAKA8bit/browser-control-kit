@@ -11,7 +11,12 @@ if (!urls.length) {
 }
 
 const { browser, context, capabilities, mode } = await attach();
-console.log(`attached via ${mode}; input=${controlPage(context.pages()[0], capabilities).inputMode()}`);
+const [firstTab] = context.pages();
+if (!firstTab) {
+  console.error("attached, but the browser has no tab we can drive. Open an ordinary http(s) tab and re-run.");
+  process.exit(1);
+}
+console.log(`attached via ${mode}; input=${controlPage(firstTab, capabilities).inputMode()}`);
 
 // The pool needs one ordinary tab to exist and reuses its own tabs across runs.
 const pool = await new TabPool(context, { size: 2, capabilities }).start();
@@ -23,5 +28,5 @@ const results = await pool.map(urls, async (url, page, i) => {
 });
 
 for (const r of results) console.log(r.ok ? `✓ ${r.value.title} → ${r.value.file} (${r.ms}ms, tab ${r.tab})` : `✗ ${r.error}`);
-await pool.close(); // no-op on the extension transport: tabs are reused
+await pool.close(); // closes the tabs the pool created; reused tabs are kept unless { closeReused: true }
 await browser.close();

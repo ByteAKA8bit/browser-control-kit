@@ -1,20 +1,15 @@
 // Page control that survives a BACKGROUND tab.
+// Non-goal: a general puppeteer polyfill — only the surface below is emulated
+// (multi-arg evaluate, waitForSelector({visible}), setViewport, evaluateOnNewDocument).
+// Invariant: the input path comes from capabilities, never from guessing.
 //
-// Playwright's click/fill run actionability checks and dispatch real input
-// events. That works when the tab is foreground, or when the transport can turn
-// on Emulation.setFocusEmulationEnabled. The Playwright Extension transport can
-// do neither — the attached tab reports visibilityState=hidden and page.click
-// times out. So input is capability-aware:
+// The extension transport can neither foreground a tab nor enable
+// Emulation.setFocusEmulationEnabled, so visibilityState=hidden and real input times out:
 //
 //   focusEmulation available (cdp) → real Playwright input
-//   otherwise                      → DOM-level input from ./dom-input.mjs, which
-//                                    re-implements actionability + hit testing
-//                                    and pierces open shadow roots; the op is
-//                                    retried in every frame so iframes work too
-//
-// The exposed surface is puppeteer-flavoured on purpose: suites written against
-// puppeteer keep working (multi-arg evaluate, waitForSelector({visible}),
-// setViewport, evaluateOnNewDocument).
+//   otherwise                      → DOM input from ./dom-input.mjs (actionability,
+//                                    hit testing, open shadow roots), retried in
+//                                    every frame so iframes work too
 import { DEEP_QUERY_ALL, DOM_CLICK, DOM_COUNT, DOM_KEY, DOM_READ_VALUE, DOM_SET_VALUE } from "./dom-input.mjs";
 import { DOM_DRAG, DOM_DROP_FILES, DOM_MAKE_TRANSFER, DOM_SET_FILES } from "./transfer.mjs";
 import { asUpload } from "./fixtures.mjs";
@@ -22,11 +17,10 @@ import { asUpload } from "./fixtures.mjs";
 const DEEP_SRC = DEEP_QUERY_ALL.toString();
 
 // ── Navigation lock ────────────────────────────────────────────────────────
-// 2026-09-05: concurrent page.goto() across several tabs over the EXTENSION
-// transport crashes the Chrome browser process (EXC_BREAKPOINT on CrBrowserMain,
-// reproduced with test/crash-repro.mjs / pool.test "navigates several tabs in
-// parallel"). Everything else parallelises fine — concurrent evaluate, clicks,
-// screenshots, tab create/close — so only navigation is serialised, process-wide.
+// 2026-09-05: concurrent page.goto() across tabs over the EXTENSION transport crashes
+// the Chrome browser process (EXC_BREAKPOINT on CrBrowserMain; repro BC_CRASH_REPRO=1
+// scripts/crash-repro.mjs, or pool.test "navigates several tabs in parallel") → only
+// navigation is serialised, process-wide; everything else parallelises fine.
 // Escape hatch: BC_PARALLEL_NAV=1.
 let navChain = Promise.resolve();
 export const serialiseNavigation = (fn) => {
@@ -72,8 +66,14 @@ export function controlPage(page, capabilities = {}) {
   const lockNavigation = mode === "extension" && process.env.BC_PARALLEL_NAV !== "1";
   const navigate = (fn) => (lockNavigation ? serialiseNavigation(fn) : fn());
 
-  /** Run a DOM primitive in the main frame, then in child frames, until one hits. */
-  const inAnyFrame = (fn, args) => inAnyFrameRaw(fn, [...args, DEEP_SRC]);
+  /**
+   * Run a DOM primitive in the main frame, then child frames, until one hits.
+   * Stringified primitives cannot import: helper sources are appended POSITIONALLY, deepSrc then transferSrc (DOM_SET_FILES/DOM_DROP_FILES), so their parameter lists and this order move together.
+   */
+  const inAnyFrame = (fn, args) => {
+    const needsTransfer = fn === DOM_SET_FILES || fn === DOM_DROP_FILES;
+    return inAnyFrameRaw(fn, needsTransfer ? [...args, DEEP_SRC, DOM_MAKE_TRANSFER.toString()] : [...args, DEEP_SRC]);
+  };
 
   const inAnyFrameRaw = async (fn, fullArgs) => {
     const payload = { src: fn.toString(), args: fullArgs };
@@ -87,21 +87,11 @@ export function controlPage(page, capabilities = {}) {
         res = { ok: false, reason: `frame-error:${String(err?.message ?? err).split("\n")[0]}` };
       }
       if (res?.ok) return { ...res, frame: frame === page.mainFrame() ? "main" : frame.url() };
-      // "not-found" just means "try the next frame"; anything else is a real
-      // actionability failure worth surfacing.
+      // "not-found" means "try the next frame"; anything else is a real failure.
       if (res && res.reason !== "not-found") last = res;
       else if (last.reason === "no-frames") last = res;
     }
     return last;
-  };
-
-  /**
-   * Same as inAnyFrame, but also injects the DataTransfer builder source that
-   * the upload/drop primitives need (DOM_DRAG only needs the deep query).
-   */
-  const inAnyFrame2 = (fn, args) => {
-    const needsTransfer = fn === DOM_SET_FILES || fn === DOM_DROP_FILES;
-    return inAnyFrameRaw(fn, needsTransfer ? [...args, DEEP_SRC, DOM_MAKE_TRANSFER.toString()] : [...args, DEEP_SRC]);
   };
 
   const overrides = {
@@ -143,10 +133,8 @@ export function controlPage(page, capabilities = {}) {
     },
 
     /**
-     * Attach files to a file input.
-     * `files` accepts Playwright-style paths, Buffers, or {name,buffer,type}.
-     * Real-input transports use Playwright's setInputFiles; otherwise the files
-     * are built in-page (File + DataTransfer), which needs no CDP at all.
+     * Attach files to a file input; `files` takes paths, Buffers or {name,buffer,type}.
+     * Without real input the File + DataTransfer are built in-page, needing no CDP.
      */
     async setInputFiles(selector, files) {
       const list = await normaliseFiles(files);
@@ -157,7 +145,7 @@ export function controlPage(page, capabilities = {}) {
         );
         return { ok: true, count: list.length, via: "playwright" };
       }
-      const res = await inAnyFrame2(DOM_SET_FILES, [selector, list.map(({ name, type, base64 }) => ({ name, type, base64 }))]);
+      const res = await inAnyFrame(DOM_SET_FILES, [selector, list.map(({ name, type, base64 }) => ({ name, type, base64 }))]);
       if (!res?.ok) throw new Error(`setInputFiles(${selector}) failed: ${res?.reason ?? "unknown"}`);
       return { ...res, via: "dom" };
     },
@@ -165,22 +153,21 @@ export function controlPage(page, capabilities = {}) {
     /** Drop files onto a dropzone (antd Upload.Dragger and friends). */
     async dropFiles(selector, files) {
       const list = await normaliseFiles(files);
-      const res = await inAnyFrame2(DOM_DROP_FILES, [selector, list.map(({ name, type, base64 }) => ({ name, type, base64 }))]);
+      const res = await inAnyFrame(DOM_DROP_FILES, [selector, list.map(({ name, type, base64 }) => ({ name, type, base64 }))]);
       if (!res?.ok) throw new Error(`dropFiles(${selector}) failed: ${res?.reason ?? "unknown"}`);
       return res;
     },
 
     /**
-     * Drag one element onto another. Emits BOTH a pointer-event drag (dnd-kit,
-     * react-dnd, sortable.js) and, when the source is draggable, the HTML5 drag
-     * sequence — real-input transports use Playwright's native dragAndDrop.
+     * Drag one element onto another: pointer-event drag (dnd-kit, react-dnd, sortable.js)
+     * plus the HTML5 sequence when the source is draggable.
      */
     async dragAndDrop(fromSelector, toSelector, { steps = 8 } = {}) {
       if (realInput()) {
         await page.dragAndDrop(fromSelector, toSelector, { timeout: 20_000 });
         return { ok: true, via: "playwright" };
       }
-      const res = await inAnyFrame2(DOM_DRAG, [fromSelector, toSelector, steps], { extraFirst: false });
+      const res = await inAnyFrame(DOM_DRAG, [fromSelector, toSelector, steps]);
       if (!res?.ok) throw new Error(`dragAndDrop(${fromSelector} → ${toSelector}) failed: ${res?.reason ?? "unknown"}`);
       return { ...res, via: "dom" };
     },
@@ -206,11 +193,10 @@ export function controlPage(page, capabilities = {}) {
     viewportInfo: () =>
       page.evaluate(() => ({ inner: [window.innerWidth, window.innerHeight], outer: [window.outerWidth, window.outerHeight], dpr: window.devicePixelRatio })),
     /**
-     * DANGEROUS over the extension transport: Page.addScriptToEvaluateOnNew-
-     * Document routed through chrome.debugger kills the Chrome browser process
-     * (reproduced: test/crash-repro.mjs addInitScript → EXC_BREAKPOINT on
-     * CrBrowserMain). Refuse by default there; re-run the code after each
-     * navigation instead, or opt in with BC_ALLOW_INIT_SCRIPT=1.
+     * DANGEROUS over the extension transport: Page.addScriptToEvaluateOnNewDocument routed
+     * through chrome.debugger kills the Chrome browser process (repro BC_CRASH_REPRO=1
+     * scripts/crash-repro.mjs addInitScript → EXC_BREAKPOINT on CrBrowserMain). Refused there
+     * by default; re-run the code after each navigation, or opt in with BC_ALLOW_INIT_SCRIPT=1.
      */
     evaluateOnNewDocument: async (fn, ...args) => {
       const extension = (capabilities.mode ?? process.env.BC_MODE ?? "extension") === "extension";
@@ -219,8 +205,7 @@ export function controlPage(page, capabilities = {}) {
       }
       return page.addInitScript({ content: `(${fn.toString()})(...${JSON.stringify(args)})` });
     },
-    // Playwright returns the Buffer; when a path is given, hand back the path so
-    // callers can record it (puppeteer behaviour).
+    // Return the path when one is given (puppeteer behaviour), else the Buffer.
     screenshot: async (options = {}) => {
       const buffer = await page.screenshot({ scale: "css", type: "png", ...options });
       return options.path ?? buffer;

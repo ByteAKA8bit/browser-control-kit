@@ -5,7 +5,7 @@
 // survived. It stops at the first killer. Run deliberately — it may crash the
 // browser it attaches to.
 //
-//   PLAYWRIGHT_MCP_EXTENSION_TOKEN=… node test/crash-repro.mjs [patternName]
+//   BC_CRASH_REPRO=1 PLAYWRIGHT_MCP_EXTENSION_TOKEN=… node scripts/crash-repro.mjs [patternName]
 import { execSync } from "node:child_process";
 import { attach } from "../packages/browser-control/src/attach.mjs";
 

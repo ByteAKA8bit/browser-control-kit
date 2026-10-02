@@ -58,14 +58,28 @@ websocket URL (the earlier design) meant a fresh dialog per attach.
   commands. Trailing slashes are normalised (`connectOverCDP` asks for
   `/json/version/`). Every advertised `webSocketDebuggerUrl` points at the **shim**,
   never at Chrome — a client dialling Chrome directly would pop a new dialog.
+- **`/shim/status`**: the shim's own diagnostic endpoint, not DevTools discovery —
+  `{ attached, reason, chrome, portFile }`, served before any Chrome round-trip so it
+  answers even when the socket is down. That is what lets `attach({ mode: "cdp" })`
+  separate "no shim listening" from "Chrome has no `--remote-debugging-port`" from
+  "Chrome is waiting for the operator's Allow click".
 - **Tunnel**: a client connecting to `/devtools/page/<targetId>` gets its own flat
   session (`Target.attachToTarget {flatten:true}`); `sessionId` is stripped on the
   way out and injected on the way in, so the client believes it owns the connection.
   `/devtools/browser/*` clients get the browser endpoint.
 - **Id rewriting**: client command ids are replaced with shim-global ids
-  (`pending: shimId -> {client, id}`) and restored on the reply. Events with no
-  session go to every browser-endpoint client; events whose `sessionId` belongs to a
-  page client go only to that client; a reply nobody awaits is dropped.
+  (`pending: shimId -> {client, id}`) and restored on the reply; a reply nobody
+  awaits is dropped.
+- **Session ownership**: `sessionOwner: sessionId -> client` decides where an event
+  goes. It holds the flat session the shim opened for a page client *and* every
+  session a client opened itself (`Target.attachToTarget` on an OOPIF, a worker, a
+  second tab), learned from the attach reply — that is the only message naming both
+  the client and the new session. An event with an owned `sessionId` goes to its
+  owner alone; an event with no session, or one nobody owns, goes to every
+  browser-endpoint client. Ownership is given back on a clean
+  `Target.detachFromTarget` reply, on `Target.detachedFromTarget`, when the owning
+  client disconnects, and when the browser socket drops — otherwise the map leaks
+  and dead sessions keep routing events into a socket nobody reads.
 - **Keep-alive**: one `Browser.getVersion` every `BC_SHIM_KEEPALIVE_MS` (30 s, `0`
   disables), only ever on an already-OPEN socket — reconnecting from a timer would pop
   the dialog with nobody waiting for it.
@@ -178,7 +192,7 @@ internal Chrome `CHECK`, i.e. the browser process dies with the operator's windo
 | Tab creation on extension gated | `src/pool.mjs` | `BC_ALLOW_TAB_CREATE=1` |
 | Extension tab ceiling `MAX_TABS_EXTENSION` | `src/pool.mjs` | `BC_MAX_TABS_EXTENSION` |
 | Only ONE pool per extension connection | `src/pool.mjs` | use `BC_MODE=cdp` |
-| Never leave the browser with no tabs (`alive.length <= 1`, counting the relay's tab) | `src/pool.mjs`, `src/tab-guard.mjs`, `cleanup.mjs` | none |
+| Never leave the browser with no tabs (`wouldEmptyBrowser(context)`, counting the relay's tab) | defined in `src/pool.mjs`, imported by `src/tab-guard.mjs` and `cleanup.mjs` | none |
 | Operator's tabs off limits (`protectedPages`) | `src/tab-guard.mjs` | none |
 
 Only navigation is serialised — concurrent `evaluate`, clicks, screenshots and tab
@@ -186,7 +200,8 @@ create/close parallelise fine.
 
 `scripts/check.mjs` **greps for these literals** (`BC_ALLOW_TAB_CREATE`,
 `MAX_TABS_EXTENSION`, `only ONE pool per connection`, `serialiseNavigation`,
-`BC_ALLOW_INIT_SCRIPT`, `protectedPages`, `ordinary.length <= 1`) and fails the
+`BC_ALLOW_INIT_SCRIPT`, `protectedPages`, `function wouldEmptyBrowser` in
+`src/pool.mjs` and `wouldEmptyBrowser(` in `src/tab-guard.mjs`) and fails the
 pre-commit run if any disappears. Renaming one without updating `scripts/check.mjs`
 breaks the hook — that is the point.
 
@@ -208,8 +223,10 @@ packages/browser-control/
   src/tab-guard.mjs          named surfaces, budget, LRU eviction, idle reaping, holds, ownership
   cleanup.mjs                close only what we left behind (--dry-run)
   selftest.mjs               end-to-end smoke; writes selftest.png, exit 1 on failure
-  test/                      tab-guard 13 · ws-server 8 · shim-autostart 8 (browserless)
-                             dom-input 16 · pool 8 (need Chrome)
+  test/                      tab-guard 42 · ws-server 17 · shim-autostart 11 ·
+                             shim-policy 6 · shim-recovery 19 · shim-service 8 ·
+                             shim-session 12 (browserless) · dom-input 16 ·
+                             pool 8 (need Chrome)
 ```
 
 Dependency direction is one-way: `tab-guard → pool → page → {dom-input, transfer,
