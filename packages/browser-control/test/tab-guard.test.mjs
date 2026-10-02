@@ -8,7 +8,8 @@
 //   node --test test/tab-guard.test.mjs
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { TabGuard, guardContext, headroom, tabCeiling } from "../src/tab-guard.mjs";
+import { readFile } from "node:fs/promises";
+import { TabGuard, guardContext, tabCeiling } from "../src/tab-guard.mjs";
 
 /** Minimal stand-in for a Playwright Page: url, navigation, close, events. */
 function fakePage(url = "https://example.com/") {
@@ -59,8 +60,7 @@ function fakeContext(initial = []) {
 
 const settled = () => new Promise((r) => setTimeout(r, 0));
 /** Default: plenty of memory, no recycling, no reaping — each test opts in. */
-const guardFor = (context, options = {}) =>
-  new TabGuard(context, { idleMs: 0, blankMs: 0, recycleMs: 0, settleMs: 0, headroom: () => 1, ...options });
+const guardFor = (context, options = {}) => new TabGuard(context, { idleMs: 0, blankMs: 0, recycleMs: 0, settleMs: 0, ...options });
 /** Make a tab look untouched for `ms`. */
 const age = (guard, page, ms) => {
   guard.owned.get(page).lastUsed = Date.now() - ms;
@@ -143,38 +143,25 @@ describe("TabGuard admission", () => {
     guard.dispose();
   });
 
-  it("takes an idle tab back instead of growing when memory is tight", async () => {
+  it("evicts an idle tab rather than exceeding the transport ceiling", async () => {
     const context = fakeContext([fakePage()]);
-    let room = 1;
-    const guard = guardFor(context, { ceiling: 10, headroom: () => room });
+    const guard = guardFor(context, { ceiling: 1 });
 
     const first = await guard.newPage();
-    room = 0.02; // the machine is now under pressure
     const second = await guard.newPage();
 
     assert.equal(first._closed, true, "the least recently used tab pays for the new one");
     assert.equal(second._closed, false);
-    assert.equal(guard.owned.size, 1, "pressure keeps the footprint flat without a quota");
+    assert.equal(guard.owned.size, 1, "the footprint stays flat");
     assert.equal(guard.stats.evicted, 1);
     guard.dispose();
   });
 
-  it("grants the tab anyway when pressure has nothing to reclaim — and reclaims sooner instead", async () => {
-    const context = fakeContext([fakePage()]);
-    let room = 1;
-    const guard = guardFor(context, { ceiling: 10, headroom: () => room, idleMs: undefined, blankMs: undefined, recycleMs: undefined });
-    const working = await guard.newPage();
-    guard.hold(working); // the only tab we own, and it is in use
-    guard.cadence = 8_000; // a deliberate caller: windows clear of both floor and cap
-    const relaxed = guard.idleAfter();
-
-    room = 0.02;
-    const second = await guard.newPage();
-
-    assert.notEqual(second, working, "refusing would have freed nothing and broken the caller");
-    assert.equal(guard.stats.grantedUnderPressure, 1);
-    assert.ok(guard.idleAfter() < relaxed, `pressure must shorten the idle window: ${guard.idleAfter()} vs ${relaxed}`);
-    guard.dispose();
+  it("never asks the operating system how much memory is left", async () => {
+    // Deliberate: system memory is reported differently on every platform and
+    // other applications move it under us. The guard governs its own footprint.
+    const source = await readFile(new URL("../src/tab-guard.mjs", import.meta.url), "utf8");
+    assert.ok(!/freemem|totalmem|vm_stat|MEMORY_FLOOR/.test(source), "tab-guard must not probe the machine");
   });
 
   it("respects the transport ceiling when nothing can be evicted", async () => {
@@ -342,11 +329,6 @@ describe("TabGuard last-tab rule", () => {
 });
 
 describe("policy inputs", () => {
-  it("reads headroom as a fraction of this machine's memory", () => {
-    const room = headroom();
-    assert.ok(room > 0 && room <= 1, `headroom should be a fraction, got ${room}`);
-  });
-
   it("keeps the extension ceiling below the raw-CDP one, and lets the operator pin it", () => {
     assert.ok(tabCeiling("extension") < tabCeiling("cdp"), "the bridge tolerates fewer tabs than raw CDP");
     process.env.BC_TAB_BUDGET = "7";

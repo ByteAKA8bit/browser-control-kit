@@ -7,16 +7,16 @@
 // discipline lives here instead of being asked for politely.
 //
 // A fixed "you get N tabs" would be both rude and wrong: the right number is
-// however many tabs are doing work right now, on this machine, at this moment.
-// So the policy is about pressure and recycling, not about a magic number:
+// however many tabs are doing work right now. And the machine's own memory is
+// not this tool's business to measure — every platform reports it differently
+// and other applications move the number under you. So the policy is only
+// about what this process can know exactly, which is its own footprint:
 //
 //   * RECYCLE FIRST — a tab we own that nobody is using is not a free tab to
 //     keep, it is the tab the next request gets. Reuse costs no memory; a new
 //     renderer process costs ~40-80 MB of the operator's RAM.
-//   * ADMIT UNDER PRESSURE — a new tab is granted while the machine can afford
-//     one. When memory is tight the least-recently-used idle tab is taken back
-//     first, and only an all-busy, under-pressure browser refuses — loudly,
-//     with the reason.
+//   * MEASURED, NOT DECLARED — "idle" is expressed in the caller's own rhythm
+//     (see "cadence" below), never in a constant somebody guessed.
 //   * TRANSPORT CEILING — the one hard number, and it is not a style choice:
 //     the extension bridge drops the connection past ~3 attached tabs
 //     (MAX_TABS_EXTENSION, measured 2026-09-05). Stability, not policy.
@@ -38,8 +38,6 @@
 // without file access) never becomes a Playwright page, so it never shows up in
 // context.pages() and this guard cannot see or close it. Those are also the
 // tabs an agent is least likely to spawn in bulk.
-import { execFileSync } from "node:child_process";
-import os from "node:os";
 import { MAX_TABS, MAX_TABS_EXTENSION } from "./pool.mjs";
 import { serialiseNavigation } from "./page.mjs";
 
@@ -81,49 +79,11 @@ function window_(spec, cadence) {
   return Math.min(spec.max, Math.max(spec.min, Math.round(cadence * spec.beats)));
 }
 
-/** Available memory below this fraction counts as pressure. */
-const MEMORY_FLOOR = Number(process.env.BC_MEM_FLOOR ?? 0.2);
-
-/**
- * How much room the machine has left, 0 (none) to 1 (plenty).
- *
- * `os.freemem()` is the portable signal and it is useless on macOS: it counts
- * only untouched pages, so a healthy 16 GB machine reads 1% free and every tab
- * request gets refused (measured 2026-10-02, against 24% actually available).
- * On darwin the answer comes from `vm_stat` — free + inactive + speculative +
- * purgeable, i.e. the pages the kernel can still hand out — cached for a few
- * seconds because this sits on the admission path.
- */
-export function headroom() {
-  const total = os.totalmem();
-  if (total <= 0) return 1;
-  if (os.platform() !== "darwin") return os.freemem() / total;
-  const now = Date.now();
-  if (memo && now - memo.at < MEMO_MS) return memo.value;
-  memo = { at: now, value: darwinAvailable() / total };
-  return memo.value;
-}
-
-let memo = null;
-const MEMO_MS = 5_000;
-
-/** Pages the macOS kernel can still hand out, in bytes. */
-function darwinAvailable() {
-  try {
-    const out = execFileSync("vm_stat", { encoding: "utf8" });
-    const pageSize = Number(/page size of (\d+)/.exec(out)?.[1] ?? 4096);
-    const pages = (name) => Number(new RegExp(`${name}:\\s+(\\d+)`).exec(out)?.[1] ?? 0);
-    return (pages("Pages free") + pages("Pages inactive") + pages("Pages speculative") + pages("Pages purgeable")) * pageSize;
-  } catch {
-    return os.freemem(); // vm_stat missing or unreadable: fall back to the portable answer
-  }
-}
-
 /**
  * The hard ceiling, which exists for transport stability only — the extension
  * bridge drops the connection past MAX_TABS_EXTENSION attached tabs. Everything
- * else is decided by pressure. BC_TAB_BUDGET pins it explicitly when the
- * operator wants a number.
+ * else follows from reuse and the measured idle windows. BC_TAB_BUDGET pins
+ * this explicitly when the operator wants a number.
  */
 export function tabCeiling(mode) {
   const pinned = Number(process.env.BC_TAB_BUDGET ?? NaN);
@@ -135,7 +95,7 @@ export function tabCeiling(mode) {
  * Track and cap the tabs this process opens in the operator's browser.
  * @param {import("playwright-core").BrowserContext} context
  * @param {{ mode?: string, ceiling?: number, idleMs?: number, blankMs?: number, recycleMs?: number,
- *          evict?: boolean, settleMs?: number, headroom?: () => number }} options
+ *          evict?: boolean, settleMs?: number }} options
  */
 export class TabGuard {
   constructor(
@@ -148,14 +108,12 @@ export class TabGuard {
       recycleMs,
       evict = process.env.BC_TAB_EVICT !== "0",
       settleMs = TAB_SETTLE_MS,
-      headroom: headroomOf = headroom,
     } = {},
   ) {
     this.context = context;
     this.mode = mode;
     /** Transport stability limit, not a policy number (see the header). */
     this.ceiling = ceiling ?? tabCeiling(mode);
-    this.headroom = headroomOf;
     /** Explicit overrides win; otherwise every window is measured (see the header). */
     this.pinned = { idleMs, blankMs, recycleMs };
     /** The caller's rhythm: an EWMA of the gap between operations we observe. */
@@ -172,7 +130,7 @@ export class TabGuard {
     this.bridgePages = new Set(context.pages().filter((p) => p.url().startsWith("chrome-extension://")));
     /** page -> { origin, bornAt, lastUsed, holds } */
     this.owned = new Map();
-    this.stats = { created: 0, recycled: 0, spawned: 0, evicted: 0, reaped: 0, blanked: 0, refused: 0, grantedUnderPressure: 0, closed: 0, overflow: 0 };
+    this.stats = { created: 0, recycled: 0, spawned: 0, evicted: 0, reaped: 0, blanked: 0, refused: 0, closed: 0, overflow: 0 };
     this._closeChain = Promise.resolve();
     this._timer = null;
     this._creating = 0; // tabs opened through newPage() arrive as "page" events too
@@ -238,28 +196,19 @@ export class TabGuard {
     return page;
   }
 
-  /**
-   * The beat every idle decision is measured in. Under memory pressure it runs
-   * four times faster: that is how pressure is answered — by reclaiming sooner,
-   * not by refusing work that would have freed nothing.
-   */
-  #beat() {
-    return this.headroom() < MEMORY_FLOOR ? this.cadence / 4 : this.cadence;
-  }
-
   /** Quiet long enough to be someone else's tab. */
   recycleAfter() {
-    return window_({ ...RECYCLE, pinned: this.pinned.recycleMs ?? RECYCLE.pinned }, this.#beat());
+    return window_({ ...RECYCLE, pinned: this.pinned.recycleMs ?? RECYCLE.pinned }, this.cadence);
   }
 
   /** Quiet long enough that its renderer should give the page back. */
   blankAfter() {
-    return window_({ ...BLANK, pinned: this.pinned.blankMs ?? BLANK.pinned }, this.#beat());
+    return window_({ ...BLANK, pinned: this.pinned.blankMs ?? BLANK.pinned }, this.cadence);
   }
 
   /** Quiet long enough to be abandoned. */
   idleAfter() {
-    return window_({ ...IDLE, pinned: this.pinned.idleMs ?? IDLE.pinned }, this.#beat());
+    return window_({ ...IDLE, pinned: this.pinned.idleMs ?? IDLE.pinned }, this.cadence);
   }
 
   /** Pin a tab: held tabs are never evicted or reaped (TabPool uses this). */
@@ -376,7 +325,6 @@ export class TabGuard {
     return {
       owned: this.owned.size,
       ceiling: this.ceiling,
-      headroom: Number(this.headroom().toFixed(2)),
       operatorTabs: this.protectedPages.size,
       // Measured, not configured: the caller's beat and the windows it implies.
       cadenceMs: Math.round(this.cadence),
@@ -400,28 +348,20 @@ export class TabGuard {
   }
 
   /**
-   * Decide whether the browser can afford one more tab right now.
+   * Make room for one more tab.
    *
-   * Refusing work does not free a single byte — only reclaiming does. So memory
-   * pressure makes this hand back idle tabs before it grants a new one, and if
-   * there is nothing idle to hand back it grants anyway and lets the reaper
-   * squeeze harder (the windows shrink under pressure, see #beat). The one
-   * genuine refusal is the transport's ceiling, where another tab would drop
-   * the connection: that is not a policy, it is physics.
+   * There is nothing to decide about the machine here: this guard governs its
+   * OWN footprint, not the operator's RAM, and a tool that measured system
+   * memory would be guessing on every platform while other applications moved
+   * the number under it. What it can know exactly is which of its tabs are idle
+   * — those are handed back before anything is opened. The only refusal is the
+   * transport's ceiling, where one more attached tab drops the connection: that
+   * is physics, not policy.
    */
   async #admit() {
-    for (;;) {
-      const tight = this.headroom() < MEMORY_FLOOR && this.owned.size > 0;
-      const overCeiling = this.owned.size >= this.ceiling;
-      if (!overCeiling && !tight) return;
+    while (this.owned.size >= this.ceiling) {
       const victim = this.#lru();
       if (!victim) {
-        if (!overCeiling) {
-          // Under pressure with every tab in use: the work is real, the tabs are
-          // real, and saying no would only break the caller.
-          this.stats.grantedUnderPressure += 1;
-          return;
-        }
         this.stats.refused += 1;
         throw new Error(
           `cannot open another tab: the ${this.mode} transport tolerates ${this.ceiling} attached tabs and all of them are in use. ` +
@@ -440,7 +380,7 @@ export class TabGuard {
    * recorded and reported instead.
    */
   async #trim() {
-    while (this.owned.size > this.ceiling || this.headroom() < MEMORY_FLOOR) {
+    while (this.owned.size > this.ceiling) {
       if (this.owned.size === 0) return;
       const victim = this.#lru();
       if (!victim) {

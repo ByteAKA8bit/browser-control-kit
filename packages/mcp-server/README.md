@@ -3,7 +3,7 @@
 An MCP stdio server that lets an agent drive **the Chrome the operator is already using** — and that cannot grow it.
 
 - **No tool opens a tab.** `browser_navigate` reuses the active tab; the only tab API is list / select / close.
-- **Discipline without a quota.** `browser-control`'s `TabGuard` hands back a tab this session has stopped using instead of opening another, admits a new one only while the machine has memory headroom, blanks idle tabs before it closes them, and never counts or closes a tab that was open before the session started. The transport's own ceiling (3 on the extension bridge) is the only hard number; `BC_TAB_BUDGET` pins your own. `browser_status` prints the guard's report back, so the agent can see what it is costing.
+- **Discipline without a quota.** `browser-control`'s `TabGuard` hands back a tab this session has stopped using instead of opening another, decides "stopped using" from the session's own measured rhythm rather than a constant, blanks idle tabs before it closes them, and never counts or closes a tab that was open before the session started. It does not probe system memory — it governs its own footprint. The transport's ceiling (3 on the extension bridge) is the only hard number; `BC_TAB_BUDGET` pins your own. `browser_status` prints the guard's report back, so the agent can see what it is costing.
 - **Idle cost is a bare Node process** (~40 MB RSS measured): `browser-control` — and through it `playwright-core` — is imported lazily inside the first tool call that needs a browser. No timers, no caches.
 - **Zero dependencies of its own.** The JSON-RPC framing, the protocol loop and the tool table are three small modules, no SDK.
 

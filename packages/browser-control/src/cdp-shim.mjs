@@ -22,13 +22,21 @@
 // session, with sessionId stripped on the way out and injected on the way in.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { upgrade } from "./ws-server.mjs";
 
 const CHROME_HOST = process.env.CHROME_HOST ?? "127.0.0.1";
 const LISTEN_PORT = Number(process.env.SHIM_PORT ?? 9333);
+// Chrome's default user-data-dir per platform; CHROME_PORT_FILE overrides it for
+// a custom profile, another channel, or a browser we have not met.
+const CHROME_PROFILE_DIRS = {
+  darwin: () => path.join(os.homedir(), "Library", "Application Support", "Google", "Chrome"),
+  win32: () => path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local"), "Google", "Chrome", "User Data"),
+  linux: () => path.join(process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config"), "google-chrome"),
+};
 const ACTIVE_PORT_FILE =
-  process.env.CHROME_PORT_FILE ??
-  `${process.env.HOME}/Library/Application Support/Google/Chrome/DevToolsActivePort`;
+  process.env.CHROME_PORT_FILE ?? path.join((CHROME_PROFILE_DIRS[os.platform()] ?? CHROME_PROFILE_DIRS.linux)(), "DevToolsActivePort");
 
 let chromePort = Number(process.env.CHROME_PORT ?? 9222);
 // A browser socket that drops costs the operator another "Allow" click, and an

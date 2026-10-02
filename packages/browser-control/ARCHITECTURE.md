@@ -140,7 +140,7 @@ first. Rules, each opt-outable and none silent (`BC_TAB_GUARD=0` disables the lo
 | --- | --- | --- |
 | Recycle first | `newPage()` hands back an owned tab that has gone quiet, blanked, before it opens one | reuse is free, a renderer is 40–80 MB |
 | Measured windows | the gap between operations is tracked as an EWMA (`cadence`, long pauses ignored); reuse ≈ 5 beats, blank ≈ 30, close ≈ 120, each clamped; `BC_TAB_*_MS` pins any of them | "quiet" has no correct constant |
-| Admission | refused only at the transport ceiling; under memory pressure the LRU idle tab is reclaimed first and, if everything is in use, the tab is granted while the windows run 4× faster | refusing frees nothing |
+| Admission | refused only at the transport ceiling; an idle tab is evicted before anything is opened. No system-memory probe: unmeasurable portably, and refusing frees nothing | own footprint, not the machine's |
 | Ownership | tabs present at `attach()` are `protectedPages`: never closed, counted or marked | the browser is the operator's |
 | Adoption | `window.open` / `target=_blank` popups are adopted and re-trim the ceiling | uninvited tabs still cost RAM |
 | Holds | `hold(page)` pins a tab; `TabPool` holds its tabs for the run | a working tab must not be reaped |

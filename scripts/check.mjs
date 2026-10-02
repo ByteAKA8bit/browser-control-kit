@@ -107,9 +107,15 @@ for (const [pkg, suite] of OFFLINE_SUITES) {
 
 if (!offlineOnly) {
   console.log("browser checks");
+  // Portable "is Chrome up?": this repo is used on more than one operating
+  // system, and a macOS-only pgrep pattern would silently skip the tier.
   const chromeUp = (() => {
+    const probe =
+      process.platform === "win32"
+        ? 'tasklist /FI "IMAGENAME eq chrome.exe" | findstr /I chrome.exe'
+        : "pgrep -fi 'google chrome|chromium|chrome\\.exe' >/dev/null 2>&1";
     try {
-      execSync("pgrep -f 'MacOS/Google Chrome' >/dev/null 2>&1");
+      execSync(probe, { stdio: "ignore" });
       return true;
     } catch {
       return false;
