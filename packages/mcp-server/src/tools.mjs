@@ -14,12 +14,9 @@
 const ATTACH_TIMEOUT_MS = () => Number(process.env.BC_MCP_ATTACH_TIMEOUT_MS ?? 60_000);
 const TEXT_LIMIT = () => Number(process.env.BC_MCP_TEXT_LIMIT ?? 20_000);
 const WAIT_TIMEOUT_MS = () => Number(process.env.BC_MCP_WAIT_MS ?? 20_000);
-// An MCP session is single-threaded by nature: it does one thing at a time, so
-// a tab that has gone quiet is the tab the next navigation should use. Recycle
-// aggressively and blank early — the defaults are tuned for a long-lived agent
-// session, not for a parallel crawl.
-const RECYCLE_MS = () => Number(process.env.BC_TAB_RECYCLE_MS ?? 2_000);
-const BLANK_MS = () => Number(process.env.BC_TAB_BLANK_MS ?? 30_000);
+// Nothing to configure here on purpose: an MCP session does one thing at a
+// time, and TabGuard already measures that rhythm and sizes its own windows
+// from it. Adding "tuned for MCP" constants would just be a second opinion.
 
 /** Reject instead of hanging forever when the operator never approves a connection. */
 function withTimeout(promise, ms, what) {
@@ -66,7 +63,7 @@ export class Session {
     // Lazy on purpose: this is the line that pulls in playwright-core.
     const { attach, controlPage } = await import("browser-control");
     const live = await withTimeout(
-      attach({ clientName: "browser-control-mcp", guard: { recycleMs: RECYCLE_MS(), blankMs: BLANK_MS() } }),
+      attach({ clientName: "browser-control-mcp" }),
       ATTACH_TIMEOUT_MS(),
       "attach()",
     );

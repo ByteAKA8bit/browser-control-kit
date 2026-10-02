@@ -23,9 +23,9 @@
 //   * OWNERSHIP — only tabs this process opened (or popups they spawned) are
 //     ours. Every tab that existed at attach() time is the operator's and is
 //     never closed, never navigated, never counted.
-//   * MEMORY BEFORE CLOSURE — an idle tab is parked on about:blank after
-//     BC_TAB_BLANK_MS, which hands the renderer's page back immediately, and is
-//     closed once idle for BC_TAB_IDLE_MS.
+//   * MEMORY BEFORE CLOSURE — an idle tab is parked on about:blank well before
+//     it is closed, which hands the renderer's page back immediately. Both
+//     windows are measured, not declared (see "cadence" below).
 //   * HOLDS — TabPool (and anyone else with a long-lived tab) calls hold() so a
 //     working tab is never evicted or reaped out from under it.
 //
@@ -54,17 +54,32 @@ const isBlank = (page) => {
 // is killed before it can tidy up.
 const MARKER = "bcPoolTab";
 const TAB_SETTLE_MS = Number(process.env.BC_TAB_SETTLE_MS ?? 400);
-// 0 disables reaping. Default 5 min: long enough that a slow task keeps its tab,
-// short enough that an abandoned one does not survive a coffee break.
-const IDLE_MS = Number(process.env.BC_TAB_IDLE_MS ?? 300_000);
-// Memory first: an idle tab is parked on about:blank long before it is closed,
-// which hands the renderer's page back without losing the tab. 0 disables it.
-const BLANK_MS = Number(process.env.BC_TAB_BLANK_MS ?? 60_000);
-// A tab this quiet is not "in use": the next request takes it instead of
-// opening another. 0 turns recycling off and makes every request a new tab.
-const RECYCLE_MS = Number(process.env.BC_TAB_RECYCLE_MS ?? 5_000);
+
+// "Is this tab still wanted?" has no correct constant. A crawler touches a tab
+// every 200 ms; an agent that stops to think touches one every 30 s. Five
+// seconds would steal the second one's tab and never reuse the first one's.
+//
+// So the windows are measured, not declared: the guard tracks the gap between
+// operations on the tabs it owns (an EWMA, ignoring gaps so long they are
+// obviously pauses rather than rhythm) and expresses each decision as a
+// multiple of THAT. A tab is reusable once it has been quiet for several of the
+// caller's own beats; blanked after a few dozen; closed after a few hundred.
+// Floors and caps keep a pathological cadence from producing a silly window,
+// and BC_TAB_*_MS pins any of them when the operator wants a number.
+const CADENCE_SEED_MS = 1_000; // before anything is measured
+const CADENCE_ALPHA = 0.3; // EWMA weight of the newest gap
+const CADENCE_PAUSE_MS = 120_000; // a gap longer than this is a pause, not rhythm
+const RECYCLE = { beats: 5, min: 1_000, max: 60_000, pinned: process.env.BC_TAB_RECYCLE_MS };
+const BLANK = { beats: 30, min: 30_000, max: 600_000, pinned: process.env.BC_TAB_BLANK_MS };
+const IDLE = { beats: 120, min: 120_000, max: 1_800_000, pinned: process.env.BC_TAB_IDLE_MS };
 const REAP_EVERY_MS = 30_000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** A window expressed in the caller's own beats, unless it was pinned. */
+function window_(spec, cadence) {
+  if (spec.pinned !== undefined) return Number(spec.pinned);
+  return Math.min(spec.max, Math.max(spec.min, Math.round(cadence * spec.beats)));
+}
 
 /** Available memory below this fraction counts as pressure. */
 const MEMORY_FLOOR = Number(process.env.BC_MEM_FLOOR ?? 0.2);
@@ -119,8 +134,8 @@ export function tabCeiling(mode) {
 /**
  * Track and cap the tabs this process opens in the operator's browser.
  * @param {import("playwright-core").BrowserContext} context
- * @param {{ mode?: string, ceiling?: number, idleMs?: number, blankMs?: number, evict?: boolean,
- *          settleMs?: number, headroom?: () => number }} options
+ * @param {{ mode?: string, ceiling?: number, idleMs?: number, blankMs?: number, recycleMs?: number,
+ *          evict?: boolean, settleMs?: number, headroom?: () => number }} options
  */
 export class TabGuard {
   constructor(
@@ -128,9 +143,9 @@ export class TabGuard {
     {
       mode = "extension",
       ceiling,
-      idleMs = IDLE_MS,
-      blankMs = BLANK_MS,
-      recycleMs = RECYCLE_MS,
+      idleMs,
+      blankMs,
+      recycleMs,
       evict = process.env.BC_TAB_EVICT !== "0",
       settleMs = TAB_SETTLE_MS,
       headroom: headroomOf = headroom,
@@ -141,9 +156,10 @@ export class TabGuard {
     /** Transport stability limit, not a policy number (see the header). */
     this.ceiling = ceiling ?? tabCeiling(mode);
     this.headroom = headroomOf;
-    this.idleMs = idleMs;
-    this.blankMs = blankMs;
-    this.recycleMs = recycleMs;
+    /** Explicit overrides win; otherwise every window is measured (see the header). */
+    this.pinned = { idleMs, blankMs, recycleMs };
+    /** The caller's rhythm: an EWMA of the gap between operations we observe. */
+    this.cadence = CADENCE_SEED_MS;
     this.evict = evict;
     this.settleMs = settleMs;
     /** Pages that existed before we attached: the operator's, off limits. */
@@ -156,13 +172,13 @@ export class TabGuard {
     this.bridgePages = new Set(context.pages().filter((p) => p.url().startsWith("chrome-extension://")));
     /** page -> { origin, bornAt, lastUsed, holds } */
     this.owned = new Map();
-    this.stats = { created: 0, recycled: 0, spawned: 0, evicted: 0, reaped: 0, blanked: 0, refused: 0, closed: 0, overflow: 0 };
+    this.stats = { created: 0, recycled: 0, spawned: 0, evicted: 0, reaped: 0, blanked: 0, refused: 0, grantedUnderPressure: 0, closed: 0, overflow: 0 };
     this._closeChain = Promise.resolve();
     this._timer = null;
     this._creating = 0; // tabs opened through newPage() arrive as "page" events too
     this._onPage = (page) => this.adopt(page, this._creating > 0 ? "created" : "spawned");
     this.context.on("page", this._onPage);
-    if (this.idleMs > 0) {
+    if (this.idleAfter() > 0) {
       this._timer = setInterval(() => void this.reap(), REAP_EVERY_MS);
       this._timer.unref?.(); // never keep the process alive just to reap
     }
@@ -203,11 +219,47 @@ export class TabGuard {
     return page;
   }
 
-  /** Record activity so the reaper and the LRU eviction order stay honest. */
+  /**
+   * Record activity, and learn from it. The gap since the previous operation is
+   * this caller's beat; every idle decision is expressed in those beats, so a
+   * fast crawler and a slow, thinking agent each get a window that fits them.
+   */
   touch(page) {
+    const now = Date.now();
     const entry = this.owned.get(page);
-    if (entry) entry.lastUsed = Date.now();
+    if (this._lastTouch) {
+      const gap = now - this._lastTouch;
+      // A long silence is a pause, not a rhythm: learning from it would make the
+      // guard hoard tabs for the rest of the session.
+      if (gap >= 0 && gap < CADENCE_PAUSE_MS) this.cadence = CADENCE_ALPHA * gap + (1 - CADENCE_ALPHA) * this.cadence;
+    }
+    this._lastTouch = now;
+    if (entry) entry.lastUsed = now;
     return page;
+  }
+
+  /**
+   * The beat every idle decision is measured in. Under memory pressure it runs
+   * four times faster: that is how pressure is answered — by reclaiming sooner,
+   * not by refusing work that would have freed nothing.
+   */
+  #beat() {
+    return this.headroom() < MEMORY_FLOOR ? this.cadence / 4 : this.cadence;
+  }
+
+  /** Quiet long enough to be someone else's tab. */
+  recycleAfter() {
+    return window_({ ...RECYCLE, pinned: this.pinned.recycleMs ?? RECYCLE.pinned }, this.#beat());
+  }
+
+  /** Quiet long enough that its renderer should give the page back. */
+  blankAfter() {
+    return window_({ ...BLANK, pinned: this.pinned.blankMs ?? BLANK.pinned }, this.#beat());
+  }
+
+  /** Quiet long enough to be abandoned. */
+  idleAfter() {
+    return window_({ ...IDLE, pinned: this.pinned.idleMs ?? IDLE.pinned }, this.#beat());
   }
 
   /** Pin a tab: held tabs are never evicted or reaped (TabPool uses this). */
@@ -252,8 +304,9 @@ export class TabGuard {
 
   /** An unheld tab nobody has touched for a while: the natural one to reuse. */
   #idlest() {
-    if (this.recycleMs <= 0) return null;
-    const quiet = Date.now() - this.recycleMs;
+    const after = this.recycleAfter();
+    if (after <= 0) return null;
+    const quiet = Date.now() - after;
     let best = null;
     let bestAt = Infinity;
     for (const [page, entry] of this.owned) {
@@ -281,25 +334,28 @@ export class TabGuard {
    *
    * A Chrome tab parked on a real application holds a renderer process with the
    * whole DOM, JS heap and caches in it; closing is not the only lever and not
-   * the first one. An idle tab we own is blanked after BC_TAB_BLANK_MS, which
-   * drops that renderer's page, and only closed once it has been idle for the
-   * full BC_TAB_IDLE_MS. Blanking goes through the process-wide navigation lock,
+   * the first one. An idle tab we own is blanked once it has been quiet for the
+   * blank window, which drops that renderer's page, and closed once it has been
+   * quiet for the idle window. Both are the caller's measured cadence in beats
+   * (see the header). Blanking goes through the process-wide navigation lock,
    * because concurrent navigation over the extension bridge crashes Chrome.
    */
   async reap() {
-    if (this.idleMs <= 0) return { reaped: 0, blanked: 0 };
+    const idleAfter = this.idleAfter();
+    const blankAfter = this.blankAfter();
+    if (idleAfter <= 0) return { reaped: 0, blanked: 0 };
     const now = Date.now();
     let reaped = 0;
     let blanked = 0;
     for (const [page, entry] of [...this.owned]) {
       if (entry.holds > 0) continue;
       const idle = now - entry.lastUsed;
-      if (idle >= this.idleMs) {
+      if (idle >= idleAfter) {
         if (await this.#close(page, "idle")) {
           this.stats.reaped += 1;
           reaped += 1;
         }
-      } else if (this.blankMs > 0 && idle >= this.blankMs && !entry.blanked && !isBlank(page)) {
+      } else if (blankAfter > 0 && idle >= blankAfter && !entry.blanked && !isBlank(page)) {
         entry.blanked = true;
         await serialiseNavigation(() => page.goto("about:blank", { waitUntil: "commit" })).catch(() => {});
         this.stats.blanked += 1;
@@ -322,8 +378,11 @@ export class TabGuard {
       ceiling: this.ceiling,
       headroom: Number(this.headroom().toFixed(2)),
       operatorTabs: this.protectedPages.size,
-      idleMs: this.idleMs,
-      blankMs: this.blankMs,
+      // Measured, not configured: the caller's beat and the windows it implies.
+      cadenceMs: Math.round(this.cadence),
+      recycleAfterMs: this.recycleAfter(),
+      blankAfterMs: this.blankAfter(),
+      idleAfterMs: this.idleAfter(),
       evict: this.evict,
       ...this.stats,
       tabs,
@@ -341,29 +400,33 @@ export class TabGuard {
   }
 
   /**
-   * Decide whether the browser can afford one more tab right now. Pressure, not
-   * a quota: while the machine has headroom and the transport is within its
-   * stability limit, the answer is yes; otherwise the least-recently-used idle
-   * tab is taken back first, and only an all-busy browser under pressure is
-   * refused — with the reason, not a number.
+   * Decide whether the browser can afford one more tab right now.
+   *
+   * Refusing work does not free a single byte — only reclaiming does. So memory
+   * pressure makes this hand back idle tabs before it grants a new one, and if
+   * there is nothing idle to hand back it grants anyway and lets the reaper
+   * squeeze harder (the windows shrink under pressure, see #beat). The one
+   * genuine refusal is the transport's ceiling, where another tab would drop
+   * the connection: that is not a policy, it is physics.
    */
   async #admit() {
     for (;;) {
-      const room = this.headroom();
-      // Pressure makes us give tabs back before taking more; it never forbids
-      // the first one, because a process holding nothing has nothing to return.
-      const tight = room < MEMORY_FLOOR && this.owned.size > 0;
+      const tight = this.headroom() < MEMORY_FLOOR && this.owned.size > 0;
       const overCeiling = this.owned.size >= this.ceiling;
       if (!overCeiling && !tight) return;
       const victim = this.#lru();
       if (!victim) {
+        if (!overCeiling) {
+          // Under pressure with every tab in use: the work is real, the tabs are
+          // real, and saying no would only break the caller.
+          this.stats.grantedUnderPressure += 1;
+          return;
+        }
         this.stats.refused += 1;
-        const why = overCeiling
-          ? `the ${this.mode} transport tolerates ${this.ceiling} attached tabs and all of them are in use`
-          : `the machine is low on memory (${Math.round(room * 100)}% free) and every tab this process owns is in use`;
         throw new Error(
-          `cannot open another tab: ${why}. Finish or release the work holding a tab, close one, ` +
-            "or pin an explicit limit with BC_TAB_BUDGET — tabs are the operator's memory, not ours (src/tab-guard.mjs).",
+          `cannot open another tab: the ${this.mode} transport tolerates ${this.ceiling} attached tabs and all of them are in use. ` +
+            "Finish or release the work holding one, close one, or raise BC_TAB_BUDGET if your transport can take it " +
+            "(the extension bridge drops the connection past three — src/tab-guard.mjs).",
         );
       }
       if (await this.#close(victim, "evict")) this.stats.evicted += 1;

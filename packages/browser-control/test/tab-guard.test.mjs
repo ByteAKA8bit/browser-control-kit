@@ -159,15 +159,21 @@ describe("TabGuard admission", () => {
     guard.dispose();
   });
 
-  it("refuses with the reason when memory is tight and every tab is held", async () => {
+  it("grants the tab anyway when pressure has nothing to reclaim — and reclaims sooner instead", async () => {
     const context = fakeContext([fakePage()]);
-    const guard = guardFor(context, { ceiling: 10, headroom: () => 0.02 });
+    let room = 1;
+    const guard = guardFor(context, { ceiling: 10, headroom: () => room, idleMs: undefined, blankMs: undefined, recycleMs: undefined });
     const working = await guard.newPage();
-    guard.hold(working);
+    guard.hold(working); // the only tab we own, and it is in use
+    guard.cadence = 8_000; // a deliberate caller: windows clear of both floor and cap
+    const relaxed = guard.idleAfter();
 
-    await assert.rejects(() => guard.newPage(), /low on memory.*in use/s);
-    assert.equal(working._closed, false, "a held tab is never sacrificed");
-    assert.equal(guard.stats.refused, 1);
+    room = 0.02;
+    const second = await guard.newPage();
+
+    assert.notEqual(second, working, "refusing would have freed nothing and broken the caller");
+    assert.equal(guard.stats.grantedUnderPressure, 1);
+    assert.ok(guard.idleAfter() < relaxed, `pressure must shorten the idle window: ${guard.idleAfter()} vs ${relaxed}`);
     guard.dispose();
   });
 
@@ -263,13 +269,60 @@ describe("TabGuard reclaiming", () => {
     guard.dispose();
   });
 
-  it("is off when BC_TAB_IDLE_MS is 0", async () => {
+  it("is off when the idle window is pinned to 0", async () => {
     const context = fakeContext([fakePage()]);
     const guard = guardFor(context, { ceiling: 3, idleMs: 0 });
     const page = await guard.newPage();
     age(guard, page, 10_000_000);
     assert.deepEqual(await guard.reap(), { reaped: 0, blanked: 0 });
     assert.equal(page._closed, false);
+    guard.dispose();
+  });
+});
+
+describe("measured windows", () => {
+  it("learns the caller's rhythm instead of trusting a constant", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 3, idleMs: undefined, blankMs: undefined, recycleMs: undefined });
+    const page = await guard.newPage();
+    const seeded = guard.cadence;
+
+    for (let i = 0; i < 20; i += 1) {
+      guard.touch(page); // a caller hammering the page: tiny gaps
+    }
+    assert.ok(guard.cadence < seeded, `a fast caller should shrink the beat, got ${guard.cadence}`);
+    assert.ok(guard.recycleAfter() >= 1_000, "but never below the floor");
+    guard.dispose();
+  });
+
+  it("does not learn from a pause, so a thinking agent keeps its tab", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 3, idleMs: undefined, blankMs: undefined, recycleMs: undefined });
+    const page = await guard.newPage();
+    guard.touch(page);
+    const before = guard.cadence;
+
+    guard._lastTouch = Date.now() - 10 * 60_000; // ten minutes away from the keyboard
+    guard.touch(page);
+
+    assert.equal(guard.cadence, before, "a ten-minute gap is a pause, not a rhythm");
+    guard.dispose();
+  });
+
+  it("orders the windows: reuse before blanking before closing", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { idleMs: undefined, blankMs: undefined, recycleMs: undefined });
+    assert.ok(guard.recycleAfter() < guard.blankAfter(), "a tab is reusable long before it is blanked");
+    assert.ok(guard.blankAfter() < guard.idleAfter(), "memory comes back before the tab does");
+    guard.dispose();
+  });
+
+  it("lets an explicit number win over the measurement", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { recycleMs: 42, blankMs: 4242, idleMs: 42_424 });
+    assert.equal(guard.recycleAfter(), 42);
+    assert.equal(guard.blankAfter(), 4242);
+    assert.equal(guard.idleAfter(), 42_424);
     guard.dispose();
   });
 });

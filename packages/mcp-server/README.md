@@ -58,8 +58,8 @@ Newline-delimited JSON-RPC 2.0 on stdin/stdout; **stdout carries protocol bytes 
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `BC_TAB_RECYCLE_MS` | `2000` | Quiet period after which a tab is reused rather than a new one opened |
-| `BC_TAB_BLANK_MS` | `30000` | Idle period after which a tab is parked on `about:blank` |
+| `BC_TAB_RECYCLE_MS` | measured | Pin the quiet period after which a tab is reused rather than a new one opened |
+| `BC_TAB_BLANK_MS` | measured | Pin the idle period after which a tab is parked on `about:blank` |
 | `BC_TAB_BUDGET` | transport ceiling | Pin an explicit tab limit |
 | `BC_MCP_ATTACH_TIMEOUT_MS` | `60000` | Give up waiting for a browser |
 | `BC_MCP_TEXT_LIMIT` | `20000` | Characters `browser_text` returns |
