@@ -47,13 +47,47 @@ export async function modalTitle(page) {
   return page.evaluate((sel) => document.querySelector(`${sel} .ant-modal-title`)?.innerText?.trim() ?? null, MODAL);
 }
 
+// Drawers are the other overlay antd apps put forms in (Drawer instead of
+// Modal). Same trap as modals: closed drawers stay mounted, so the OPEN one is
+// tagged and every helper works inside that tag.
+export const DRAWER = '[data-qa-drawer="active"]';
+
+/** Tag the open drawer; returns false when none is on screen. */
+export async function syncDrawer(page) {
+  return page.evaluate(() => {
+    for (const el of document.querySelectorAll('[data-qa-drawer="active"]')) el.removeAttribute("data-qa-drawer");
+    const open = [...document.querySelectorAll(".ant-drawer")].find(
+      (d) => d.classList.contains("ant-drawer-open") && d.querySelector(".ant-drawer-body"),
+    );
+    if (!open) return false;
+    open.setAttribute("data-qa-drawer", "active");
+    return true;
+  });
+}
+
+export async function drawerOpen(page) {
+  return syncDrawer(page);
+}
+
+export async function drawerTitle(page) {
+  if (!(await syncDrawer(page))) return null;
+  return page.evaluate((sel) => document.querySelector(`${sel} .ant-drawer-title`)?.innerText?.trim() ?? null, DRAWER);
+}
+
+/** Re-tag whichever overlay a helper was asked to work in. */
+export async function syncScope(page, scope) {
+  if (scope === MODAL) return syncModal(page);
+  if (scope === DRAWER) return syncDrawer(page);
+  return true;
+}
+
 /**
  * Click an enabled button by visible text.
  * EXACT text wins over substring: this screen has both「一時保存」and
  *「一時保存を破棄」, and a substring match would hit the destructive one first.
  */
 export async function clickButton(page, text, { scope = "body", nth = 0 } = {}) {
-  if (scope === MODAL) await syncModal(page);
+  await syncScope(page, scope);
   const clicked = await page.evaluate(
     (t, s, n) => {
       const root = document.querySelector(s) ?? document.body;
@@ -78,7 +112,7 @@ export async function clickButton(page, text, { scope = "body", nth = 0 } = {}) 
 
 /** Click an icon-only button (antd icon name: plus / edit / delete / …). */
 export async function clickIcon(page, icon, { scope = ".ant-tabs-tabpane-active", nth = 0 } = {}) {
-  if (scope === MODAL) await syncModal(page);
+  await syncScope(page, scope);
   const clicked = await page.evaluate(
     (ic, s, n) => {
       const root = document.querySelector(s) ?? document.body;
@@ -98,19 +132,19 @@ export async function clickIcon(page, icon, { scope = ".ant-tabs-tabpane-active"
 
 /** Validation messages inside the visible modal (or any scope). */
 export async function formErrors(page, scope = "body") {
-  if (scope === MODAL) await syncModal(page);
+  await syncScope(page, scope);
   return page.evaluate((s) => {
     const root = document.querySelector(s) ?? document.body;
     return [...root.querySelectorAll(".ant-form-item-explain-error")].map((e) => e.innerText.trim());
   }, scope);
 }
 
-/** Set a controlled input's value inside the visible modal (React-safe). */
-export async function setModalInput(page, selector, value) {
-  if (!(await syncModal(page))) throw new Error("setModalInput: no visible modal");
+/** Set a controlled input's value inside the visible modal/drawer (React-safe). */
+export async function setModalInput(page, selector, value, { scope = MODAL } = {}) {
+  if (!(await syncScope(page, scope))) throw new Error(`setModalInput: no visible ${scope}`);
   const ok = await page.evaluate(
-    (modal, sel, val) => {
-      const el = document.querySelector(`${modal} ${sel}`);
+    (root, sel, val) => {
+      const el = document.querySelector(`${root} ${sel}`);
       if (!el) return false;
       const proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement : window.HTMLInputElement;
       Object.getOwnPropertyDescriptor(proto.prototype, "value").set.call(el, val);
@@ -118,27 +152,74 @@ export async function setModalInput(page, selector, value) {
       el.dispatchEvent(new Event("change", { bubbles: true }));
       return true;
     },
-    MODAL,
+    scope,
     selector,
     value,
   );
-  if (!ok) throw new Error(`setModalInput: ${selector} not found in modal`);
+  if (!ok) throw new Error(`setModalInput: ${selector} not found in ${scope}`);
   await sleep(250);
   return true;
 }
 
-/** Antd Select inside the visible modal: open by input id, pick option text. */
-export async function selectOption(page, inputId, optionText) {
-  await syncModal(page);
-  await page.click(`${MODAL} #${inputId}`).catch(async () => {
-    await page.click(`#${inputId}`);
+/** Pick a radio / checkbox by its visible label inside a modal or drawer. */
+export async function pickRadio(page, label, { scope = MODAL } = {}) {
+  if (!(await syncScope(page, scope))) throw new Error(`pickRadio: no visible ${scope}`);
+  const ok = await page.evaluate(
+    (root, want) => {
+      const el = document.querySelector(root);
+      const wrappers = [...(el?.querySelectorAll(".ant-radio-button-wrapper, .ant-radio-wrapper, .ant-checkbox-wrapper") ?? [])];
+      const hit = wrappers.find((w) => (w.innerText ?? "").trim() === want) ?? wrappers.find((w) => (w.innerText ?? "").includes(want));
+      if (!hit) return false;
+      (hit.querySelector("input") ?? hit).click();
+      return true;
+    },
+    scope,
+    label,
+  );
+  if (!ok) throw new Error(`pickRadio: "${label}" not found in ${scope}`);
+  await sleep(250);
+  return true;
+}
+
+/**
+ * Antd Select inside a modal/drawer: open by input id, pick option text.
+ * The real click is tried first (it is what a user does); when the transport's
+ * hit test refuses — antd keeps closed overlays mounted, so the input can be
+ * zero-size or reported as obscured — the dropdown is opened with DOM-level
+ * mouse events on the `.ant-select` wrapper, which is what antd listens to.
+ */
+export async function selectOption(page, inputId, optionText, { scope = MODAL } = {}) {
+  await syncScope(page, scope);
+  const openViaDom = () =>
+    page.evaluate(
+      (root, id) => {
+        const el = document.querySelector(`${root} #${id}`) ?? document.querySelector(`#${id}`);
+        const wrapper = el?.closest(".ant-select");
+        if (!wrapper) return false;
+        for (const type of ["mousedown", "mouseup", "click"]) wrapper.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+        return true;
+      },
+      scope,
+      inputId,
+    );
+  const dropdownOpen = () =>
+    page
+      .waitForSelector(".ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option", { timeout: 4000 })
+      .then(() => true)
+      .catch(() => false);
+
+  await page.click(`${scope} #${inputId}`).catch(async () => {
+    await page.click(`#${inputId}`).catch(() => {});
   });
-  await page.waitForSelector(".ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option", { timeout: 8000 });
+  if (!(await dropdownOpen())) {
+    if (!(await openViaDom())) throw new Error(`selectOption(${inputId}): select not found in ${scope}`);
+    if (!(await dropdownOpen())) throw new Error(`selectOption(${inputId}): dropdown did not open`);
+  }
   const picked = await page.evaluate((t) => {
     const opts = [...document.querySelectorAll(".ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option")];
     const hit = opts.find((o) => (o.innerText ?? "").trim() === t) ?? opts.find((o) => (o.innerText ?? "").includes(t));
     if (!hit) return { ok: false, options: opts.map((o) => o.innerText.trim()).slice(0, 30) };
-    hit.click();
+    for (const type of ["mousedown", "mouseup", "click"]) hit.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
     return { ok: true };
   }, optionText);
   if (!picked.ok) throw new Error(`selectOption(${inputId}): "${optionText}" not found; options=${JSON.stringify(picked.options)}`);
@@ -146,10 +227,10 @@ export async function selectOption(page, inputId, optionText) {
   return true;
 }
 
-/** Antd DatePicker inside the visible modal: type value, commit with Enter. */
-export async function pickDate(page, inputId, value) {
-  await syncModal(page);
-  const sel = `${MODAL} #${inputId}`;
+/** Antd DatePicker inside a modal/drawer: type value, commit with Enter. */
+export async function pickDate(page, inputId, value, { scope = MODAL } = {}) {
+  await syncScope(page, scope);
+  const sel = `${scope} #${inputId}`;
   await page.click(sel);
   await page.$eval(sel, (el) => {
     el.value = "";
@@ -160,11 +241,29 @@ export async function pickDate(page, inputId, value) {
   return page.$eval(sel, (el) => el.value);
 }
 
-/** Click 保存 in the visible modal; report validation errors and open state. */
-export async function saveModal(page) {
-  await clickButton(page, "保存", { scope: MODAL });
+/** Click 保存 in the visible modal/drawer; report validation errors and open state. */
+export async function saveModal(page, { scope = MODAL, label = "保存" } = {}) {
+  await clickButton(page, label, { scope });
   await sleep(1400);
-  return { errors: await formErrors(page, MODAL), stillOpen: await modalOpen(page) };
+  return { errors: await formErrors(page, scope), stillOpen: await syncScope(page, scope) };
+}
+
+/** Close the open drawer (cancel → close icon → Escape) and verify. */
+export async function closeDrawer(page) {
+  for (let i = 0; i < 3; i += 1) {
+    if (!(await syncDrawer(page))) return true;
+    await page.evaluate((sel) => {
+      const root = document.querySelector(sel);
+      const cancel = [...(root?.querySelectorAll("button") ?? [])].find((b) => /キャンセル|閉じる|戻る/.test(b.innerText ?? ""));
+      (cancel ?? root?.querySelector(".ant-drawer-close"))?.click();
+    }, DRAWER);
+    await sleep(600);
+    if (!(await syncDrawer(page))) return true;
+    await page.keyboard.press("Escape");
+    await sleep(600);
+  }
+  if (await syncDrawer(page)) throw new Error(`closeDrawer: drawer "${await drawerTitle(page)}" refused to close`);
+  return true;
 }
 
 /** Close the visible modal (cancel → close icon → Escape) and verify. */

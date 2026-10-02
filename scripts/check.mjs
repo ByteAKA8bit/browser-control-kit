@@ -1,4 +1,4 @@
-// Local CI, run by the git hooks (no GitHub Actions).
+// Local CI, run by the git hooks; GitHub Actions runs the offline tier too.
 //
 // Two tiers, because half of this repo can only be verified against a real
 // browser:
@@ -64,12 +64,15 @@ step("crash guards still in place", () => {
   // These guards exist because the extension bridge really did take Chrome down.
   const pool = readFileSync(path.join(ROOT, "packages/browser-control/src/pool.mjs"), "utf8");
   const page = readFileSync(path.join(ROOT, "packages/browser-control/src/page.mjs"), "utf8");
+  const guard = readFileSync(path.join(ROOT, "packages/browser-control/src/tab-guard.mjs"), "utf8");
   const required = [
     [pool, "BC_ALLOW_TAB_CREATE", "tab-creation gate"],
     [pool, "MAX_TABS_EXTENSION", "extension tab ceiling"],
     [pool, "only ONE pool per connection", "single-pool guard"],
     [page, "serialiseNavigation", "navigation lock"],
     [page, "BC_ALLOW_INIT_SCRIPT", "addInitScript gate"],
+    [guard, "protectedPages", "operator's tabs are off limits"],
+    [guard, "ordinary.length <= 1", "never close the last ordinary tab"],
   ];
   for (const [src, needle, label] of required) if (!src.includes(needle)) throw new Error(`${label} missing (${needle})`);
   return `${required.length} guards`;
@@ -80,6 +83,27 @@ step("license + package metadata", () => {
   if (pkg.license !== "MIT") throw new Error(`browser-control license is ${pkg.license}`);
   return "MIT";
 });
+// The suites that need no browser: tab governance decides what gets closed in
+// the operator's window, the websocket codec sits between every automation
+// client and Chrome, the shim autostart decision keeps the `cdp` transport down
+// to a single approval click, the shim policy keeps it from ever quitting the
+// operator's browser, and the MCP protocol is what agents actually speak to us.
+// All must be verified on every commit, not only when Chrome happens to be running.
+const OFFLINE_SUITES = [
+  ["packages/browser-control", "test/tab-guard.test.mjs"],
+  ["packages/browser-control", "test/ws-server.test.mjs"],
+  ["packages/browser-control", "test/shim-autostart.test.mjs"],
+  ["packages/browser-control", "test/shim-policy.test.mjs"],
+  ["packages/mcp-server", "test/protocol.test.mjs"],
+];
+for (const [pkg, suite] of OFFLINE_SUITES) {
+  step(`${pkg.replace("packages/", "")}/${suite}`, () => {
+    const out = execSync(`node --test ${suite}`, { cwd: path.join(ROOT, pkg), stdio: "pipe" }).toString();
+    const fail = /# fail (\d+)/.exec(out)?.[1] ?? "?";
+    if (fail !== "0") throw new Error(`${fail} failing tests`);
+    return `${/# pass (\d+)/.exec(out)?.[1] ?? "?"} passed`;
+  });
+}
 
 if (!offlineOnly) {
   console.log("browser checks");

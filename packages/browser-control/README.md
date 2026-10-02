@@ -1,130 +1,140 @@
+**English** · [简体中文](../../README.zh-CN.md)
+
 # browser-control
 
-驱动**操作者自己正在用的那个 Chrome**——正常双击打开的、带全部登录态和扩展的浏览器。
+Drives **the Chrome the operator is already using** — the one opened by double-clicking it, with every login and extension intact.
 
-- **不加启动参数**、**不挂 user-data-dir**、**不起新实例**、**不用点"允许"**
-- 后台标签也能操作（不抢焦点、不打断你）
-- 与被测应用完全解耦：这个包只管"怎么控制浏览器"，业务用例在别处
+- No launch flags, no `--user-data-dir`, no second instance, no "Allow" click on the default transport
+- Works on a background tab: it does not steal focus or interrupt the operator
+- Fully decoupled from the application under test: this package only knows how to drive a browser
 
-> 起一个空白 dev profile 的方案本包**明确不做**：没有真实会话、没有扩展、没有真实状态，证明不了任何东西，而且这种方案满地都是。
+> Spinning up a blank dev profile is an explicit **non-goal**: no session, no extensions, no real state — it proves nothing, and that approach already exists everywhere.
 
-## 装
+## Install
 
 ```bash
-npm i          # 只有 playwright-core 一个依赖
+npm i          # playwright-core is the only dependency
 ```
 
-Node ≥ 22（`cdp-shim.mjs` 用到默认开启的全局 `WebSocket`）。**不要用 Bun**：Bun 的 WebSocket 客户端无法承载 Playwright 的 CDP 传输，`connectOverCDP` 会卡在 `<ws connecting>` 直到超时。
+Node >= 22 (`cdp-shim.mjs` relies on the global `WebSocket`). **Do not use Bun**: its WebSocket client cannot carry Playwright's CDP transport, so `connectOverCDP` hangs at `<ws connecting>` until it times out.
 
-## 用
+## Use
 
 ```js
 import { attach, controlPage, blockUrls } from "browser-control";
 
-const { browser, context, mode, capabilities } = await attach();   // 默认 extension 通道
+const { browser, context, mode, capabilities } = await attach();   // extension transport by default
 const page = controlPage(context.pages()[0] ?? (await context.newPage()), capabilities);
 
-await blockUrls(page, /translate(-pa)?\.google(apis)?\.com/);      // 别让翻译改写 UI
+await blockUrls(page, /translate(-pa)?\.google(apis)?\.com/);      // keep translation from rewriting the UI
 await page.goto("https://example.com/#/login", { waitUntil: "domcontentloaded" });
 await page.fill("#user", "alice");
 await page.click("button[type=submit]");
 console.log(page.inputMode());                                     // "dom-input" | "real-input"
-await browser.close();                                             // 只断开，不关你的浏览器
+await browser.close();                                             // disconnects; your browser stays open
 ```
 
-## Token 存放（不必放环境变量）
+## Where the token lives (no environment variable needed)
 
-Token 等于整个浏览器的控制权，别留在 shell history / CI 日志里。未设 `PLAYWRIGHT_MCP_EXTENSION_TOKEN` 时，会**只读**地取 `~/.config/browser-control/token`（本包从不创建/写入该文件；路径可用 `BC_TOKEN_FILE` 覆盖）：
+The token is control over the whole browser — keep it out of shell history and CI logs. When `PLAYWRIGHT_MCP_EXTENSION_TOKEN` is unset, it is read **read-only** from `~/.config/browser-control/token` (this package never creates or writes that file; `BC_TOKEN_FILE` overrides the path):
 
 ```bash
 mkdir -p ~/.config/browser-control
-pbpaste > ~/.config/browser-control/token   # 扩展 status 页复制的 token
+pbpaste > ~/.config/browser-control/token   # copied from the extension's status page
 chmod 600 ~/.config/browser-control/token
 ```
 
-## Trace（实测扩展通道也支持）
+## Trace (works on the extension transport too, measured)
 
-`BC_TRACE=1` 或 `attach({ trace: true })` → 返回值带 `saveTrace(file)`：
+`BC_TRACE=1` or `attach({ trace: true })` → the return value carries `saveTrace(file)`:
 
 ```bash
-TF_TRACE=1 node runner.mjs 08-upload    # → results/traces/08-upload.zip
+BC_TRACE=1 node runner.mjs            # → saveTrace("results/traces/08-upload.zip")
 npx playwright show-trace results/traces/08-upload.zip
 ```
 
-实测产物：287 个条目 / 263 帧 screencast / 含 `trace.network`，约 7 MB 一个套件 —— 所以默认关闭，按需开。
+Measured output: 287 entries / 263 screencast frames / includes `trace.network`, about 7 MB for one suite — hence off by default.
 
-## 两种通道
+## The two transports
 
-| 通道 | 前置条件 | 要点"允许"吗 | 能力 | 适用 |
+| Transport | Prerequisites | Approval clicks | Capabilities | Use when |
 | --- | --- | --- | --- | --- |
-| `extension`（默认） | 装 [Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm) + `PLAYWRIGHT_MCP_EXTENSION_TOKEN`（扩展 status 页显示） | **不用**（token 免弹窗） | 无原始 CDP（实测 `Target.attachToBrowserTarget: Not allowed`）、无 `Browser.grantPermissions`、无焦点模拟 → 由 DOM 级输入兜住 | **默认/无人值守**：Chrome 正常启动即可 |
-| `cdp` | Chrome 带 `--remote-debugging-port=9222` + `node src/cdp-shim.mjs` | 每个新连接要点一次 | 完整 CDP：焦点模拟、权限预授权、下载目录、URL 拦截 | 需要 CDP 级开关时 |
+| `extension` (default) | [Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm) + `PLAYWRIGHT_MCP_EXTENSION_TOKEN` (shown on its status page) | **none** (the token replaces the dialog) | No raw CDP (measured: `Target.attachToBrowserTarget: Not allowed`), no `Browser.grantPermissions`, no focus emulation → DOM-level input covers it | **Default / unattended**: Chrome only has to be running |
+| `cdp` | Chrome with `--remote-debugging-port=9222` + `node src/cdp-shim.mjs` | **one per shim lifetime** (the shim proxies all clients) | Full CDP: focus emulation, pre-granted permissions, download directory, URL interception | You need a CDP-level switch |
 
-切换：`BC_MODE=cdp`（或 `attach({ mode: "cdp" })`）；shim 地址 `BC_CDP_URL`。
+Switch with `BC_MODE=cdp` (or `attach({ mode: "cdp" })`); the shim address is `BC_CDP_URL`.
 
-`cdp-shim.mjs` 存在的原因：Chrome 152 在默认 profile 下只保留 DevTools WebSocket，`/json/*` 全 404，而 Playwright/puppeteer 必须靠 `/json/version` 握手；shim 持有**一条**长连接把这些端点重建出来（并容忍 Playwright 请求的 `/json/version/` 尾斜杠）。
+`cdp-shim.mjs` exists for two reasons, most painful first:
 
-## 核心设计：能力自适应输入
+1. **The approval dialog.** Chrome asks the operator to approve every new external CDP connection to the default profile and never remembers; until approved, `/json/*` returns 404 and the WebSocket handshake hangs. The shim holds the single approved browser socket and **proxies** every client over it — `/json/version` and `/json/list` hand out shim addresses (`ws://127.0.0.1:9333/devtools/{browser,page}/...`), so clients never reach Chrome directly. `/devtools/page/<id>` opens a flat session on that same socket, with `sessionId` added inbound and stripped outbound.
+2. **The discovery endpoints.** On that same Chrome, `/json/*` is all 404s, while puppeteer-flavoured clients handshake through `/json/version` — so those endpoints are rebuilt on top of `Target.*` (tolerating Playwright's trailing slash on `/json/version/`).
 
-Playwright 的 `click`/`fill` 会做 actionability 检查（visible / enabled / stable）并派发真实输入事件。扩展通道附着的标签在后台时 `document.visibilityState === "hidden"`、`hasFocus() === false`，这些检查必然超时。
+Make it resident: `node ../../scripts/install-shim-service.mjs` (launchd, KeepAlive + login autostart), log at `~/.cache/browser-control/shim.log`. Only a shim restart or a Chrome restart costs another click.
 
-于是 `controlPage()` 按探测到的能力选路：
+## Core design: capability-adaptive input
 
-- `capabilities.focusEmulation === true`（cdp 通道）→ 真实输入（`page.click` / `pressSequentially` / `keyboard`）
-- 否则 → **DOM 级输入**：
-  - 点击：`scrollIntoView` + 完整 `pointerdown → mousedown → focus → pointerup → mouseup → click` 序列（带正确的 clientX/Y）
-  - 文本：`HTMLInputElement.prototype.value` 的原生 setter + `input`/`change` 事件（React / Ant Design 受控组件只认这一套）
-  - 按键：`keydown`/`keyup`，`Enter` 额外触发 `form.requestSubmit()`
+Playwright's `click`/`fill` run actionability checks (visible / enabled / stable) and dispatch real input events. A tab attached over the extension transport reports `document.visibilityState === "hidden"` and `hasFocus() === false` while in the background, so those checks are guaranteed to time out.
 
-`attach()` 返回的 `capabilities`：`{ mode, rawCdp, focusEmulation, browserPermissions }`——探测得来，不靠假设。
+So `controlPage()` routes by the probed capabilities:
 
-## 上传 / 拖拽（DOM 路径也支持）
+- `capabilities.focusEmulation === true` (cdp transport) → real input (`page.click` / `pressSequentially` / `keyboard`)
+- otherwise → **DOM-level input**:
+  - click: `scrollIntoView` plus the full `pointerdown → mousedown → focus → pointerup → mouseup → click` sequence (with correct clientX/Y)
+  - text: the native `HTMLInputElement.prototype.value` setter plus `input`/`change` events (React / Ant Design controlled components accept nothing else)
+  - keys: `keydown`/`keyup`, and `Enter` additionally triggers `form.requestSubmit()`
 
-`setInputFiles` 通常靠 `DOM.setFileInputFiles`（CDP），`dragAndDrop` 靠真实鼠标——后台标签两者都没有。于是用纯 Web API 重建：
+`attach()` returns `capabilities`: `{ mode, rawCdp, focusEmulation, browserPermissions }` — probed, not assumed.
 
-| API | 实现 | 说明 |
+## Upload / drag (supported on the DOM path too)
+
+`setInputFiles` normally relies on `DOM.setFileInputFiles` (CDP) and `dragAndDrop` on a real mouse — a background tab has neither. Both are rebuilt out of plain Web APIs:
+
+| API | Implementation | Notes |
 | --- | --- | --- |
-| `page.setInputFiles(sel, files)` | `File` → `DataTransfer` → `input.files` + `input`/`change` | 接受路径 / `Buffer` / `{name,buffer,type}`；**校验 `accept` 与 `multiple`**，不合规直接失败（`rejected-by-accept:.xlsx,.xls` / `input-not-multiple`），避免上传 UI 本来不允许的东西 |
-| `page.dropFiles(sel, files)` | `dragenter`→`dragover`→`drop` 带 DataTransfer | antd `Upload.Dragger` 这类拖拽区 |
-| `page.dragAndDrop(from, to)` | 指针序列（`pointerdown`→N×`pointermove`→`pointerup`，坐标插值、每步对 `elementFromPoint` 派发）**＋** 源元素 `draggable` 时补发 HTML5 `dragstart/dragover/drop/dragend` | 覆盖 dnd-kit / react-dnd / sortable.js（只听指针）与 HTML5 原生拖拽两类实现 |
+| `page.setInputFiles(sel, files)` | `File` → `DataTransfer` → `input.files` + `input`/`change` | Accepts a path / `Buffer` / `{name,buffer,type}`; **validates `accept` and `multiple`** and fails loudly otherwise (`rejected-by-accept:.xlsx,.xls` / `input-not-multiple`), so you never upload what the UI would refuse |
+| `page.dropFiles(sel, files)` | `dragenter`→`dragover`→`drop` carrying a DataTransfer | For drop zones such as antd `Upload.Dragger` |
+| `page.dragAndDrop(from, to)` | Pointer sequence (`pointerdown`→N×`pointermove`→`pointerup`, interpolated coordinates, dispatched at `elementFromPoint` each step) **plus** HTML5 `dragstart/dragover/drop/dragend` when the source is `draggable` | Covers both pointer-only implementations (dnd-kit, react-dnd, sortable.js) and native HTML5 drag |
 
-有真实输入能力（`cdp` 通道）时自动改用 Playwright 原生 API，返回值里的 `via` 字段标明走了哪条路。
+With real input available (the `cdp` transport) the native Playwright APIs are used instead; the returned `via` field says which path ran.
 
-## 测试用夹具生成（`browser-control/fixtures`）
+## Fixture generation (`browser-control/fixtures`)
 
-上传测试要字节，向操作者索要样例文件会阻塞工作，所以自己生成真格式：
+Upload tests need bytes, and asking the operator for sample files blocks the work — so real formats are generated in-process:
 
 ```js
 import { makeXlsx, makeCsv, makePng, asUpload } from "browser-control/fixtures";
-const xlsx = makeXlsx([["分類","分野","名称"], ["クラウド","IaaS","AWS"]]);  // 真 OOXML，零依赖
+const xlsx = makeXlsx([["分類","分野","名称"], ["クラウド","IaaS","AWS"]]);  // real OOXML, zero dependencies
 ```
 
-`makeXlsx` 是一个 50 行的 STORED-only ZIP writer + OOXML 部件（含正确 CRC32）；产物用 **openpyxl 实测可读**（含日文）。`makeCsv` 带 UTF-8 BOM，`makePng` 是 1×1 透明图。
-
+`makeXlsx` is a 50-line STORED-only ZIP writer plus the OOXML parts (with correct CRC32); the output is **verified readable by openpyxl**, Japanese text included. `makeCsv` carries a UTF-8 BOM, `makePng` is a 1×1 transparent image.
 
 ## API
 
-| 导出 | 说明 |
+| Export | Description |
 | --- | --- |
-| `attach({ mode, clientName, shimUrl })` | 连上正在运行的浏览器 → `{ browser, context, mode, capabilities }` |
-| `controlPage(page, capabilities)` | 包出一个 puppeteer 风味的 page：多参 `evaluate`/`$eval`/`$$eval`、`waitForSelector({visible})`、`setViewport`、`evaluateOnNewDocument`、`createCDPSession`（无 CDP 时退化为空实现）、`inputMode()`、`capabilities()`；其余属性透传原生 Playwright Page |
-| `blockUrls(page, pattern)` | `page.route` 拦截（翻译服务、埋点等） |
-| `page.setInputFiles / dropFiles / dragAndDrop` | 见上节；DOM 路径下同样可用 |
-| `page.deepCount(selector)` | 跨 shadow root 与 frame 的匹配计数（诊断用） |
-| `page.viewportInfo()` | 只读窗口尺寸；`setViewport` 默认不生效（不擅自改你的窗口） |
+| `attach({ mode, clientName, shimUrl, trace, guard })` | Connect to the running browser → `{ browser, context, mode, capabilities, tabs, saveTrace }`; `context` is under the tab budget by default, `tabs` is the `TabGuard`, and `browser.close()` hands our tabs back first |
+| `controlPage(page, capabilities)` | A puppeteer-flavoured page: multi-arg `evaluate`/`$eval`/`$$eval`, `waitForSelector({visible})`, `setViewport`, `evaluateOnNewDocument`, `createCDPSession` (a no-op shim when CDP is absent), `inputMode()`, `capabilities()`; everything else passes through to the native Playwright `Page` |
+| `blockUrls(page, pattern)` | `page.route` interception (translation services, analytics beacons…) |
+| `page.setInputFiles / dropFiles / dragAndDrop` | See above; available on the DOM path too |
+| `page.deepCount(selector)` | Match count across shadow roots and frames (diagnostics) |
+| `page.viewportInfo()` | Read-only window size; `setViewport` is inert by default (your window is not ours to resize) |
+| `TabGuard` / `guardContext(context, guard)` / `guardBrowser(browser, guard)` | The tab budget: `newPage()` evicts the LRU tab when over budget, adopts `window.open` popups, reaps idle tabs, `hold()` protects tabs in use, `report()` explains itself. `attach()` already wires this up; these exports are for manual use |
+| `defaultBudget(mode)` | Budget default: `BC_TAB_BUDGET` wins, otherwise 3 on extension / 4 on cdp |
+| `TabPool` / `parallelMap` (`browser-control/pool`) | Run work across several tabs; `map()` never rejects — failures come back as `{ ok: false, error, ms, tab }` |
 
-`controlPage` 兼容 puppeteer 语义的原因很实际：Playwright 的 `evaluate` 只接受**一个**参数，且传字符串会被当表达式求值（永远不会被调用）——实测 arrow / function / async 三种字符串写法全部返回 `undefined`。多参调用在页面内用 `new Function` 重建。
+`controlPage` mirrors puppeteer semantics for a practical reason: Playwright's `evaluate` takes exactly **one** argument, and a string argument is evaluated as an expression (so the function is never called) — measured across arrow / function / async string forms, all returning `undefined`. Multi-arg calls are rebuilt in-page with `new Function`.
 
-## 实测
+## Tests
 
-同一套 TalentFlow e2e（`../tf-test`）在两种通道下的结果一致：
+```bash
+npm run test:offline   # tab-guard 13 + ws-server 8 = 21 cases, no browser needed
+npm test               # the same plus dom-input 16 and pool 8, --test-concurrency=1
+npm run selftest       # end-to-end smoke, writes ./selftest.png
+npm run cleanup        # closes only the tabs this tool left behind (--dry-run reports only)
+```
 
-| 套件 | extension（0 次点击） | cdp（1 次点击） |
-| --- | --- | --- |
-| 01-auth-access（30 例：登录/路由守卫/API 授权/JWT 篡改） | 30 PASS · 98s | 30 PASS · 139s |
-| 03-resume-edit（16 例：表单校验/草稿/提出/取り下げ） | 15 PASS + 1 已知缺陷 · 58s | 同上 · 51s |
-| 04-approval-flow（13 例：模态框/下拉/日期/差し戻し/承认全流程） | 13 PASS · 43s | 13 PASS · 47s |
-| 06-admin-masters（17 例：10 个管理模块 CRUD） | 16 PASS + 1 已知缺陷 · 145s | 同上 |
-| 08-upload（6 例：xlsx 取込 / multipart テンプレート登録） | 6 PASS · 14s | — |
+`dom-input.test.mjs` covers refusal of obscured elements (`obscured-by:DIV`), disabled, zero-size, `pointer-events:none`, shadow piercing, iframe reach, `accept`/`multiple` validation, drop zones, pointer + HTML5 drag, and readonly. The browser suites need a running Chrome and an extension token; without them they are skipped, never failed.
 
-单元测试 `npm test`：**16/16**（遮挡拒绝 `obscured-by:DIV`、disabled、零尺寸、`pointer-events:none`、shadow 穿透、iframe 到达、`accept`/`multiple` 校验、dropzone、指针+HTML5 拖拽、readonly）。
+## Licence
+
+MIT — see [LICENSE](../../LICENSE).

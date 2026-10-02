@@ -1,55 +1,77 @@
+**English** · [简体中文](README.zh-CN.md)
+
 # browser-control-kit
 
-驱动**你自己正在用的那个浏览器**——正常双击打开的 Chrome，带全部登录态和扩展。
+Drives **the browser the operator is already using** — the Chrome that was opened by double-clicking it, with the real profile, the real logins, the real extensions.
 
-- **不加启动参数**、**不挂 user-data-dir**、**不起新实例**、**不用点"允许"**
-- 后台标签也能操作（不抢焦点、不打断你）
-- 只放工具代码；被测业务的用例不进这个仓库
+- No launch flags, no `--user-data-dir`, no second instance, and no "Allow" click on the default transport
+- Works on a **background tab**: it does not steal focus or interrupt what you are doing
+- Tooling only; the suites for whatever app you are testing do not live in this repo
 
-> 起一个空白 dev profile 的方案本仓库**明确不做**：没有真实会话、没有扩展、没有真实状态，证明不了任何东西，而且这种方案满地都是。
+> Spinning up a blank dev profile is an explicit **non-goal**. No session, no extensions, no real state — it proves nothing, and there are a hundred projects that already do it.
 
-## 结构
+## Layout
 
 ```
-packages/browser-control/   怎么控制浏览器（与应用无关）
-  src/extension-transport.mjs  唯一接触 playwright 内部 API 的文件（升级只坏这里）
-  src/attach.mjs               两种通道 + 能力探测 + trace
-  src/page.mjs                 能力自适应输入、导航串行化、puppeteer 风味 API
-  src/dom-input.mjs            DOM 输入原语：actionability + hit test + shadow/frame 到达
-  src/transfer.mjs             上传 / 拖放 / 拖拽（不需要 CDP）
-  src/fixtures.mjs             零依赖 xlsx / csv / png 生成
-  src/pool.mjs                 并行：多标签任务池（含扩展通道的安全约束）
-  src/cdp-shim.mjs             仅 cdp 通道需要的 /json/* 发现端点补丁
-  test/                        24 个 node:test 用例（跑在真实浏览器上）
-  cleanup.mjs                  收尾清理（只动本工具留下的标签，绝不碰你的页面）
-packages/antd-kit/          怎么操作 Ant Design v6（与业务无关）
-scripts/check.mjs           本地 CI（离线检查 + 真实浏览器测试）
-scripts/crash-repro.mjs     崩溃二分定位（会故意搞崩浏览器，需 BC_CRASH_REPRO=1）
-.githooks/                  pre-commit = 离线检查，pre-push = + 浏览器测试
-examples/                   最小示例
+packages/browser-control/   how to control the browser (app-agnostic)
+  src/extension-transport.mjs  the only file touching playwright internals (upgrades break here, nowhere else)
+  src/attach.mjs               transport choice + capability probe + trace
+  src/page.mjs                 capability-adaptive input, serialised navigation, puppeteer-flavoured API
+  src/dom-input.mjs            DOM input primitives: actionability + hit test + shadow/frame reach
+  src/transfer.mjs             upload / drop / drag (no CDP required)
+  src/fixtures.mjs             zero-dependency xlsx / csv / png generation
+  src/pool.mjs                 TabPool: parallel work across tabs, with the extension-transport limits
+  src/tab-guard.mjs            TabGuard: tab budget, LRU eviction, idle reaping
+  src/cdp-shim.mjs             /json/* rebuild + single-socket CDP proxy (cdp transport only)
+  src/ws-server.mjs            hand-rolled RFC 6455 server used by the shim
+  test/                        node:test suites — browserless + real-browser
+  cleanup.mjs                  closes only the tabs this tool left behind
+packages/mcp-server/        MCP stdio server (bin: browser-control-mcp) — agents talk to this
+packages/antd-kit/          how to drive Ant Design v6 (business-agnostic)
+scripts/check.mjs           local CI (offline checks + real-browser suites)
+scripts/crash-repro.mjs     crash bisection (deliberately kills Chrome; needs BC_CRASH_REPRO=1)
+.githooks/                  pre-commit = offline checks, pre-push = + browser suites
+examples/                   minimal runnable sample
 ```
 
-依赖方向单向：`你的用例 → antd-kit → browser-control`。
+Dependency direction is one-way: `your suites → antd-kit → browser-control → playwright-core`. `playwright-core` (exact pin) is the only third-party dependency in the repo; everything else is hand-rolled on purpose.
 
-## 快速开始
+## The two transports
+
+| Transport | Prerequisites | Approval clicks | Capabilities |
+| --- | --- | --- | --- |
+| `extension` (default) | [Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm) + its token | **none** — the token replaces the dialog | No browser-level CDP (`Target.attachToBrowserTarget: Not allowed`), no `Browser.grantPermissions`, no focus emulation → input falls back to DOM primitives. Tab lifecycle is restricted (see the guards table) |
+| `cdp` | Chrome started with `--remote-debugging-port` + `npm run shim` | **one**, per Chrome/shim restart | Full CDP: focus emulation, pre-granted permissions, download directory, URL interception |
+
+Honest trade-off: `extension` costs you raw CDP and makes tab creation/navigation deliberately conservative, but it is unattended — Chrome just has to be running. `cdp` gives you everything CDP can do, at the price of a background process and one approval dialog whenever Chrome or the shim restarts.
+
+Select with `BC_MODE=cdp` or `attach({ mode: "cdp" })`; the shim address is `BC_CDP_URL`.
+
+## Quick start
 
 ```bash
-npm i && node scripts/install-hooks.mjs      # Node ≥ 22；不要用 Bun（其 WS 客户端撑不起 Playwright 的 CDP 传输）
+npm i && node scripts/install-hooks.mjs   # Node >= 22. Not Bun: its WebSocket client
+                                          # cannot carry Playwright's CDP transport
+                                          # (connectOverCDP hangs at <ws connecting>)
 
-# 一次性：装 Playwright Extension，把 status 页的 token 存起来
+# one-time: install the Playwright Extension, store the token from its status page
 mkdir -p ~/.config/browser-control && pbpaste > ~/.config/browser-control/token && chmod 600 $_
 
-npm run test:unit        # DOM 输入 16 例
-npm run test:pool        # 并行 8 例
-npm run selftest         # 端到端自检
-npm run cleanup          # 收尾：关掉本工具留下的标签、清掉探测用的站点权限
-                         # （--dry-run 只报告不动手）
+npm run test:offline   # tab governance + websocket codec, 21 cases, no browser needed
+npm run test:unit      # DOM input, 16 cases   (needs Chrome + token)
+npm run test:pool      # parallel pool, 8 cases (needs Chrome + token)
+npm test               # all four suites, --test-concurrency=1
+npm run selftest       # end-to-end smoke; writes ./selftest.png
+npm run cleanup        # closes the tabs this tool left behind (--dry-run reports only)
+npm run shim           # /json/* rebuild + CDP proxy; only for BC_MODE=cdp
 ```
+
+The token is read-only (`BC_TOKEN_FILE` overrides the path); this repo never writes or echoes it.
 
 ```js
 import { attach, controlPage, TabPool } from "browser-control";
 
-const { browser, context, capabilities } = await attach();       // 默认扩展通道
+const { browser, context, capabilities } = await attach();   // extension transport by default
 const page = controlPage(context.pages()[0], capabilities);
 await page.goto("https://example.com/", { waitUntil: "domcontentloaded" });
 await page.fill("#q", "hello");
@@ -57,37 +79,125 @@ await page.click("button[type=submit]");
 
 const pool = await new TabPool(context, { size: 2, capabilities }).start();
 const results = await pool.map(items, async (item, tab) => tab.evaluate(/* … */));
+
+await browser.close();   // disconnects; it does not close your browser
 ```
 
-## 两种通道
+## About that "Allow remote debugging?" dialog
 
-| 通道 | 前置条件 | 要点"允许"吗 | 能力 |
-| --- | --- | --- | --- |
-| `extension`（默认） | Playwright Extension + token | **不用** | 无浏览器级 CDP（无焦点模拟/权限预授权/下载目录）→ 由 DOM 级输入兜住；标签生命周期受限（见下） |
-| `cdp` | Chrome 带 `--remote-debugging-port` + `npm run shim` | 每个新连接一次 | 完整 CDP |
+Chrome prompts the operator for **every new external CDP connection** to the default profile and never remembers the answer (until approved, `/json/*` returns 404 and the WebSocket handshake just hangs). So the goal is not to dodge the dialog — it is to make the connection happen **once**.
 
-## 血的教训（都写进了代码里的守卫）
+| Approach | Clicks | Cost |
+| --- | --- | --- |
+| `extension` transport (default) | **0** — the token stands in for the click | No browser-level CDP (see above) |
+| `cdp` + resident shim (`npm run shim:service`) | one per **Chrome restart** | A background process |
+| `cdp` + ad-hoc shim (`npm run shim`) | one per shim start | — |
+| `connectOverCDP("http://localhost:9222")` directly | one per `attach()` | This is the thing that annoys you |
+| A clean `--user-data-dir` profile | 0 | No logins, no real state — explicit non-goal here |
+| `RemoteDebuggingAllowed` policy | does not help | It is an on/off switch, there is no "always allow" |
 
-2026-09-05，在 Chrome 152 + Playwright Extension 上把浏览器搞崩/搞退出 **11 次**后定下的约束，`scripts/check.mjs` 会校验这些守卫还在：
-
-| 现象 | 守卫 |
-| --- | --- |
-| `page.addInitScript()` 经 `chrome.debugger` 会崩掉 browser 进程（2/2 复现，`EXC_BREAKPOINT` on `CrBrowserMain`） | 扩展通道默认拒绝，需 `BC_ALLOW_INIT_SCRIPT=1` |
-| 多标签**并发导航**崩浏览器 | `controlPage` 进程级导航串行化（`BC_PARALLEL_NAV=1` 可解） |
-| 反复创建/关闭标签、多个池累积附着标签 → 扩展断连，浏览器可能直接退出 | 每连接**只允许一个池**；扩展通道**不关闭**标签（留给下次复用）；`BC_MAX_TABS_EXTENSION=3` |
-| 池的标签是浏览器里唯一的标签时，桥一断 Chrome 就退出 | 启动池前要求存在至少一个普通标签 |
-| 每次 `attach()` 都会在你浏览器里留下一个**标签组**（扩展行为） | 一个进程只 attach 一次；`npm run cleanup` 收尾 |
-| **扩展一次只接受一个客户端**：并发跑两个测试文件时后者连不上、前者被打断 | 测试串行执行（`--test-concurrency=1`） |
-| `setViewport` 会下发 `Emulation.setDeviceMetricsOverride`，把页面锁小、右侧留白 | 默认不生效，需 `BC_VIEWPORT=1` |
-
-## 本地 CI（git hook，不用 GitHub Actions）
+The shim is a real **proxy**, not a convenience: it holds the single approved browser socket and multiplexes every automation client over it. `/json/version` and `/json/list` hand out WebSocket URLs that point at the shim itself (`ws://127.0.0.1:9333/...`), so clients never connect to Chrome directly. `/devtools/page/<targetId>` gets a flat `Target.attachToTarget` session on that same socket, with `sessionId` injected inbound and stripped outbound — transparent to the client.
 
 ```bash
-node scripts/install-hooks.mjs
+npm run shim:service                              # launchd agent, KeepAlive + login autostart
+node scripts/install-shim-service.mjs --uninstall
+tail -f ~/.cache/browser-control/shim.log
 ```
-- `pre-commit` → `scripts/check.mjs --offline`：全量语法检查、遗留调试语句、**崩溃守卫是否还在**、license 元数据
-- `pre-push` → 同上 + 真实浏览器测试；Chrome 没开或没 token 时**跳过并提示**，不阻塞推送
 
-## 许可
+Measured (throwaway-profile Chrome, three consecutive `attach()` calls): Chrome sees exactly **one** CDP connection on a stable port, and both Playwright connections land on the shim.
 
-MIT
+```
+chrome side:  Google 89970 127.0.0.1:9224->127.0.0.1:53988
+              node   90275 127.0.0.1:53988->127.0.0.1:9224     ← the shim, and nothing else
+shim side:    node   90849 127.0.0.1:54006->127.0.0.1:9333     ← Playwright
+              node   90849 127.0.0.1:54007->127.0.0.1:9333
+```
+
+Restarting the shim means a new connection, hence another click — which is exactly why it is meant to be resident. A Chrome restart is the same story: the shim reconnects by itself and says in its log that this one needs a click.
+
+## The tab budget (`TabGuard`)
+
+The classic agent failure mode: open a tab per step, never close one, and half an hour later Chrome is carrying dozens of renderer processes — in **the browser you are personally using**. `attach()` therefore returns a guarded context:
+
+```js
+const { browser, context, tabs } = await attach();   // tabs = TabGuard
+
+for (let i = 0; i < 10; i += 1) await context.newPage();  // ten requested
+console.log(tabs.report());                               // owned: 3 — the rest were LRU-closed
+
+await browser.close();   // hands back the tabs we opened, then disconnects
+```
+
+| Rule | Behaviour | Switch |
+| --- | --- | --- |
+| Budget | This process holds at most N tabs; over budget closes the **least recently used** one | `BC_TAB_BUDGET` (default: 3 on extension, 4 on cdp) |
+| Ownership | Tabs that existed before `attach()` belong to the operator and are **never closed or counted**; `window.open` / `target=_blank` popups are adopted as ours | — |
+| Idle reaping | Our own tabs are closed once idle past the threshold (memory actually comes back) | `BC_TAB_IDLE_MS` (default 300000, `0` disables) |
+| Holds | `TabPool` tabs call `hold()` and are immune to eviction and reaping; when the budget is full of held tabs, asking for another **fails loudly** instead of growing the browser | `BC_TAB_EVICT=0` to error instead of evicting |
+| Off switch | `attach({ guard: false })` or `BC_TAB_GUARD=0` | — |
+
+Measured (real Chrome, cdp transport): an agent opening 10 tabs ends with 2 (budget 2, 8 evicted); `window.open` popups are adopted and fall back inside the budget; after 1 s idle all of ours are reaped; the operator's pre-existing tabs are never touched.
+
+Blind spot: tabs the extension cannot attach to (`chrome://`, the Web Store, other extensions' pages, `file://` without file access) never appear in `context.pages()`, so the guard can neither see nor close them.
+
+## MCP server
+
+Agents keep wrapping this repo in ad-hoc MCP servers that drop connections and open tabs forever, so the server ships here instead. No SDK, no dependencies, ~350 lines of JSON-RPC over stdio.
+
+```json
+{
+  "mcpServers": {
+    "browser-control": {
+      "command": "node",
+      "args": ["/absolute/path/to/browser-control-kit/packages/mcp-server/bin/browser-control-mcp.mjs"],
+      "env": { "BC_MODE": "cdp" }
+    }
+  }
+}
+```
+
+| Property | How it is enforced |
+| --- | --- |
+| **No tab sprawl** | There is no tool that opens a tab. `browser_navigate` reuses the active tab; the whole tab API is list / select / close, and `TabGuard` runs with budget 2 |
+| **Stable connection** | One `attach()` per process, created lazily and re-created if the browser goes away; concurrent first calls share one in-flight attach; stdin EOF is the only shutdown path |
+| **Clean stdout** | JSON-RPC only, logs go to stderr, writes respect backpressure — the usual cause of "the MCP server keeps disconnecting" |
+| **Light** | `browser-control` and playwright are imported lazily on the first browser call: idle RSS measured at 40 MB, ~3 MB over a bare Node process |
+| **Failures are results** | A failing tool returns `isError: true` with text, never a JSON-RPC error and never a crash |
+
+Twelve tools, one terse line each: `browser_status`, `browser_navigate`, `browser_click`, `browser_type`, `browser_fill`, `browser_text`, `browser_evaluate`, `browser_screenshot`, `browser_tabs`, `browser_tab_select`, `browser_tab_close`, `browser_wait_for`. See [`packages/mcp-server/README.md`](packages/mcp-server/README.md).
+
+```bash
+npm run mcp            # run it by hand
+node --test packages/mcp-server/test/protocol.test.mjs   # 12 protocol cases, no browser needed
+```
+
+## Guards derived from crashes
+
+On 2026-09-05, Chrome 152 + the Playwright Extension were crashed or made to quit **11 times**. Every constraint below is load-bearing, and `scripts/check.mjs` fails the commit if the guard disappears from the source.
+
+| Symptom | Guard |
+| --- | --- |
+| `page.addInitScript()` over `chrome.debugger` kills the browser process (2/2 reproduced, `EXC_BREAKPOINT` on `CrBrowserMain`) | Refused on the extension transport; `BC_ALLOW_INIT_SCRIPT=1` to override. Pool tabs are marked after navigation with `evaluate` instead |
+| **Concurrent navigation** across tabs crashes the browser | `controlPage` serialises navigation process-wide (`BC_PARALLEL_NAV=1` to opt out) |
+| Churning tabs, or several pools accumulating attached tabs → the extension disconnects and Chrome may quit | **One pool per connection**; size ≤ `BC_MAX_TABS_EXTENSION` (3); create/close is serial with a 400 ms settle |
+| Closing the last ordinary tab takes the bridge down and Chrome exits | A pool refuses to start unless an ordinary (non-`chrome-extension://`) tab exists; that tab is never closed |
+| Every `attach()` leaves a **tab group** behind (extension behaviour) | One `attach()` per process; `npm run cleanup` to tidy up |
+| **The extension accepts one client at a time**: two test files in parallel means one cannot connect and the other is interrupted | Suites run serially (`--test-concurrency=1`) |
+| `setViewport` issues `Emulation.setDeviceMetricsOverride` and shrinks the operator's page | No-op unless `BC_VIEWPORT=1` |
+
+## Local CI (git hooks, now plus GitHub Actions)
+
+```bash
+node scripts/install-hooks.mjs   # git config core.hooksPath .githooks
+```
+
+- `pre-commit` → `node scripts/check.mjs --offline`: `node --check` on every `.mjs`, no stray `console.debug` / `debugger;`, **the crash guards are still in the source**, licence metadata, and the 21 browserless cases
+- `pre-push` → the same plus the real-browser suites; when Chrome is closed or the token is missing they are **skipped with a notice**, never blocking the push
+
+`.github/workflows/ci.yml` runs the offline tier on Node 22. The browser tier cannot run in CI — it needs the operator's Chrome and an extension token.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) before sending a patch, and [AGENTS.md](AGENTS.md) for the full architecture notes.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).

@@ -1,0 +1,26 @@
+# Local CI lives in scripts/check.mjs; this runs its offline tier on every push and PR.
+#
+# The browser tier CANNOT run here: it drives the operator's own Chrome through
+# the Playwright Extension and needs that extension's token. GitHub's runners
+# have neither, so `node scripts/check.mjs --offline` is the whole job — syntax
+# check of every .mjs, the stray-debugging and crash-guard string audits, the
+# licence metadata check, and every browserless suite (tab guard, websocket
+# codec, shim autostart, shim policy, MCP protocol).
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # package-lock.json is committed, so `npm ci` is the normal path; the
+      # fallback keeps the job green on branches cut before the lockfile landed.
+      - run: npm ci || npm i
+      - run: node scripts/check.mjs --offline

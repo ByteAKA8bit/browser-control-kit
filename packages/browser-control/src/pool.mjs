@@ -65,6 +65,7 @@ export class TabPool {
     this.prepare = prepare;
     this.reuse = reuse;
     this.pages = [];
+    this.rawPages = [];
     this.createdPages = [];
     this._idle = [];
     this._waiters = [];
@@ -104,6 +105,10 @@ export class TabPool {
       if (this.mode !== "extension") {
         await raw.addInitScript({ content: `sessionStorage.setItem(${JSON.stringify(MARKER)}, "1")` }).catch(() => {});
       }
+      this.rawPages.push(raw);
+      // A pool tab is in use for the pool's lifetime: pin it so the tab guard's
+      // LRU eviction and idle reaper never close it mid-run (src/tab-guard.mjs).
+      this.context.tabGuard?.hold(raw);
       const page = controlPage(raw, this.capabilities);
       if (this.prepare) await this.prepare(page, i);
       this.pages.push(page);
@@ -179,34 +184,34 @@ export class TabPool {
     return results;
   }
 
-  /** Close only the tabs this pool created; reused tabs stay as they were. */
   /**
-   * Extension transport: DO NOT close tabs. Tab lifecycle over chrome.debugger
-   * destabilised Chrome 152 in every combination we tried (crash reports at
-   * 00:18:33/40/48/57, 00:22:33, 00:25:46, 00:26:10, 00:26:51, 00:27:54 — plus
-   * clean browser exits with no report). Pool tabs are therefore left open and
-   * REUSED by the next run (that is what the sessionStorage marker is for).
-   * Tab churn is only exercised on the cdp transport, where it is stable.
+   * Close what we opened. Tabs are a resource: leaving them behind fills up the
+   * operator's browser and the next run inherits junk, so closing is the
+   * default on every transport.
+   *
+   * Two rules, both learned by killing Chrome 152:
+   *   * close SERIALLY with a settle delay — simultaneous detaches raced
+   *   * never close the last ordinary tab — with no tabs left the browser exits
+   *     and takes the extension bridge with it
    */
-  async close({ closeReused = false, force = false } = {}) {
-    if (this.mode === "extension" && !force) {
-      this.pages = [];
-      this._idle = [];
-      return { closed: 0, kept: this.createdPages.length, reason: "extension transport: tabs are reused, not closed" };
-    }
-    const candidates = closeReused ? [...this.pages] : [...this.createdPages];
-    // Never leave the browser with zero controlled tabs: the extension closes
-    // the whole connection ("All controlled tabs detached") and every later call
-    // fails with "Target page, context or browser has been closed".
-    const keep = Math.max(0, 1 - (this.context.pages().length - candidates.length));
-    const targets = candidates.slice(0, Math.max(0, candidates.length - keep));
-    for (const p of targets) {
-      await p.close().catch(() => {});
+  async close({ closeReused = false } = {}) {
+    const candidates = closeReused ? [...new Set([...this.createdPages, ...this.rawPages])] : [...this.createdPages];
+    let closed = 0;
+    for (const page of candidates) {
+      if (page.isClosed?.()) continue;
+      const ordinary = this.context.pages().filter((p) => !p.isClosed?.() && !p.url().startsWith("chrome-extension://"));
+      if (ordinary.length <= 1) break;
+      await page.close().catch(() => {});
       await sleep(TAB_SETTLE_MS);
+      closed += 1;
     }
+    for (const page of this.rawPages) this.context.tabGuard?.unhold(page);
     this.pages = [];
+    this.rawPages = [];
+    this.createdPages = [];
     this._idle = [];
-    return { closed: targets.length };
+    if (this.mode === "extension") poolsStartedOnExtension = Math.max(0, poolsStartedOnExtension - 1);
+    return { closed, kept: candidates.length - closed };
   }
 }
 

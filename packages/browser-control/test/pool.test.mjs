@@ -40,7 +40,6 @@ before(async () => {
 });
 
 after(async () => {
-  // Extension transport: this is a no-op by design (tabs are reused, not closed).
   await pool?.close();
   await browser?.close().catch(() => {});
 });
@@ -112,10 +111,12 @@ describe("TabPool parallelism", () => {
     assert.match(results[1].error, /task blew up/);
   });
 
-  it("does not close tabs on the extension transport", async () => {
-    if (!extension) return;
+  it("closes the tabs it opened and leaves the browser as it was", async () => {
+    const ordinaryBefore = context.pages().filter((p) => !p.url().startsWith("chrome-extension://")).length;
     const res = await pool.close();
-    assert.equal(res.closed, 0);
-    assert.match(res.reason, /reused, not closed/);
+    assert.ok(res.closed >= 1, `expected the pool to close its tabs, got ${JSON.stringify(res)}`);
+    const ordinaryAfter = context.pages().filter((p) => !p.isClosed() && !p.url().startsWith("chrome-extension://")).length;
+    assert.equal(ordinaryAfter, ordinaryBefore - res.closed, "tab count must drop by exactly what we closed");
+    assert.ok(ordinaryAfter >= 1, "never close the last ordinary tab");
   });
 });

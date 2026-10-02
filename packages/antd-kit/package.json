@@ -10,5 +10,24 @@
   },
   "engines": {
     "node": ">=22"
-  }
+  },
+  "license": "MIT",
+  "author": "Bryce Chou <ByteAKA8bit@outlook.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ByteAKA8bit/browser-control-kit.git",
+    "directory": "packages/antd-kit"
+  },
+  "homepage": "https://github.com/ByteAKA8bit/browser-control-kit#readme",
+  "bugs": {
+    "url": "https://github.com/ByteAKA8bit/browser-control-kit/issues"
+  },
+  "keywords": [
+    "antd",
+    "ant-design",
+    "browser-automation",
+    "playwright",
+    "e2e",
+    "testing"
+  ]
 }
