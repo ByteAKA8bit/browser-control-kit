@@ -17,17 +17,17 @@ Everything is ESM `.mjs` with no build step. Do not add `.js`, `.ts`, a bundler,
 ## The two test tiers
 
 ```bash
-npm run test:offline   # tab-guard 13 + ws-server 8 = 21 cases, no browser needed
-npm run test:unit      # dom-input, 16 cases   (needs Chrome + an extension token)
-npm run test:pool      # pool, 8 cases         (needs Chrome + an extension token)
-npm test               # all four suites, --test-concurrency=1
+npm run test:offline   # 47 cases, no browser needed (tab guard, ws codec, shim autostart + policy, MCP protocol)
+npm run test:unit      # dom-input, 16 cases   (needs Chrome + the Playwright Extension + a token)
+npm run test:pool      # pool, 8 cases         (needs Chrome + the Playwright Extension + a token)
+npm test               # every suite, --test-concurrency=1
 npm run check          # the whole local CI: offline tier + browser suites
 node scripts/check.mjs --offline   # exactly what pre-commit runs
 ```
 
 `--test-concurrency=1` is mandatory: the Playwright Extension accepts exactly one client, so two suite processes mean one cannot connect and the other is interrupted. One `attach()` per process.
 
-The browser tier is gated on a running Chrome plus a token; when either is missing it is **skipped with a notice and exit 0**, so it never blocks a commit — and it never runs in GitHub Actions. Run `npm run cleanup` after a browser run.
+The browser tier needs a machine that is actually set up: Chrome running, the Playwright Extension installed in the profile, a token. When a prerequisite is missing the suites report `# SKIP <reason>` (see `test/attached.mjs`) and `scripts/check.mjs` skips its browser step with a notice — exit 0 either way, so a missing local prerequisite never blocks a commit, and the tier never runs in GitHub Actions. Run `npm run cleanup` after a browser run.
 
 Framework is built-in `node:test` + `node:assert/strict`. No mocks, snapshots, coverage tooling or reporters.
 

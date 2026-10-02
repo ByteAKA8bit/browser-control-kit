@@ -13,25 +13,23 @@
 //   PLAYWRIGHT_MCP_EXTENSION_TOKEN=… node --test test/pool.test.mjs
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { attach } from "../src/attach.mjs";
+import { attachOrSkip } from "./attached.mjs";
 import { MAX_TABS_EXTENSION, TabPool } from "../src/pool.mjs";
 
-let browser;
-let context;
-let capabilities;
+// This suite exercises tab creation on purpose, so it opts through the gate
+// itself (see src/pool.mjs SAFETY GATE) before attaching. Everything it creates
+// is left open for reuse; `npm run cleanup` removes them. A machine without the
+// extension installed skips the suite with that reason rather than failing it.
+process.env.BC_ALLOW_TAB_CREATE = "1";
+const { attached, skip } = await attachOrSkip();
+const browser = attached?.browser;
+const context = attached?.context;
+const capabilities = attached?.capabilities ?? {};
+const extension = (capabilities.mode ?? "extension") === "extension";
 let pool;
-let extension;
 
 before(async () => {
-  // This suite exercises tab creation on purpose, so it opts through the gate
-  // itself (see src/pool.mjs SAFETY GATE). Everything it creates is left open
-  // for reuse; `npm run cleanup` removes them.
-  process.env.BC_ALLOW_TAB_CREATE = "1";
-  const attached = await attach();
-  browser = attached.browser;
-  context = attached.context;
-  capabilities = attached.capabilities;
-  extension = (capabilities.mode ?? "extension") === "extension";
+  if (!attached) return;
   // Anchor tab: without an ordinary tab of its own the browser exits when the
   // bridge closes. Also gives the pool something to reuse.
   const anchor = context.pages().find((p) => !p.url().startsWith("chrome-extension://")) ?? (await context.newPage());
@@ -44,7 +42,7 @@ after(async () => {
   await browser?.close().catch(() => {});
 });
 
-describe("TabPool guard rails", () => {
+describe("TabPool guard rails", { skip }, () => {
   it("refuses impossible sizes", () => {
     assert.throws(() => new TabPool(context, { size: 0 }), /size must be >= 1/);
     assert.throws(() => new TabPool(context, { size: 99 }), /exceeds BC_MAX_TABS/);
@@ -65,7 +63,7 @@ describe("TabPool guard rails", () => {
   });
 });
 
-describe("TabPool parallelism", () => {
+describe("TabPool parallelism", { skip }, () => {
   it("runs page work on separate tabs concurrently", async () => {
     const started = Date.now();
     // 4 tasks × 600ms over 2 tabs: serial ≈ 2.4s, parallel ≈ 1.2s.

@@ -7,7 +7,7 @@
 //   PLAYWRIGHT_MCP_EXTENSION_TOKEN=… node --test test/
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { attach } from "../src/attach.mjs";
+import { attachOrSkip } from "./attached.mjs";
 import { controlPage } from "../src/page.mjs";
 import { makeCsv, makeXlsx } from "../src/fixtures.mjs";
 
@@ -39,12 +39,15 @@ const FIXTURE = `
   </script>
 `;
 
-let browser;
+// Attached once, up front: a machine without the extension installed has nothing
+// to say about these primitives, so every describe below is skipped with that
+// reason instead of reporting 16 cancelled tests.
+const { attached, skip } = await attachOrSkip();
+const browser = attached?.browser;
 let page;
 
 before(async () => {
-  const attached = await attach();
-  browser = attached.browser;
+  if (!attached) return;
   const raw = attached.context.pages()[0] ?? (await attached.context.newPage());
   page = controlPage(raw, { ...attached.capabilities, focusEmulation: false }); // force the DOM path
   await raw.goto("about:blank");
@@ -57,7 +60,7 @@ after(async () => {
 
 const log = () => page.evaluate(() => document.getElementById("log").textContent ?? "");
 
-describe("DOM click actionability", () => {
+describe("DOM click actionability", { skip }, () => {
   it("clicks a plain button", async () => {
     await page.click("#plain");
     assert.match(await log(), /plain;/);
@@ -84,7 +87,7 @@ describe("DOM click actionability", () => {
   });
 });
 
-describe("reach", () => {
+describe("reach", { skip }, () => {
   it("pierces an open shadow root", async () => {
     await page.click("#shadowbtn");
     assert.match(await log(), /shadow;/);
@@ -102,7 +105,7 @@ describe("reach", () => {
   });
 });
 
-describe("DOM text input", () => {
+describe("DOM text input", { skip }, () => {
   it("fills and replaces a value with input/change events", async () => {
     const seen = [];
     await page.evaluate(() => {
@@ -149,7 +152,7 @@ const UPLOAD_FIXTURE = `
   </script>
 `;
 
-describe("upload & drag", () => {
+describe("upload & drag", { skip }, () => {
   before(async () => {
     await page.setContent(`<body>${UPLOAD_FIXTURE}</body>`);
   });
