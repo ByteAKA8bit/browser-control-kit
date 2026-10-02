@@ -211,7 +211,7 @@ node scripts/install-hooks.mjs   # git config core.hooksPath .githooks
 - `pre-commit` → `node scripts/check.mjs --offline`: `node --check` on every `.mjs`, no stray `console.debug` / `debugger;`, **the crash guards are still in the source**, licence metadata, and the 140 browserless cases
 - `pre-push` → the same plus the real-browser suites; when Chrome is closed or the token is missing they are **skipped with a notice**, never blocking the push
 
-`.github/workflows/ci.yml` runs the offline tier on Node 22. The browser tier cannot run in CI — it needs the operator's Chrome and an extension token.
+`.github/workflows/ci.yml` runs the offline tier on Node 22 across **macOS and Windows** — the two platforms this kit supports, because it drives the desktop Chrome the operator is logged into. Linux is not a target; it runs there as a non-blocking reference signal only. The browser tier cannot run in CI at all — it needs the operator's Chrome and an extension token.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before sending a patch, and [AGENTS.md](AGENTS.md) for the full architecture notes.
 

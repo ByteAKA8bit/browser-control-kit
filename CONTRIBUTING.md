@@ -29,6 +29,8 @@ node scripts/check.mjs --offline   # exactly what pre-commit runs
 
 The browser tier needs a machine that is actually set up: Chrome running, the Playwright Extension installed in the profile, a token. When a prerequisite is missing the suites report `# SKIP <reason>` (see `test/attached.mjs`) and `scripts/check.mjs` skips its browser step with a notice — exit 0 either way, so a missing local prerequisite never blocks a commit, and the tier never runs in GitHub Actions. Run `npm run cleanup` after a browser run.
 
+GitHub Actions runs the offline tier on **macOS and Windows** for every push and PR. Those are the supported platforms: this kit drives the desktop Chrome the operator is already logged into, which is a macOS/Windows situation. Ubuntu runs the same tier with `continue-on-error: true` — Linux is not a target, so a red Linux is information, never a verdict. Branch protection requires the summary job named `check`, and that job goes red only when a macOS or Windows leg does.
+
 Framework is built-in `node:test` + `node:assert/strict`. No mocks, snapshots, coverage tooling or reporters.
 
 ## Adding a test file

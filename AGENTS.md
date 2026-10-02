@@ -71,7 +71,7 @@ node --test --test-name-pattern="pierces an open shadow root" \
 BC_CRASH_REPRO=1 node scripts/crash-repro.mjs evaluateOnExtensionPage   # deliberately kills Chrome
 ```
 
-There is **no ESLint, Prettier, tsc, or bundler**. `scripts/check.mjs` is the entire CI; `.github/workflows/ci.yml` runs `node scripts/check.mjs --offline` on every push and PR (the browser tier cannot run on a hosted runner — no operator Chrome, no extension token):
+There is **no ESLint, Prettier, tsc, or bundler**. `scripts/check.mjs` is the entire CI; `.github/workflows/ci.yml` runs `node scripts/check.mjs --offline` on every push and PR on **macOS and Windows** — the supported platforms, because this kit drives the desktop Chrome the operator is logged into. Ubuntu runs the same tier as a non-blocking reference signal (`continue-on-error`); Linux is not a target. Branch protection requires the summary job named `check`, which gates on the macOS and Windows legs only. The browser tier cannot run on a hosted runner — no operator Chrome, no extension token:
 
 1. `node --check` on every `*.mjs` (skips `node_modules` and dot-dirs — a `.js`/`.ts` file would silently escape it).
 2. Rejects lines starting with `console.debug` or `debugger;`.
@@ -79,7 +79,7 @@ There is **no ESLint, Prettier, tsc, or bundler**. `scripts/check.mjs` is the en
 4. `LICENSE` exists and `packages/browser-control/package.json` `license === "MIT"`.
 5. The browserless suites `tab-guard.test.mjs` (42), `ws-server.test.mjs` (17), `shim-autostart.test.mjs` (11), `shim-policy.test.mjs` (6), `shim-recovery.test.mjs` (19), `shim-service.test.mjs` (8), `shim-session.test.mjs` (12) and `packages/mcp-server/test/protocol.test.mjs` (25), each its own `step()`.
 
-Browser tier is gated on `pgrep -f 'MacOS/Google Chrome'` plus a token; missing either → *skipped with a notice, exit 0*. Never blocks a push.
+Browser tier is gated on a running-Chrome probe (`pgrep` on posix, `tasklist` on win32) plus a token; missing either → *skipped with a notice, exit 0*. Never blocks a push.
 
 ## Code Conventions & Common Patterns
 
@@ -146,7 +146,7 @@ Subpath exports: `browser-control/fixtures`, `/pool`, `/tab-guard`, `/shim`. Add
 - **Node ≥ 22** (global `WebSocket`). **Bun is unsupported** — its WS client cannot carry Playwright's CDP transport (`connectOverCDP` hangs at `<ws connecting>`).
 - **npm** workspaces; `package-lock.json` is committed (CI runs `npm ci`) — lockfile changes belong in the commit. The root manifest is `private: true` but still carries `license`/`author`/`repository`/`homepage`/`bugs`.
 - All source is `.mjs`. Do not introduce `.js`, `.ts`, or a build step.
-- Cross-platform where it counts: the shim resolves Chrome's user-data-dir per platform (`CHROME_PROFILE_DIRS` in `src/cdp-shim.mjs`, override with `CHROME_PORT_FILE`), and `scripts/check.mjs` probes for a running Chrome on win32/posix. `scripts/install-shim-service.mjs` is launchd-only and says so; `scripts/crash-repro.mjs` is macOS-only by design.
+- **Supported platforms are macOS and Windows** — the operator's own logged-in Chrome lives on a desktop, and CI runs the offline tier on both. Linux is not a target (it runs non-blocking in CI for information). Cross-platform where it counts: the shim resolves Chrome's user-data-dir per platform (`CHROME_PROFILE_DIRS` in `src/cdp-shim.mjs`, override with `CHROME_PORT_FILE`), and `scripts/check.mjs` probes for a running Chrome on win32/posix. `scripts/install-shim-service.mjs` is launchd-only and says so; `scripts/crash-repro.mjs` is macOS-only by design.
 - Key env flags: `BC_MODE`, `BC_CDP_URL`, `BC_TRACE`, `BC_MAX_TABS`, `BC_MAX_TABS_EXTENSION`, `BC_TAB_SETTLE_MS`, `BC_ALLOW_TAB_CREATE`, `BC_REUSE_ANY`, `BC_PARALLEL_NAV`, `BC_VIEWPORT`, `BC_ALLOW_INIT_SCRIPT`, `BC_TAB_GUARD`, `BC_TAB_BUDGET`, `BC_TAB_RECYCLE_MS`, `BC_TAB_BLANK_MS`, `BC_TAB_IDLE_MS`, `BC_TAB_EVICT`, `BC_KEEP_BRIDGE_TAB`, `BC_TOKEN_FILE`, `PLAYWRIGHT_MCP_EXTENSION_TOKEN`, `SHIM_PORT`, `CHROME_PORT_FILE`, `BC_SHIM_AUTOSTART`, `BC_SHIM_KEEPALIVE_MS`, `BC_SHIM_PROBE_MS`, `BC_SHIM_START_MS`, `BC_SHIM_PROXY_TIMEOUT_MS`, `BC_CRASH_REPRO`.
 
 ## Testing & QA

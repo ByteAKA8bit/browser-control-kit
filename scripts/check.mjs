@@ -28,8 +28,66 @@ const step = (name, fn) => {
   } catch (err) {
     failures.push(name);
     console.log(`  ✗ ${name} — ${String(err?.message ?? err).split("\n")[0]}`);
+    if (err?.diagnostics) console.log(err.diagnostics.replace(/^(?=.)/gm, "    "));
   }
 };
+
+// A red suite used to reach CI as nothing but "Command failed: node --test …",
+// because the child's TAP body — the assertion diff and the stack — stayed in
+// the pipe. So echo it, capped: a suite that fails wholesale prints thousands
+// of lines, and a drowned log hides the cause just as well as silence did.
+const DIAGNOSTIC_CASES = 3;
+const DIAGNOSTIC_BYTES = 6000;
+const DIAGNOSTIC_ASIDE_BYTES = 1500;
+
+// execSync hands back stdout/stderr as Buffers on a non-zero exit.
+const suiteOutput = (err) => `${err?.stdout ?? ""}${err?.stderr ?? ""}`;
+const clamp = (text, limit, notes, what) => {
+  const bytes = Buffer.byteLength(text);
+  if (bytes <= limit) return text;
+  notes.push(`${bytes - limit} more bytes of ${what} truncated`);
+  return Buffer.from(text).subarray(0, limit).toString();
+};
+
+// The runner indents subtest diagnostics, so a failing case runs from its
+// "not ok" line until the next result or comment line at any depth.
+function failingCases(out) {
+  const cases = [];
+  let current = null;
+  for (const line of out.split("\n")) {
+    if (/^\s*not ok \d/.test(line)) cases.push((current = [line]));
+    else if (!current) continue;
+    else if (/^\s*(ok \d|# )/.test(line)) current = null;
+    else current.push(line);
+  }
+  return cases.map((lines) => lines.join("\n").replace(/\s+$/, ""));
+}
+
+// A suite that dies on import reports only "test failed" in TAP; the real
+// stack arrives as "#" comments (plus whatever reached stderr), so keep those
+// on a smaller budget of their own rather than losing them to the case cap.
+const SUMMARY_COMMENT = /^# (tests|suites|pass|fail|cancelled|skipped|todo|duration_ms|Subtest:) /;
+const childAside = (out, stderr) =>
+  [...out.split("\n").filter((line) => line.startsWith("# ") && !SUMMARY_COMMENT.test(line)), String(stderr)]
+    .join("\n")
+    .trim();
+
+function suiteFailure(stdout, stderr = "") {
+  const out = String(stdout);
+  const cases = failingCases(out);
+  const count = /# fail (\d+)/.exec(out)?.[1];
+  const err = new Error(count && count !== "0" ? `${count} failing tests` : "suite did not run");
+  const notes = [];
+  // With no "not ok" at all the suite never reported, and then the raw output
+  // is the only evidence there is.
+  const shown = cases.length ? cases.slice(0, DIAGNOSTIC_CASES).join("\n") : out.trimEnd();
+  let body = clamp(shown, DIAGNOSTIC_BYTES, notes, "output");
+  if (cases.length > DIAGNOSTIC_CASES) notes.push(`${cases.length - DIAGNOSTIC_CASES} further failing cases not shown`);
+  const aside = cases.length ? childAside(out, stderr) : String(stderr).trim();
+  if (aside) body += `\n--- child output ---\n${clamp(aside, DIAGNOSTIC_ASIDE_BYTES, notes, "child output")}`;
+  err.diagnostics = `${body}${notes.length ? `\n… ${notes.join(", ")}.` : ""}`;
+  return err;
+}
 
 async function sourceFiles() {
   const out = [];
@@ -99,9 +157,14 @@ const OFFLINE_SUITES = [
 ];
 for (const [pkg, suite] of OFFLINE_SUITES) {
   step(`${pkg.replace("packages/", "")}/${suite}`, () => {
-    const out = execSync(`node --test ${suite}`, { cwd: path.join(ROOT, pkg), stdio: "pipe" }).toString();
+    let out;
+    try {
+      out = execSync(`node --test ${suite}`, { cwd: path.join(ROOT, pkg), stdio: "pipe" }).toString();
+    } catch (err) {
+      throw suiteFailure(err?.stdout ?? "", err?.stderr ?? "");
+    }
     const fail = /# fail (\d+)/.exec(out)?.[1] ?? "?";
-    if (fail !== "0") throw new Error(`${fail} failing tests`);
+    if (fail !== "0") throw suiteFailure(out);
     return `${/# pass (\d+)/.exec(out)?.[1] ?? "?"} passed`;
   });
 }
@@ -144,15 +207,15 @@ if (!offlineOnly) {
             stdio: "pipe",
           }).toString();
         } catch (err) {
-          out = `${err.stdout ?? ""}${err.stderr ?? ""}`;
+          out = suiteOutput(err);
           if (out.includes("Playwright Extension not found")) {
             notes.push("skipped browser tests (Playwright Extension not installed in this profile)");
             return "skipped: extension not installed";
           }
-          throw new Error(/# fail (\d+)/.exec(out)?.[1] ? `${/# fail (\d+)/.exec(out)[1]} failing tests` : "suite did not run");
+          throw suiteFailure(err?.stdout ?? "", err?.stderr ?? "");
         }
         const fail = /# fail (\d+)/.exec(out)?.[1] ?? "?";
-        if (fail !== "0") throw new Error(`${fail} failing tests`);
+        if (fail !== "0") throw suiteFailure(out);
         return `${/# pass (\d+)/.exec(out)?.[1] ?? "?"} passed`;
       });
     }

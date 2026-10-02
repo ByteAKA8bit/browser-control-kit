@@ -5,7 +5,11 @@
 # have neither, so `node scripts/check.mjs --offline` is the whole job — syntax
 # check of every .mjs, the stray-debugging and crash-guard string audits, the
 # licence metadata check, and every browserless suite (tab guard, websocket
-# codec, shim autostart, shim policy, MCP protocol).
+# codec, shim autostart/policy/recovery/service/session, MCP protocol).
+#
+# macOS and Windows are the supported platforms — this kit drives the desktop
+# Chrome the operator is logged into — so those two gate. Linux is kept as an
+# unblocking reference signal; `check` below is the required status check.
 name: ci
 
 on:
@@ -13,8 +17,15 @@ on:
   pull_request:
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
+  offline:
+    # The platforms this tool is used on. fail-fast off: when one of them breaks
+    # the other's result is exactly the information needed to tell a real
+    # portability bug from a runner accident.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -24,3 +35,33 @@ jobs:
       # fallback keeps the job green on branches cut before the lockfile landed.
       - run: npm ci || npm i
       - run: node scripts/check.mjs --offline
+
+  linux:
+    # Not a target: nobody drives their own Chrome from a Linux CI box, so a red
+    # Linux must never block a merge. It is kept because the repo is zero-
+    # dependency ESM whose logic is mostly platform-neutral — knowing where it
+    # breaks here is free, and deleting the job would hide that for nothing.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci || npm i
+      - run: node scripts/check.mjs --offline
+
+  # Branch protection requires a check literally named `check`, and a matrix job
+  # reports as `check (macos-latest)` — which would wait forever and lock main.
+  # So the matrix lives above under another name and this unmatrixed job carries
+  # the required name. `always()` is load-bearing: a job skipped by a failed
+  # `needs` counts as success in branch protection, so it must run and then fail
+  # on the result itself. `linux` is deliberately not in `needs`.
+  check:
+    needs: [offline]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "offline (macos-latest, windows-latest): ${{ needs.offline.result }}"
+          [ "${{ needs.offline.result }}" = success ]

@@ -192,6 +192,8 @@ node scripts/install-hooks.mjs
 - `pre-commit` → `scripts/check.mjs --offline`：全量语法检查、遗留调试语句、**崩溃守卫是否还在**、license 元数据
 - `pre-push` → 同上 + 真实浏览器测试；Chrome 没开或没 token 时**跳过并提示**，不阻塞推送
 
+`.github/workflows/ci.yml` 在 **macOS 与 Windows** 上用 Node 22 跑 offline 层 —— 这个工具驱动的是操作员自己登录着的桌面 Chrome，所以只支持这两个平台。Linux 不是目标平台，它在 CI 里只是不阻塞的参考信号。浏览器层在 CI 里根本跑不了：它需要操作员的 Chrome 和扩展 token。
+
 ## 许可
 
 MIT
