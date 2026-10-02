@@ -5,9 +5,10 @@
 // entire protocol path here in two screens.
 //
 // Non-goal: every MCP feature. Tools only — no resources, prompts, sampling or
-// batching. The server never exits because a page threw; it exits on stdin EOF
-// or an explicit shutdown, and nothing else.
-import { createStdioTransport, log } from "./transport.mjs";
+// batching. The server never exits because a page threw; it exits when its
+// client is gone — stdin closed, a broken stream, or the client killed — and
+// for no other reason.
+import { clientOwnsStdin, createStdioTransport, log } from "./transport.mjs";
 import { INSTRUCTIONS, InvalidParams, Session, callTool, toolSpecs } from "./tools.mjs";
 
 // Keep in sync with package.json.
@@ -34,13 +35,26 @@ const failure = (id, code, message) => ({ jsonrpc: "2.0", id, error: { code, mes
  * calls this and lets the process live until stdin closes.
  * @param {{ input?: NodeJS.ReadableStream, output?: NodeJS.WritableStream }} streams
  */
-export function startServer({ input, output } = {}) {
+export function startServer({ input = process.stdin, output = process.stdout } = {}) {
+  // The client owns these pipes — that IS the server's lifetime. A terminal on
+  // stdin means nobody is speaking MCP here, and a server that waits for a
+  // human to type JSON-RPC is a process that never ends.
+  if (!clientOwnsStdin(input)) {
+    log("stdin is a terminal, so no MCP client is attached. Launch this from a client, or pipe JSON-RPC in.");
+    process.exitCode = 2;
+    return null;
+  }
   const session = new Session();
 
-  // The only way out: the client closes stdin. MCP stdio has no shutdown
+  // The client going away is the only way out — MCP stdio has no shutdown
   // request, and inventing one would be a second lifecycle to keep correct.
-  const stop = async () => {
-    log("stdin closed, shutting down");
+  // "Gone" has several spellings (stdin ended, either stream broke), so this
+  // runs at most once.
+  let stopping = false;
+  const stop = async (why) => {
+    if (stopping) return;
+    stopping = true;
+    log(`${why}, shutting down`);
     transport.stop();
     await session.close();
     // No timers and no sockets of our own: the loop drains the last reply and
@@ -102,7 +116,7 @@ export function startServer({ input, output } = {}) {
       log(`malformed JSON (${line.length} bytes)`);
       transport.send(failure(null, PARSE_ERROR, "invalid JSON: messages are one JSON object per line"));
     },
-    onEnd: () => void stop(),
+    onEnd: () => void stop("client closed the stream"),
   });
 
   // A page that throws, a socket that dies mid-screenshot: loud on stderr, and

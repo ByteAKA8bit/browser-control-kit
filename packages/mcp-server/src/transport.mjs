@@ -66,6 +66,28 @@ export function log(message) {
 }
 
 /**
+ * An MCP stdio server is owned by its client: the protocol hands the other end
+ * of these pipes to that client, so the pipes ARE the lifetime. stdin ending —
+ * or either stream breaking — means the client is gone, including when it was
+ * killed outright, because the kernel closes its end for it.
+ *
+ * What this deliberately does NOT do is watch `process.ppid` for re-parenting.
+ * It reads like a fact and is a guess: plenty of clients are started behind a
+ * launcher that exits immediately, and exiting then would end a session that is
+ * still working — trading a wasted process for lost work. It is also unreliable
+ * exactly where it would matter (Windows has no re-parenting; a container whose
+ * parent is already PID 1 never changes) and it would put a polling timer in a
+ * server that promises to have none.
+ *
+ * The one case pipes cannot cover is a caller that hands us a stdin it shares
+ * with something else (`stdio: "inherit"`), which nobody will ever close. That
+ * is a bug in the spawn, and it is said out loud instead of guessed around.
+ */
+export function clientOwnsStdin(input = process.stdin) {
+  return !input.isTTY;
+}
+
+/**
  * Wire stdin/stdout into one message stream.
  * @param {{ input?: NodeJS.ReadableStream, output?: NodeJS.WritableStream,
  *           onMessage: (message: unknown) => void, onParseError: (line: string) => void,
@@ -86,7 +108,11 @@ export function createStdioTransport({ input = process.stdin, output = process.s
   });
   input.setEncoding("utf8");
   input.on("data", decode);
+  // Every way the client can vanish, not just the polite one: stdin ends, stdin
+  // breaks, or stdout refuses our writes (EPIPE — nobody is reading any more).
   input.on("end", onEnd);
+  input.on("error", onEnd);
+  output.on("error", onEnd);
   return {
     send: (message) => send(`${JSON.stringify(message)}\n`),
     stop: () => {

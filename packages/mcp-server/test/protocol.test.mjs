@@ -9,6 +9,7 @@ import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { clientOwnsStdin } from "../src/transport.mjs";
 
 const BIN = path.join(import.meta.dirname, "..", "bin", "browser-control-mcp.mjs");
 // cdp mode at a dead port with autostart forbidden: attach() fails in
@@ -278,5 +279,23 @@ describe("lifecycle", () => {
     const client = startClient(NO_BROWSER);
     assert.equal(await client.stop(), 0);
     assert.deepEqual(client.lines, [], "a server nobody spoke to writes nothing to stdout");
+  });
+
+  it("exits when the client drops the pipe without closing it politely", async () => {
+    // A client that dies takes its end of stdin with it, SIGKILL included —
+    // this is the kernel doing the work, which is why the server needs no
+    // liveness heuristic of its own.
+    const client = startClient(NO_BROWSER);
+    client.child.stdin.destroy();
+    const code = await new Promise((resolve) => client.child.on("exit", resolve));
+    assert.equal(code, 0, "a broken pipe is a clean exit, not a crash");
+  });
+
+  it("refuses to sit on a terminal, where no client can ever close stdin", () => {
+    // The one lifetime the pipes cannot express: a stdin shared with something
+    // that will never close it (a terminal, or a caller spawning with
+    // stdio:"inherit"). Say so rather than wait forever.
+    assert.equal(clientOwnsStdin({ isTTY: true }), false);
+    assert.equal(clientOwnsStdin({ isTTY: undefined }), true, "a pipe is what a client gives us");
   });
 });
