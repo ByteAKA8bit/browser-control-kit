@@ -138,13 +138,14 @@ first. Rules, each opt-outable and none silent (`BC_TAB_GUARD=0` disables the lo
 
 | Rule | Behaviour | Why |
 | --- | --- | --- |
-| Budget | `defaultBudget(mode)` = 3 on extension / 4 otherwise, `BC_TAB_BUDGET` overrides | the tool may not grow the browser |
-| Eviction | `newPage()` makes room by closing the LRU tab **we own**; unevictable → honest "tab budget exhausted" error | asking for a tab must not add one |
+| Recycle first | `newPage()` hands back an owned tab idle for `BC_TAB_RECYCLE_MS` (5 s), blanked | reuse is free, a renderer is 40–80 MB |
+| Admission | granted while `headroom()` ≥ `BC_MEM_FLOOR` (0.2) and under the transport ceiling; otherwise the LRU idle tab is evicted first, and an all-busy browser is refused with the reason | pressure, not a quota |
 | Ownership | tabs present at `attach()` are `protectedPages`: never closed, counted or marked | the browser is the operator's |
 | Adoption | `window.open` / `target=_blank` popups are adopted and re-trim the ceiling | uninvited tabs still cost RAM |
 | Holds | `hold(page)` pins a tab; `TabPool` holds its tabs for the run | a working tab must not be reaped |
-| Reaping | idle > `BC_TAB_IDLE_MS` (5 min, `0` disables), timer every 30 s and `unref`'d | this is what returns memory during a long run |
-| Last tab | `#close` refuses when ≤ 1 ordinary (non-`chrome-extension://`) tab remains | Chrome exits and takes the bridge with it |
+| Reclaiming | idle > `BC_TAB_BLANK_MS` (1 min) → `about:blank`; idle > `BC_TAB_IDLE_MS` (5 min) → closed; timer every 30 s, `unref`'d | memory comes back before the tab does |
+| Last tab | `#close` refuses when ≤ 1 tab remains, counting the relay's own | Chrome exits and takes the bridge with it |
+| Nothing left behind | `browser.close()` also closes the relay's `connect.html`; `beforeExit`/`SIGINT`/`SIGTERM` reclaim | sixteen runs once left sixteen tabs |
 | Serialised closes | one at a time with `BC_TAB_SETTLE_MS` (400 ms) | attach/detach churn crashed Chrome |
 
 `report()` exposes budget, owned/operator counts and per-tab origin/held/idle. Known

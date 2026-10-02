@@ -3,10 +3,10 @@
 // Non-goal: opening tabs. There is deliberately NO "new tab" tool — the
 // complaint this server answers is agents that open a tab per step until the
 // operator's Chrome holds forty renderers. browser_navigate reuses the active
-// tab, tab_select switches between tabs that already exist, and the tab budget
-// (default 2 for MCP sessions, override with BC_TAB_BUDGET) is enforced by
-// browser-control's TabGuard, whose report browser_status prints back so the
-// agent can see it is being metered.
+// tab and tab_select switches between tabs that already exist, so the number of
+// tabs follows the work actually in flight instead of a quota. Reuse, memory
+// pressure and idle reclaiming are browser-control's TabGuard; browser_status
+// prints its report back so the agent can see what it is costing.
 //
 // browser-control — and through it playwright-core — is imported lazily inside
 // #connect(), so a server that an agent has merely listed tools on costs
@@ -14,13 +14,12 @@
 const ATTACH_TIMEOUT_MS = () => Number(process.env.BC_MCP_ATTACH_TIMEOUT_MS ?? 60_000);
 const TEXT_LIMIT = () => Number(process.env.BC_MCP_TEXT_LIMIT ?? 20_000);
 const WAIT_TIMEOUT_MS = () => Number(process.env.BC_MCP_WAIT_MS ?? 20_000);
-// 2, not browser-control's 3/4: an MCP agent is the worst offender for tab
-// sprawl, and anything it genuinely needs it can reach by switching tabs.
-// A nonsense BC_TAB_BUDGET falls back to 2 rather than handing TabGuard a NaN.
-const TAB_BUDGET = () => {
-  const wanted = Number(process.env.BC_TAB_BUDGET);
-  return Number.isFinite(wanted) && wanted > 0 ? wanted : 2;
-};
+// An MCP session is single-threaded by nature: it does one thing at a time, so
+// a tab that has gone quiet is the tab the next navigation should use. Recycle
+// aggressively and blank early — the defaults are tuned for a long-lived agent
+// session, not for a parallel crawl.
+const RECYCLE_MS = () => Number(process.env.BC_TAB_RECYCLE_MS ?? 2_000);
+const BLANK_MS = () => Number(process.env.BC_TAB_BLANK_MS ?? 30_000);
 
 /** Reject instead of hanging forever when the operator never approves a connection. */
 function withTimeout(promise, ms, what) {
@@ -67,7 +66,7 @@ export class Session {
     // Lazy on purpose: this is the line that pulls in playwright-core.
     const { attach, controlPage } = await import("browser-control");
     const live = await withTimeout(
-      attach({ clientName: "browser-control-mcp", guard: { budget: TAB_BUDGET() } }),
+      attach({ clientName: "browser-control-mcp", guard: { recycleMs: RECYCLE_MS(), blankMs: BLANK_MS() } }),
       ATTACH_TIMEOUT_MS(),
       "attach()",
     );
@@ -184,7 +183,8 @@ const text = (value) => ({ content: [{ type: "text", text: typeof value === "str
 export const TOOLS = [
   {
     name: "browser_status",
-    description: "Report transport, capabilities and tab budget usage.",
+    description:
+      "Report the transport, its capabilities, and how many tabs this session is holding against its budget. Read it when a tab operation is refused.",
     inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
     async run(_args, session) {
       try {
@@ -198,7 +198,8 @@ export const TOOLS = [
   },
   {
     name: "browser_navigate",
-    description: "Navigate the active tab to a URL.",
+    description:
+      "Navigate THIS session's active tab to a URL. There is no tool that opens a tab: this server reuses one tab for the whole session, because every extra tab is a Chrome renderer process in the operator's own browser. Switch with browser_tab_select, finish with browser_tab_close.",
     inputSchema: {
       type: "object",
       properties: {
@@ -311,13 +312,15 @@ export const TOOLS = [
   },
   {
     name: "browser_tabs",
-    description: "List open tabs with their index.",
+    description:
+      "List the tabs this session can see, with their index and whether this session owns them. Tabs the operator opened are theirs: read them, never close them.",
     inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
     run: (_args, session) => session.tabs(),
   },
   {
     name: "browser_tab_select",
-    description: "Make an existing tab the active one.",
+    description:
+      "Make an existing tab the active one for the calls that follow. This is how you move between pages; the session will not open a second tab for you.",
     inputSchema: {
       type: "object",
       properties: { index: { type: "integer", description: "Index from browser_tabs" } },
@@ -328,7 +331,8 @@ export const TOOLS = [
   },
   {
     name: "browser_tab_close",
-    description: "Close a tab by index.",
+    description:
+      "Close a tab this session opened, as soon as you are done with it. Idle tabs are blanked and reclaimed automatically, but closing promptly is what keeps the operator's Chrome small.",
     inputSchema: {
       type: "object",
       properties: { index: { type: "integer" } },

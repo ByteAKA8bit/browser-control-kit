@@ -3,7 +3,7 @@
 An MCP stdio server that lets an agent drive **the Chrome the operator is already using** — and that cannot grow it.
 
 - **No tool opens a tab.** `browser_navigate` reuses the active tab; the only tab API is list / select / close.
-- **The budget is enforced, not suggested.** `browser-control`'s `TabGuard` caps the tabs this server owns at **2** (`BC_TAB_BUDGET` overrides), evicts LRU rather than growing the browser, and never counts or closes a tab that was open before the session started. `browser_status` prints the guard's report back, so the agent can see it is metered.
+- **Discipline without a quota.** `browser-control`'s `TabGuard` hands back a tab this session has stopped using instead of opening another, admits a new one only while the machine has memory headroom, blanks idle tabs before it closes them, and never counts or closes a tab that was open before the session started. The transport's own ceiling (3 on the extension bridge) is the only hard number; `BC_TAB_BUDGET` pins your own. `browser_status` prints the guard's report back, so the agent can see what it is costing.
 - **Idle cost is a bare Node process** (~40 MB RSS measured): `browser-control` — and through it `playwright-core` — is imported lazily inside the first tool call that needs a browser. No timers, no caches.
 - **Zero dependencies of its own.** The JSON-RPC framing, the protocol loop and the tool table are three small modules, no SDK.
 
@@ -58,7 +58,9 @@ Newline-delimited JSON-RPC 2.0 on stdin/stdout; **stdout carries protocol bytes 
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `BC_TAB_BUDGET` | `2` | Tabs this server may own |
+| `BC_TAB_RECYCLE_MS` | `2000` | Quiet period after which a tab is reused rather than a new one opened |
+| `BC_TAB_BLANK_MS` | `30000` | Idle period after which a tab is parked on `about:blank` |
+| `BC_TAB_BUDGET` | transport ceiling | Pin an explicit tab limit |
 | `BC_MCP_ATTACH_TIMEOUT_MS` | `60000` | Give up waiting for a browser |
 | `BC_MCP_TEXT_LIMIT` | `20000` | Characters `browser_text` returns |
 | `BC_MCP_WAIT_MS` | `20000` | Default `browser_wait_for` timeout |

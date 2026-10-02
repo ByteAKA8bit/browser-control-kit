@@ -29,7 +29,7 @@ const DEEP_SRC = DEEP_QUERY_ALL.toString();
 // screenshots, tab create/close — so only navigation is serialised, process-wide.
 // Escape hatch: BC_PARALLEL_NAV=1.
 let navChain = Promise.resolve();
-const serialiseNavigation = (fn) => {
+export const serialiseNavigation = (fn) => {
   const run = navChain.then(fn, fn);
   navChain = run.then(
     () => {},

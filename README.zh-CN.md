@@ -121,28 +121,30 @@ shim side:    node   90849 127.0.0.1:54006->127.0.0.1:9333     ← Playwright
 | **扩展一次只接受一个客户端**：并发跑两个测试文件时后者连不上、前者被打断 | 测试串行执行（`--test-concurrency=1`） |
 | `setViewport` 会下发 `Emulation.setDeviceMetricsOverride`，把页面锁小、右侧留白 | 默认不生效，需 `BC_VIEWPORT=1` |
 
-## 标签预算（给 agent 上笼头）
+## 标签纪律（`TabGuard`）
 
-Agent 的典型毛病：一步开一个新标签，从不关，半小时后 Chrome 吃掉几十个渲染进程——而那是**你自己在用的浏览器**。`attach()` 默认返回一个受管的 context：
+Agent 的典型毛病：一步开一个新标签,从不关,半小时后 Chrome 吃掉几十个渲染进程——而那是**你自己在用的浏览器**。解法不是配额:数字定小了干不了活,定大了保护不了谁;**正确的标签数,等于此刻真正在干活的标签数**。所以 `attach()` 返回的受管 context 按"复用 + 压力"治理,而不是按数字:
 
 ```js
 const { browser, context, tabs } = await attach();   // tabs = TabGuard
 
-for (let i = 0; i < 10; i += 1) await context.newPage();  // 开了 10 个
-console.log(tabs.report());                               // owned: 3，其余 7 个已按 LRU 关掉
+for (let i = 0; i < 10; i += 1) await context.newPage();  // 要了 10 次
+console.log(tabs.report());                               // owned: 3, recycled: 7 —— 多数请求复用了同一个标签
 
-await browser.close();   // 先把自己开的标签还回去，再断开
+await browser.close();   // 自己的标签 + relay 的桥接页,一起还回去
 ```
 
 | 规则 | 行为 | 开关 |
 | --- | --- | --- |
-| 预算 | 本进程最多持有 N 个标签，超了就关掉**最久没用过**的那个 | `BC_TAB_BUDGET`（默认：扩展 3 / CDP 4） |
-| 归属 | `attach()` 之前就存在的标签属于操作者，**永不关闭、不计数**；`window.open`/`target=_blank` 弹出的标签算我们的 | — |
-| 闲置回收 | 自己的标签闲置超过阈值就关掉（真正把内存还回去） | `BC_TAB_IDLE_MS`（默认 300000，`0` 关闭） |
-| 占用 | `TabPool` 的标签会 `hold()`，不会被回收或淘汰；预算被占满时再要标签会**明确报错**而不是继续长 | `BC_TAB_EVICT=0` 改为只报错不淘汰 |
-| 整体关闭 | `attach({ guard: false })` 或 `BC_TAB_GUARD=0` | — |
+| **先复用** | 超过 `BC_TAB_RECYCLE_MS` 没人动过的自有标签,**就是**下一个标签:清空后直接交出去。复用零成本,新开一个要花掉操作者 40–80 MB | `BC_TAB_RECYCLE_MS`(默认 5000,`0` 关闭复用) |
+| **按压力准入** | 机器有余量就批。内存紧张时先把最久没用的闲置标签收回;只有"全部在用 + 内存紧张"才拒绝,并说明原因 | `BC_MEM_FLOOR`(默认总内存的 `0.2`) |
+| **先还内存,再收标签** | 闲置超过 `BC_TAB_BLANK_MS` 先导航到 `about:blank`(渲染进程的页面立刻还回去),闲置满 `BC_TAB_IDLE_MS` 才关 | `BC_TAB_BLANK_MS` 60000、`BC_TAB_IDLE_MS` 300000(`0` 关闭) |
+| **通道上限** | 唯一一个硬数字,而且不是审美问题:扩展桥超过 3 个附着标签就断连。想自己定死用 `BC_TAB_BUDGET` | `BC_MAX_TABS_EXTENSION`、`BC_TAB_BUDGET` |
+| **归属** | `attach()` 之前就存在的标签属于操作者,**永不关闭、不导航、不计数**;`window.open`/`target=_blank` 弹窗算我们的 | — |
+| **占用** | `TabPool` 的标签 `hold()` 住,不会被复用、淘汰或回收 | `BC_TAB_EVICT=0` 改为只报错不淘汰 |
+| **不留尾巴** | `browser.close()` 连 relay 的 `connect.html` 一起关;调用方忘了收尾,`beforeExit`/`SIGINT`/`SIGTERM` 也会还 | `BC_KEEP_BRIDGE_TAB=1`、`BC_TAB_GUARD=0`、`attach({ guard: false })` |
 
-实测（真实 Chrome + CDP）：agent 连开 10 个标签 → 只剩 2 个（预算 2，淘汰 8），`window.open` 弹窗被接管后同样回落到预算内，闲置 1 秒后全部回收，操作者原有的标签始终没动。
+实测(真实 Chrome):连续 10 次 `newPage()` → **新建 3 个、复用 7 次、淘汰 0 个**,`close()` 后浏览器标签数回到原样;连跑三轮完整测试,标签数一个不多一个不少。一个坑:macOS 上 `os.freemem()` 不能当压力信号——16 GB 的健康机器读出来只有 1%,而实际可用 24%,所以 `headroom()` 在 darwin 上读 `vm_stat`。
 
 盲区：扩展通道附着不了的标签（`chrome://`、Web Store、其他扩展的页面、无 file 权限的 `file://`）不会出现在 `context.pages()` 里，这个守卫看不见、也关不掉。
 

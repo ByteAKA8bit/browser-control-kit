@@ -146,9 +146,11 @@ describe("stdio JSON-RPC", () => {
       "browser_wait_for",
     ]);
     for (const tool of result.tools) {
-      assert.match(tool.description, /^\S.*\.$/, `${tool.name} needs a one-line description`);
+      assert.match(tool.description, /^\S.*\.$/, `${tool.name} needs a description that reads as a sentence`);
       assert.ok(!tool.description.includes("\n"), `${tool.name} description must be one line`);
-      assert.ok(tool.description.length <= 80, `${tool.name} description must stay terse`);
+      // Long enough to steer behaviour, short enough to stay in a tool list: the
+      // tab tools have to explain why they will not open a tab for you.
+      assert.ok(tool.description.length <= 320, `${tool.name} description must stay readable (${tool.description.length} chars)`);
       assert.equal(tool.inputSchema.type, "object", `${tool.name} schema`);
       assert.equal(typeof tool.inputSchema.properties, "object");
       assert.ok(Array.isArray(tool.inputSchema.required), `${tool.name} declares required`);

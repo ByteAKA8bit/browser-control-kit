@@ -115,28 +115,30 @@ shim side:    node   90849 127.0.0.1:54006->127.0.0.1:9333     ← Playwright
 
 Restarting the shim means a new connection, hence another click — which is exactly why it is meant to be resident. A Chrome restart is the same story: the shim reconnects by itself and says in its log that this one needs a click.
 
-## The tab budget (`TabGuard`)
+## Tab discipline (`TabGuard`)
 
-The classic agent failure mode: open a tab per step, never close one, and half an hour later Chrome is carrying dozens of renderer processes — in **the browser you are personally using**. `attach()` therefore returns a guarded context:
+The classic agent failure mode: open a tab per step, never close one, and half an hour later Chrome is carrying dozens of renderer processes — in **the browser you are personally using**. The answer is not a quota. A number is either too small for real work or too large to protect anything; the right number of tabs is however many are doing work *right now*. So `attach()` returns a guarded context that governs by reuse and pressure:
 
 ```js
 const { browser, context, tabs } = await attach();   // tabs = TabGuard
 
 for (let i = 0; i < 10; i += 1) await context.newPage();  // ten requested
-console.log(tabs.report());                               // owned: 3 — the rest were LRU-closed
+console.log(tabs.report());                               // owned: 3, recycled: 7 — most requests reused a tab
 
-await browser.close();   // hands back the tabs we opened, then disconnects
+await browser.close();   // hands back our tabs and the relay's, then disconnects
 ```
 
 | Rule | Behaviour | Switch |
 | --- | --- | --- |
-| Budget | This process holds at most N tabs; over budget closes the **least recently used** one | `BC_TAB_BUDGET` (default: 3 on extension, 4 on cdp) |
-| Ownership | Tabs that existed before `attach()` belong to the operator and are **never closed or counted**; `window.open` / `target=_blank` popups are adopted as ours | — |
-| Idle reaping | Our own tabs are closed once idle past the threshold (memory actually comes back) | `BC_TAB_IDLE_MS` (default 300000, `0` disables) |
-| Holds | `TabPool` tabs call `hold()` and are immune to eviction and reaping; when the budget is full of held tabs, asking for another **fails loudly** instead of growing the browser | `BC_TAB_EVICT=0` to error instead of evicting |
-| Off switch | `attach({ guard: false })` or `BC_TAB_GUARD=0` | — |
+| **Recycle first** | A tab we own that nobody has touched for `BC_TAB_RECYCLE_MS` *is* the next tab: it gets blanked and handed back. Reuse is free; a new renderer costs the operator 40–80 MB | `BC_TAB_RECYCLE_MS` (default 5000, `0` disables reuse) |
+| **Admit under pressure** | A new tab is granted while the machine has room. When memory is tight the least-recently-used idle tab is taken back first; only an all-busy browser under pressure refuses, and it says why | `BC_MEM_FLOOR` (default `0.2` of total memory) |
+| **Memory before closure** | An idle tab is parked on `about:blank` after `BC_TAB_BLANK_MS` — the renderer's page is returned immediately — and closed once idle for `BC_TAB_IDLE_MS` | `BC_TAB_BLANK_MS` 60000, `BC_TAB_IDLE_MS` 300000 (`0` disables) |
+| **Transport ceiling** | The one hard number, and not a style choice: the extension bridge drops the connection past 3 attached tabs. Pin your own with `BC_TAB_BUDGET` | `BC_MAX_TABS_EXTENSION`, `BC_TAB_BUDGET` |
+| **Ownership** | Tabs that existed before `attach()` belong to the operator and are **never closed, navigated or counted**; `window.open` / `target=_blank` popups are adopted as ours | — |
+| **Holds** | `TabPool` tabs call `hold()` and are immune to recycling, eviction and reaping | `BC_TAB_EVICT=0` to error instead of evicting |
+| **Nothing is left behind** | `browser.close()` returns our tabs *and* the relay's `connect.html`; a process that forgets reclaims on `beforeExit`/`SIGINT`/`SIGTERM` | `BC_KEEP_BRIDGE_TAB=1`, `BC_TAB_GUARD=0`, `attach({ guard: false })` |
 
-Measured (real Chrome, cdp transport): an agent opening 10 tabs ends with 2 (budget 2, 8 evicted); `window.open` popups are adopted and fall back inside the budget; after 1 s idle all of ours are reaped; the operator's pre-existing tabs are never touched.
+Measured against the real browser: ten `newPage()` requests in a row produced **3 tabs created, 7 recycled, 0 evicted** and the browser was back to its original tab count after `close()`; three consecutive full test runs leave the tab count exactly where it started. One trap worth knowing: `os.freemem()` is not a usable pressure signal on macOS — it read 1% on a healthy 16 GB machine against 24% actually available — so `headroom()` reads `vm_stat` there.
 
 Two measured facts about the extension transport that shape all of this (2026-10-02): `context.pages()` lists **only the relay's own tab plus tabs opened during this connection** — the operator's existing tabs are not enumerable, so they are safe but also invisible to `cleanup.mjs`; and the relay opens a `connect.html` tab per `attach()` that nothing used to close. Tabs the extension cannot attach to at all (`chrome://`, the Web Store, other extensions' pages, `file://` without access) never appear either.
 

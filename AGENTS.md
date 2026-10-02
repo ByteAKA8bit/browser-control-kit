@@ -107,7 +107,7 @@ Chrome 152 + Playwright Extension killed the browser process 11 times; each guar
 4. **One `TabPool` per extension connection**; size ≤ `MAX_TABS_EXTENSION` (3) on extension, ≤ `MAX_TABS` (4) otherwise; `start()` throws with no ordinary tab present.
 5. **Never touch the operator's tabs or profile**: reuse only `bcPoolTab`-marked tabs (`BC_REUSE_ANY=1` opts in), never `evaluate` on extension/devtools pages, `setViewport` is a no-op unless `BC_VIEWPORT=1`, the token is read but never written or echoed.
 6. **Tab creation on extension requires `BC_ALLOW_TAB_CREATE=1`**; otherwise the pool degrades its size.
-7. **The tab budget is enforced, not suggested** (`src/tab-guard.mjs`): `attach()` returns a guarded context whose `newPage()` evicts the LRU tab we own rather than growing the browser, adopts `window.open`/`target=_blank` popups, reaps idle tabs, and never counts or closes a tab that existed before attach. `TabPool` calls `context.tabGuard?.hold()` so working tabs are immune. Opt out with `BC_TAB_GUARD=0`.
+7. **Tab discipline is enforced, not requested** (`src/tab-guard.mjs`): `attach()` returns a guarded context whose `newPage()` recycles an idle owned tab before opening one, admits a new tab only while `headroom()` is above `BC_MEM_FLOOR` and under the transport ceiling, blanks idle tabs before closing them, adopts `window.open` popups, never counts or closes a tab that existed before attach, closes the relay's `connect.html` on teardown, and reclaims on `beforeExit`/`SIGINT`/`SIGTERM`. `TabPool` calls `context.tabGuard?.hold()`. Opt out with `BC_TAB_GUARD=0`.
 
 ### antd-kit specifics
 
@@ -125,7 +125,7 @@ antd **v6**: modal bodies are `.ant-modal-container` (v5's `.ant-modal-content` 
 | `src/page.mjs` | `controlPage` Proxy, nav lock, frame fan-out, `blockUrls` |
 | `src/dom-input.mjs` / `src/transfer.mjs` | Stringified in-page click/type/upload/drag primitives |
 | `src/pool.mjs` | `TabPool`, `parallelMap`, tab ceilings |
-| `src/tab-guard.mjs` | `TabGuard` budget/LRU/idle reaper, `guardContext`, `guardBrowser` |
+| `src/tab-guard.mjs` | `TabGuard`: recycling, pressure-based admission, blank-then-close reaping, `guardContext`, `guardBrowser`, `headroom`, `tabCeiling` |
 | `src/fixtures.mjs` | `makeXlsx/makeCsv/makePng/asUpload`, hand-rolled ZIP+CRC32 |
 | `selftest.mjs` / `cleanup.mjs` | Operator scripts (not published tests) |
 | `scripts/check.mjs` | The CI |
@@ -142,7 +142,7 @@ Subpath exports: `browser-control/fixtures`, `/pool`, `/tab-guard`, `/shim`. Add
 - **npm** workspaces; `package-lock.json` is committed (CI runs `npm ci`) — lockfile changes belong in the commit. The root manifest is `private: true` but still carries `license`/`author`/`repository`/`homepage`/`bugs`.
 - All source is `.mjs`. Do not introduce `.js`, `.ts`, or a build step.
 - macOS-centric paths: `~/Library/Application Support/Google/Chrome/DevToolsActivePort`, `pgrep -f 'MacOS/Google Chrome'`.
-- Key env flags: `BC_MODE`, `BC_CDP_URL`, `BC_TRACE`, `BC_MAX_TABS`, `BC_MAX_TABS_EXTENSION`, `BC_TAB_SETTLE_MS`, `BC_ALLOW_TAB_CREATE`, `BC_REUSE_ANY`, `BC_PARALLEL_NAV`, `BC_VIEWPORT`, `BC_ALLOW_INIT_SCRIPT`, `BC_TAB_GUARD`, `BC_TAB_BUDGET`, `BC_TAB_IDLE_MS`, `BC_TAB_EVICT`, `BC_TOKEN_FILE`, `PLAYWRIGHT_MCP_EXTENSION_TOKEN`, `SHIM_PORT`, `CHROME_PORT_FILE`, `BC_SHIM_AUTOSTART`, `BC_SHIM_KEEPALIVE_MS`, `BC_SHIM_PROBE_MS`, `BC_SHIM_START_MS`, `BC_CRASH_REPRO`.
+- Key env flags: `BC_MODE`, `BC_CDP_URL`, `BC_TRACE`, `BC_MAX_TABS`, `BC_MAX_TABS_EXTENSION`, `BC_TAB_SETTLE_MS`, `BC_ALLOW_TAB_CREATE`, `BC_REUSE_ANY`, `BC_PARALLEL_NAV`, `BC_VIEWPORT`, `BC_ALLOW_INIT_SCRIPT`, `BC_TAB_GUARD`, `BC_TAB_BUDGET`, `BC_TAB_RECYCLE_MS`, `BC_TAB_BLANK_MS`, `BC_TAB_IDLE_MS`, `BC_TAB_EVICT`, `BC_MEM_FLOOR`, `BC_KEEP_BRIDGE_TAB`, `BC_TOKEN_FILE`, `PLAYWRIGHT_MCP_EXTENSION_TOKEN`, `SHIM_PORT`, `CHROME_PORT_FILE`, `BC_SHIM_AUTOSTART`, `BC_SHIM_KEEPALIVE_MS`, `BC_SHIM_PROBE_MS`, `BC_SHIM_START_MS`, `BC_CRASH_REPRO`.
 
 ## Testing & QA
 
