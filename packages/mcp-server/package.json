@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": false,
   "type": "module",
-  "description": "MCP server over stdio for browser-control: drive the browser the operator is already using, with a hard cap on tabs.",
+  "description": "MCP server over stdio for browser-control: drive the browser the operator is already using, addressing pages by name.",
   "main": "src/server.mjs",
   "exports": {
     ".": "./src/server.mjs"
@@ -32,7 +32,15 @@
   "bugs": {
     "url": "https://github.com/ByteAKA8bit/browser-control-kit/issues"
   },
-  "keywords": ["mcp", "model-context-protocol", "chrome", "cdp", "browser-automation", "playwright", "agent"],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "chrome",
+    "cdp",
+    "browser-automation",
+    "playwright",
+    "agent"
+  ],
   "files": [
     "bin",
     "src",

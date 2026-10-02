@@ -6,7 +6,7 @@
 
 - `packages/browser-control` — published; transport attach + a puppeteer-flavoured page wrapper + a parallel tab pool. Only third-party dep: `playwright-core@1.63.0-alpha-2026-08-31` (exact pin).
 - `packages/antd-kit` — private, zero-dep; `page.evaluate` helpers for Ant Design **v6** modals/drawers/forms.
-- `packages/mcp-server` — `browser-control-mcp`, an MCP stdio server exposing the kit as agent tools; depends only on `browser-control`.
+- `packages/mcp-server` — `browser-control-mcp`, an MCP stdio server exposing the kit as agent tools; depends only on `browser-control`. Its surface is ten tools over **named surfaces** (`as` / `on`) — no tab handles, and no tool that opens or closes a tab.
 
 Dependency direction is one-way and must stay that way: consumer suites → `antd-kit` → `browser-control` → `playwright-core`. `antd-kit` duck-types the `page` object; it has no dependency entry on `browser-control`.
 
@@ -55,8 +55,7 @@ graph LR
 npm i && node scripts/install-hooks.mjs   # one-time: git config core.hooksPath .githooks
 
 npm test            # 7 suites in one process, --test-concurrency=1 (dom-input + pool need Chrome + token)
-npm run test:offline # browserless tier: tab-guard (13) + ws-server (8) + shim-autostart (8)
-                    #   + shim-policy + mcp-server protocol
+npm run test:offline # browserless tier: tab-guard (31) + ws-server (8) + shim-autostart (8) + shim-policy (6) + mcp protocol (16) = 69
 npm run test:unit   # dom-input.test.mjs  (16 cases)
 npm run test:pool   # pool.test.mjs       (8 cases)
 npm run selftest    # end-to-end smoke; writes ./selftest.png, exits 1 on failure
@@ -107,7 +106,7 @@ Chrome 152 + Playwright Extension killed the browser process 11 times; each guar
 4. **One `TabPool` per extension connection**; size ≤ `MAX_TABS_EXTENSION` (3) on extension, ≤ `MAX_TABS` (4) otherwise; `start()` throws with no ordinary tab present.
 5. **Never touch the operator's tabs or profile**: reuse only `bcPoolTab`-marked tabs (`BC_REUSE_ANY=1` opts in), never `evaluate` on extension/devtools pages, `setViewport` is a no-op unless `BC_VIEWPORT=1`, the token is read but never written or echoed.
 6. **Tab creation on extension requires `BC_ALLOW_TAB_CREATE=1`**; otherwise the pool degrades its size.
-7. **Tab discipline is enforced, not requested** (`src/tab-guard.mjs`): `attach()` returns a guarded context whose `newPage()` recycles an idle owned tab before opening one, sizes every idle window from the caller's measured cadence (not constants), blanks idle tabs before closing them, adopts `window.open` popups, never counts or closes a tab that existed before attach, closes the relay's `connect.html` on teardown, and reclaims on `beforeExit`/`SIGINT`/`SIGTERM`. It deliberately does NOT probe system memory. The only refusal is the transport ceiling. `TabPool` calls `context.tabGuard?.hold()`. Opt out with `BC_TAB_GUARD=0`.
+7. **Tab discipline is enforced, not requested** (`src/tab-guard.mjs`): `attach()` returns a guarded context whose `newPage()` recycles an idle owned tab before opening one, sizes every idle window from the caller's measured cadence (not constants), blanks idle tabs before closing them, adopts `window.open` popups, never counts or closes a tab that existed before attach, closes the relay's `connect.html` on teardown, and reclaims on `beforeExit`/`SIGINT`/`SIGTERM`. It deliberately does NOT probe system memory. The only refusal is the transport ceiling. `TabPool` calls `context.tabGuard?.hold()`. Opt out with `BC_TAB_GUARD=0`. Callers that need a page to survive bind a **named surface** (`guard.surface(name)`, `guard.release(name)`, `guard.surfaces()`): one page per name, exempt from recycling and reaping while bound, reusing an idle owned tab before opening anything. At the ceiling with every tab bound, the least-recently-used surface is released and its tab reused — reported via `stats.surfacesEvicted` / `report().surfaces`, never an error. The cadence answers "is this scratch tab idle?"; the name answers "is this page still wanted?".
 
 ### antd-kit specifics
 
@@ -125,7 +124,7 @@ antd **v6**: modal bodies are `.ant-modal-container` (v5's `.ant-modal-content` 
 | `src/page.mjs` | `controlPage` Proxy, nav lock, frame fan-out, `blockUrls` |
 | `src/dom-input.mjs` / `src/transfer.mjs` | Stringified in-page click/type/upload/drag primitives |
 | `src/pool.mjs` | `TabPool`, `parallelMap`, tab ceilings |
-| `src/tab-guard.mjs` | `TabGuard`: recycling, measured idle windows, blank-then-close reclaiming, `guardContext`, `guardBrowser`, `tabCeiling` |
+| `src/tab-guard.mjs` | `TabGuard`: named surfaces (`surface`/`release`/`surfaces`, LRU release at the ceiling), recycling, measured idle windows, blank-then-close reclaiming, `guardContext`, `guardBrowser`, `tabCeiling` |
 | `src/fixtures.mjs` | `makeXlsx/makeCsv/makePng/asUpload`, hand-rolled ZIP+CRC32 |
 | `selftest.mjs` / `cleanup.mjs` | Operator scripts (not published tests) |
 | `scripts/check.mjs` | The CI |

@@ -1,12 +1,15 @@
-// The agent-facing surface: one browser session, one active tab, twelve tools.
+// The agent-facing surface: one browser session, pages addressed by NAME, ten
+// tools.
 //
-// Non-goal: opening tabs. There is deliberately NO "new tab" tool — the
-// complaint this server answers is agents that open a tab per step until the
-// operator's Chrome holds forty renderers. browser_navigate reuses the active
-// tab and tab_select switches between tabs that already exist, so the number of
-// tabs follows the work actually in flight instead of a quota. Reuse, memory
-// pressure and idle reclaiming are browser-control's TabGuard; browser_status
-// prints its report back so the agent can see what it is costing.
+// Non-goal: tab handles. The earlier version of this file handed the agent tab
+// indices and then spent three tool descriptions policing them — don't open
+// one, don't close the operator's, close yours when you are done. Agents leak
+// handles; that is what handles are for. So there is no handle: `as` names the
+// page a navigation should keep, `on` goes back to a named page, and omitting
+// both lands on the scratch page that the next unnamed navigation reuses.
+// Lifetime belongs to browser-control's TabGuard — named pages are pinned,
+// unnamed ones recycled, idle ones blanked and reclaimed — which is why no tool
+// here can open or close a tab and nothing has to be explained to the agent.
 //
 // browser-control — and through it playwright-core — is imported lazily inside
 // #connect(), so a server that an agent has merely listed tools on costs
@@ -18,6 +21,15 @@ const WAIT_TIMEOUT_MS = () => Number(process.env.BC_MCP_WAIT_MS ?? 20_000);
 // time, and TabGuard already measures that rhythm and sizes its own windows
 // from it. Adding "tuned for MCP" constants would just be a second opinion.
 
+/**
+ * The one paragraph a client shows before the first tool call (MCP
+ * `initialize.instructions`). It exists so the per-call descriptions do not
+ * have to nag: state the addressing model once, say that nothing needs
+ * closing, stop.
+ */
+export const INSTRUCTIONS =
+  "Pages are addressed by name, never by handle. Pass `as` to browser_navigate to keep that page under a name, and `on` to come back to it from any later call; leave both out and you get the scratch page, which the next unnamed navigation reuses. Nothing needs closing — named pages are kept while you use them, unnamed ones are recycled, idle ones are reclaimed — and browser_surfaces lists what is named right now.";
+
 /** Reject instead of hanging forever when the operator never approves a connection. */
 function withTimeout(promise, ms, what) {
   if (!(ms > 0)) return promise;
@@ -28,31 +40,28 @@ function withTimeout(promise, ms, what) {
   return Promise.race([promise, alarm]).finally(() => clearTimeout(timer));
 }
 
-/** Tabs the agent may drive: the extension's own pages are not browsing tabs. */
-function ordinaryPages(context) {
-  return context.pages().filter((page) => {
-    const url = page.url();
-    return !url.startsWith("chrome-extension://") && !url.startsWith("devtools://");
-  });
-}
-
 const flatten = (err) => String(err?.message ?? err).split("\n")[0];
 
 /**
  * One attached browser per server process, created on the first tool call that
  * needs it and re-created if the browser goes away.
+ *
+ * It keeps no page state of its own — no "active tab", nothing to desynchronise
+ * from the browser. Every call resolves its page through the guard's name
+ * table, so a page that closed underneath us simply comes back as a fresh one
+ * under the same name.
  */
 export class Session {
   #live = null;
   #connecting = null;
-  #active = null;
   #controlPage = null;
+  #wrapped = new WeakMap(); // raw page → controlPage proxy, so a call does not rebuild one
+  #evicted = 0; // last seen guard.stats.surfacesEvicted, to report only what is new
 
   /** The attach() result, connecting at most once at a time. */
   async browser() {
     if (this.#live?.browser.isConnected()) return this.#live;
     this.#live = null;
-    this.#active = null;
     this.#connecting ??= this.#connect().finally(() => {
       this.#connecting = null;
     });
@@ -68,70 +77,38 @@ export class Session {
       "attach()",
     );
     this.#controlPage = controlPage;
+    this.#evicted = live.tabs?.stats?.surfacesEvicted ?? 0;
     this.#live = live;
     return live;
   }
 
   /**
-   * The active tab, wrapped by controlPage; sticky across tool calls.
+   * The page a call should act on, wrapped by controlPage.
    *
-   * There is deliberately no newPage() here: this server never grows the
-   * browser. It drives the tab it drove last, else a tab this session already
-   * owns, else the most recently opened ordinary tab — and when there is no
-   * ordinary tab at all it says so instead of conjuring one.
+   * `as` binds (or re-binds) a name, `on` must already exist, and neither means
+   * the scratch page. The guard creates, recycles or hands back as needed; this
+   * method never opens or closes anything itself.
+   * @returns {Promise<{ page: object, surface: string | null, evicted: number }>}
    */
-  async page() {
+  async target({ as, on } = {}) {
     const live = await this.browser();
-    if (this.#active && !this.#active.raw.isClosed()) {
-      live.context.tabGuard?.touch(this.#active.raw);
-      return this.#active.page;
-    }
-    const pages = ordinaryPages(live.context);
-    const target = pages.find((page) => live.tabs?.owned.has(page)) ?? pages.at(-1);
-    if (!target) throw new Error("no ordinary tab is open: open one in Chrome and retry — this server never opens tabs itself");
-    return this.#adopt(target, live);
+    const guard = this.#guard(live);
+    // Trimmed because that is what the guard keys on; a blank name is the
+    // guard's error to raise, not a second opinion here.
+    const name = (as ?? on)?.trim() ?? null;
+    if (name && as === undefined) this.#assertNamed(guard, name);
+    const raw = await guard.surface(name ?? undefined);
+    return { page: this.#wrap(raw, live), surface: name, evicted: this.#freshEvictions(guard) };
   }
 
-  /** Point every later tool call at an existing tab. */
-  async selectTab(index) {
+  /** What is bound right now, and the reassurance that it needs no cleanup. */
+  async surfaces() {
     const live = await this.browser();
-    const pages = ordinaryPages(live.context);
-    const target = pages[index];
-    if (!target) throw new Error(`no tab at index ${index}: there are ${pages.length} (0-${Math.max(0, pages.length - 1)})`);
-    this.#adopt(target, live);
-    return { index, url: target.url() };
-  }
-
-  async closeTab(index) {
-    const live = await this.browser();
-    const pages = ordinaryPages(live.context);
-    const target = pages[index];
-    if (!target) throw new Error(`no tab at index ${index}: there are ${pages.length}`);
-    // Ownership: tabs that predate this session are the operator's. Closing one
-    // is exactly the surprise this tool must never deliver.
-    if (live.tabs?.protectedPages.has(target)) {
-      throw new Error(`tab ${index} was already open before this session started, so it is the operator's and will not be closed`);
-    }
-    // Crash invariant: closing the last ordinary tab exits Chrome and takes the
-    // automation bridge with it.
-    if (pages.length <= 1) throw new Error("refusing to close the last ordinary tab: Chrome would exit and take the connection with it");
-    const url = target.url();
-    if (this.#active?.raw === target) this.#active = null;
-    await target.close();
-    return { closed: index, url, remaining: pages.length - 1 };
-  }
-
-  async tabs() {
-    const live = await this.browser();
-    return Promise.all(
-      ordinaryPages(live.context).map(async (page, index) => ({
-        index,
-        active: page === this.#active?.raw,
-        ours: live.tabs ? live.tabs.owned.has(page) : null, // only "ours" tabs may be closed
-        url: page.url(),
-        title: await page.title().catch(() => ""), // a tab mid-navigation has no title yet
-      })),
-    );
+    const guard = this.#guard(live);
+    return {
+      surfaces: guard.surfaces(),
+      note: "Nothing here needs closing: named pages are held while you use them, unnamed ones are recycled, idle ones are reclaimed.",
+    };
   }
 
   async status() {
@@ -143,7 +120,6 @@ export class Session {
       mode: live.mode,
       capabilities: live.capabilities,
       tabGuard: live.tabs?.report() ?? { enforced: false, reason: "BC_TAB_GUARD=0" },
-      activeTab: this.#active ? this.#active.raw.url() : null,
       support,
     };
   }
@@ -154,10 +130,38 @@ export class Session {
     return { attached: false, reason: flatten(err), mode: DEFAULT_MODE, support: transportSupport() };
   }
 
-  #adopt(raw, live) {
-    const page = this.#controlPage(raw, live.capabilities);
-    this.#active = { raw, page };
-    live.context.tabGuard?.touch(raw);
+  /** Named pages are the guard's table; without a guard there is no table. */
+  #guard(live) {
+    if (!live.tabs) {
+      throw new Error("named pages need the tab guard, and BC_TAB_GUARD=0 turned it off: unset it and restart this server");
+    }
+    return live.tabs;
+  }
+
+  #assertNamed(guard, name) {
+    const names = guard.surfaces().map((surface) => surface.name);
+    if (names.includes(name)) return;
+    throw new Error(
+      names.length
+        ? `no page is named "${name}"; these are: ${names.join(", ")}`
+        : `no page is named "${name}"; none are named yet — navigate with as:"${name}" first`,
+    );
+  }
+
+  /** Evictions the agent has not been told about yet (losing a name must be visible). */
+  #freshEvictions(guard) {
+    const total = guard.stats?.surfacesEvicted ?? 0;
+    const fresh = total - this.#evicted;
+    this.#evicted = total;
+    return fresh > 0 ? fresh : 0;
+  }
+
+  #wrap(raw, live) {
+    let page = this.#wrapped.get(raw);
+    if (!page) {
+      page = this.#controlPage(raw, live.capabilities);
+      this.#wrapped.set(raw, page);
+    }
     return page;
   }
 
@@ -165,12 +169,14 @@ export class Session {
   async close() {
     const live = this.#live;
     this.#live = null;
-    this.#active = null;
     await live?.browser.close().catch(() => {}); // the browser may already be gone
   }
 }
 
 const text = (value) => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }] });
+
+/** `on` is the same parameter on every acting tool, so it is written once. */
+const ON = { type: "string", description: "Name of a page you kept with `as`; omit for the scratch page" };
 
 /**
  * Tool definitions. `run(args, session)` returns a value (wrapped as text) or a
@@ -180,8 +186,7 @@ const text = (value) => ({ content: [{ type: "text", text: typeof value === "str
 export const TOOLS = [
   {
     name: "browser_status",
-    description:
-      "Report the transport, its capabilities, and how many tabs this session is holding against its budget. Read it when a tab operation is refused.",
+    description: "Report the transport, its capabilities, and what the page guard is holding right now.",
     inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
     async run(_args, session) {
       try {
@@ -195,21 +200,29 @@ export const TOOLS = [
   },
   {
     name: "browser_navigate",
-    description:
-      "Navigate THIS session's active tab to a URL. There is no tool that opens a tab: this server reuses one tab for the whole session, because every extra tab is a Chrome renderer process in the operator's own browser. Switch with browser_tab_select, finish with browser_tab_close.",
+    description: "Navigate to a URL. Give `as` a name to keep that page and return to it later with `on`; omit both and you get the scratch page.",
     inputSchema: {
       type: "object",
       properties: {
         url: { type: "string", description: "Absolute URL" },
+        as: { type: "string", description: "Keep this page under this name" },
+        on: ON,
         waitUntil: { type: "string", enum: ["commit", "domcontentloaded", "load", "networkidle"] },
       },
       required: ["url"],
       additionalProperties: false,
     },
-    async run({ url, waitUntil }, session) {
-      const page = await session.page();
+    async run({ url, as, on, waitUntil }, session) {
+      const { page, surface, evicted } = await session.target({ as, on });
       const response = await page.goto(url, waitUntil ? { waitUntil } : {});
-      return { url: page.url(), title: await page.title(), status: response?.status() ?? null };
+      return {
+        surface,
+        url: page.url(),
+        title: await page.title(),
+        status: response?.status() ?? null,
+        // Only ever present when a name was actually lost, never as a reminder.
+        ...(evicted ? { surfacesEvicted: evicted } : {}),
+      };
     },
   },
   {
@@ -217,12 +230,12 @@ export const TOOLS = [
     description: "Click the first element matching a selector.",
     inputSchema: {
       type: "object",
-      properties: { selector: { type: "string", description: "CSS selector" } },
+      properties: { selector: { type: "string", description: "CSS selector" }, on: ON },
       required: ["selector"],
       additionalProperties: false,
     },
-    async run({ selector }, session) {
-      const page = await session.page();
+    async run({ selector, on }, session) {
+      const { page } = await session.target({ on });
       await page.click(selector);
       return `clicked ${selector}`;
     },
@@ -232,12 +245,12 @@ export const TOOLS = [
     description: "Append text to a field.",
     inputSchema: {
       type: "object",
-      properties: { selector: { type: "string" }, text: { type: "string" } },
+      properties: { selector: { type: "string" }, text: { type: "string" }, on: ON },
       required: ["selector", "text"],
       additionalProperties: false,
     },
-    async run({ selector, text: value }, session) {
-      const page = await session.page();
+    async run({ selector, text: value, on }, session) {
+      const { page } = await session.target({ on });
       await page.type(selector, value);
       return `typed into ${selector}`;
     },
@@ -247,12 +260,12 @@ export const TOOLS = [
     description: "Replace a field's value.",
     inputSchema: {
       type: "object",
-      properties: { selector: { type: "string" }, value: { type: "string" } },
+      properties: { selector: { type: "string" }, value: { type: "string" }, on: ON },
       required: ["selector", "value"],
       additionalProperties: false,
     },
-    async run({ selector, value }, session) {
-      const page = await session.page();
+    async run({ selector, value, on }, session) {
+      const { page } = await session.target({ on });
       await page.fill(selector, value);
       return `filled ${selector}`;
     },
@@ -262,12 +275,12 @@ export const TOOLS = [
     description: "Read visible text of the page or one element.",
     inputSchema: {
       type: "object",
-      properties: { selector: { type: "string", description: "Defaults to the whole document" } },
+      properties: { selector: { type: "string", description: "Defaults to the whole document" }, on: ON },
       required: [],
       additionalProperties: false,
     },
-    async run({ selector }, session) {
-      const page = await session.page();
+    async run({ selector, on }, session) {
+      const { page } = await session.target({ on });
       const value = await page.evaluate((sel) => {
         const el = sel ? document.querySelector(sel) : document.body;
         return el ? el.innerText : null;
@@ -279,15 +292,15 @@ export const TOOLS = [
   },
   {
     name: "browser_evaluate",
-    description: "Evaluate a JavaScript expression in the active tab.",
+    description: "Evaluate a JavaScript expression in a page.",
     inputSchema: {
       type: "object",
-      properties: { expression: { type: "string", description: "JavaScript expression or IIFE" } },
+      properties: { expression: { type: "string", description: "JavaScript expression or IIFE" }, on: ON },
       required: ["expression"],
       additionalProperties: false,
     },
-    async run({ expression }, session) {
-      const page = await session.page();
+    async run({ expression, on }, session) {
+      const { page } = await session.target({ on });
       const value = await page.evaluate(expression);
       return value === undefined ? "undefined" : value;
     },
@@ -297,46 +310,15 @@ export const TOOLS = [
     description: "Capture a PNG of the viewport or one element.",
     inputSchema: {
       type: "object",
-      properties: { selector: { type: "string", description: "Defaults to the viewport" } },
+      properties: { selector: { type: "string", description: "Defaults to the viewport" }, on: ON },
       required: [],
       additionalProperties: false,
     },
-    async run({ selector }, session) {
-      const page = await session.page();
+    async run({ selector, on }, session) {
+      const { page } = await session.target({ on });
       const buffer = selector ? await page.locator(selector).first().screenshot({ type: "png" }) : await page.screenshot();
       return { content: [{ type: "image", data: buffer.toString("base64"), mimeType: "image/png" }] };
     },
-  },
-  {
-    name: "browser_tabs",
-    description:
-      "List the tabs this session can see, with their index and whether this session owns them. Tabs the operator opened are theirs: read them, never close them.",
-    inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
-    run: (_args, session) => session.tabs(),
-  },
-  {
-    name: "browser_tab_select",
-    description:
-      "Make an existing tab the active one for the calls that follow. This is how you move between pages; the session will not open a second tab for you.",
-    inputSchema: {
-      type: "object",
-      properties: { index: { type: "integer", description: "Index from browser_tabs" } },
-      required: ["index"],
-      additionalProperties: false,
-    },
-    run: ({ index }, session) => session.selectTab(index),
-  },
-  {
-    name: "browser_tab_close",
-    description:
-      "Close a tab this session opened, as soon as you are done with it. Idle tabs are blanked and reclaimed automatically, but closing promptly is what keeps the operator's Chrome small.",
-    inputSchema: {
-      type: "object",
-      properties: { index: { type: "integer" } },
-      required: ["index"],
-      additionalProperties: false,
-    },
-    run: ({ index }, session) => session.closeTab(index),
   },
   {
     name: "browser_wait_for",
@@ -347,15 +329,22 @@ export const TOOLS = [
         selector: { type: "string" },
         state: { type: "string", enum: ["attached", "detached", "visible", "hidden"] },
         timeoutMs: { type: "integer" },
+        on: ON,
       },
       required: ["selector"],
       additionalProperties: false,
     },
-    async run({ selector, state = "visible", timeoutMs }, session) {
-      const page = await session.page();
+    async run({ selector, state = "visible", timeoutMs, on }, session) {
+      const { page } = await session.target({ on });
       await page.locator(selector).first().waitFor({ state, timeout: timeoutMs ?? WAIT_TIMEOUT_MS() });
       return `${selector} is ${state}`;
     },
+  },
+  {
+    name: "browser_surfaces",
+    description: "List the pages you have named, with their URL and how long each has been idle.",
+    inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
+    run: (_args, session) => session.surfaces(),
   },
 ];
 

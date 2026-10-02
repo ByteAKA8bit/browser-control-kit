@@ -21,7 +21,7 @@ packages/browser-control/   怎么控制浏览器（与应用无关）
   src/transfer.mjs             上传 / 拖放 / 拖拽（不需要 CDP）
   src/fixtures.mjs             零依赖 xlsx / csv / png 生成
   src/pool.mjs                 并行：多标签任务池（含扩展通道的安全约束）
-  src/tab-guard.mjs            标签预算:上限、LRU 淘汰、闲置回收
+  src/tab-guard.mjs            TabGuard:具名页面、先复用、量出来的闲置窗口、回收
   src/cdp-shim.mjs             /json/* 重建 + 单连接 CDP 代理（仅 cdp 通道）
   src/ws-server.mjs            给 shim 用的手写 RFC 6455 服务端
   test/                        node:test:无浏览器套件 + 真实浏览器套件
@@ -142,7 +142,10 @@ await browser.close();   // 自己的标签 + relay 的桥接页,一起还回去
 | **通道上限** | 唯一一个硬数字,而且不是审美问题:扩展桥超过 3 个附着标签就断连。想自己定死用 `BC_TAB_BUDGET` | `BC_MAX_TABS_EXTENSION`、`BC_TAB_BUDGET` |
 | **归属** | `attach()` 之前就存在的标签属于操作者,**永不关闭、不导航、不计数**;`window.open`/`target=_blank` 弹窗算我们的 | — |
 | **占用** | `TabPool` 的标签 `hold()` 住,不会被复用、淘汰或回收 | `BC_TAB_EVICT=0` 改为只报错不淘汰 |
+| **具名页面（surface）** | `guard.surface("docs")` 把一个名字绑到一个页面:同名总是返回同一个页面,绑定期间既不会被复用也不会被回收。`guard.surface()` 是草稿页,仍按原来的策略激进复用。`guard.release(name)` 把它变回普通的自有标签;`guard.surfaces()` 列出 `{ name, url, idleMs, blanked }` | — |
 | **不留尾巴** | `browser.close()` 连 relay 的 `connect.html` 一起关;调用方忘了收尾,`beforeExit`/`SIGINT`/`SIGTERM` 也会还 | `BC_KEEP_BRIDGE_TAB=1`、`BC_TAB_GUARD=0`、`attach({ guard: false })` |
+
+两个问题由两套机制分别回答,而且都成立:量出来的节拍回答"这个草稿标签闲了吗",名字回答"这个页面还要不要"。当通道上限已满、而且**每个**标签都是绑定的具名页面时,**最久未用**的那个会被释放、它的标签被复用——不报错,而是记进 `report().surfacesEvicted` 并在工具输出里说出来:丢掉一个具名页面必须是可见的。
 
 实测(真实 Chrome):连续 10 次 `newPage()` → **新建 3 个、复用 7 次、淘汰 0 个**,`close()` 后标签数回到原样;连跑三轮完整测试,标签数一个不多一个不少。一条值得记下的弯路:早期版本按"系统剩余内存"做准入,既无法跨平台测准(macOS 上 16 GB 健康机器报 1%,实际可用 24%),原理上也站不住——**拒绝一个标签省不下一个字节,只会让活干不成**。复用和回收才是真正起作用的两件事。
 
@@ -166,17 +169,19 @@ Agent 总爱把这个仓库现场包成 MCP,然后连接断断续续、标签越
 
 | 特性 | 怎么保证的 |
 | --- | --- |
-| **开不出新标签** | 根本没有"开标签"这个工具。`browser_navigate` 复用当前标签,标签 API 只有 列出 / 切换 / 关闭,并且 `TabGuard` 预算为 2 |
+| **开不出新标签** | Agent 的词汇里根本没有"标签"。它说的是**具名页面**——`browser_navigate {url, as: "docs"}` 留住一个,`{on: "docs"}` 回到它,两个都不给就用草稿页——生命周期归服务端管。没有任何工具能开或关一个标签,所以 agent 漏不了标签 |
 | **连接稳定** | 每进程一次 `attach()`,懒创建、断了自动重建,并发首调共享同一次 attach;只有 stdin EOF 才退出 |
 | **stdout 干净** | 只跑 JSON-RPC,日志全走 stderr,写入遵守背压——这正是"MCP 老断"的常见原因 |
 | **轻** | `browser-control` 与 playwright 都是首次用到才懒加载:实测空载 RSS 40 MB,比裸 Node 只多约 3 MB |
 | **失败是结果不是崩溃** | 工具失败返回 `isError: true` + 文本,不抛 JSON-RPC 错误、不退出 |
 
-12 个工具,每个一句话描述:`browser_status`、`browser_navigate`、`browser_click`、`browser_type`、`browser_fill`、`browser_text`、`browser_evaluate`、`browser_screenshot`、`browser_tabs`、`browser_tab_select`、`browser_tab_close`、`browser_wait_for`。详见 [`packages/mcp-server/README.md`](packages/mcp-server/README.md)。
+任何需要 agent 配合的规则都是一个失效点,所以我们不是去管住标签,而是把标签从它的词汇里拿掉——和 shim(一条被批准的连接,所有客户端都从它代理)、以及"先复用"(是否开标签不再由调用方决定)是同一个动作。剩下的只有意图:一个名字。到了通道上限、每个标签都是具名页面时,最久未用的那个被释放、标签被复用,工具会说出丢掉的是哪个名字——是报告,不是拒绝。
+
+10 个工具,每个一句话描述:`browser_status`、`browser_navigate`(`{url, as?, waitUntil?}`)、`browser_click`、`browser_type`、`browser_fill`、`browser_text`、`browser_evaluate`、`browser_screenshot`、`browser_wait_for`(都可带可选的 `on`),以及 `browser_surfaces`——列出当前的具名页面,人和 agent 都看得懂。`on` 指向不存在的名字时返回工具错误,并列出存在的名字。详见 [`packages/mcp-server/README.md`](packages/mcp-server/README.md)。
 
 ```bash
 npm run mcp            # 手动跑
-node --test packages/mcp-server/test/protocol.test.mjs   # 12 条协议用例,不需要浏览器
+node --test packages/mcp-server/test/protocol.test.mjs   # 协议用例,不需要浏览器
 ```
 
 ## 本地 CI（git hook + GitHub Actions 的 offline 层）

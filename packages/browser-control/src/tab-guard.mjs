@@ -28,6 +28,15 @@
 //     windows are measured, not declared (see "cadence" below).
 //   * HOLDS — TabPool (and anyone else with a long-lived tab) calls hold() so a
 //     working tab is never evicted or reaped out from under it.
+//   * NAMES — the measured cadence answers "is this tab still wanted?" for
+//     scratch pages, where the only evidence is how recently someone touched
+//     them. For a long-lived page that question has a better answer than any
+//     measurement: the caller said so. surface("docs") binds a name to a tab
+//     and that binding IS the wanting — a named surface is pinned, never
+//     recycled and never reaped, until release("docs") or until the ceiling
+//     forces the least-recently-used name out (recorded as surfacesEvicted,
+//     because losing a named surface must be visible). Naming is also why the
+//     agent never handles a tab: it asks for a name, the guard owns lifetimes.
 //
 // Constraints inherited from src/pool.mjs (learned by killing Chrome 152):
 // closing is serialised with a settle delay, and the browser is never left with
@@ -128,9 +137,11 @@ export class TabGuard {
      * it from a URL match, and it leaked one tab per run.
      */
     this.bridgePages = new Set(context.pages().filter((p) => p.url().startsWith("chrome-extension://")));
-    /** page -> { origin, bornAt, lastUsed, holds } */
+    /** page -> { origin, bornAt, lastUsed, holds, name } */
     this.owned = new Map();
-    this.stats = { created: 0, recycled: 0, spawned: 0, evicted: 0, reaped: 0, blanked: 0, refused: 0, closed: 0, overflow: 0 };
+    /** name -> page. One name, one tab; the binding is a hold (see the header). */
+    this.named = new Map();
+    this.stats = { created: 0, recycled: 0, spawned: 0, evicted: 0, reaped: 0, blanked: 0, refused: 0, closed: 0, overflow: 0, surfacesEvicted: 0 };
     this._closeChain = Promise.resolve();
     this._timer = null;
     this._creating = 0; // tabs opened through newPage() arrive as "page" events too
@@ -166,7 +177,13 @@ export class TabGuard {
     const now = Date.now();
     this.owned.set(page, { origin, bornAt: now, lastUsed: now, holds: 0 });
     this.stats[origin === "created" ? "created" : "spawned"] += 1;
-    page.on?.("close", () => this.owned.delete(page));
+    // A tab can go away under us (operator closes it, renderer dies). The name
+    // must not survive the page it meant, or the next surface(name) hands back
+    // a corpse.
+    page.on?.("close", () => {
+      this.#unbind(page);
+      this.owned.delete(page);
+    });
     // Activity signals, cheap ones: a tab that navigates or loads is in use.
     page.on?.("load", () => this.touch(page));
     page.on?.("framenavigated", () => this.touch(page));
@@ -233,13 +250,7 @@ export class TabGuard {
    */
   async newPage() {
     const recycled = this.#idlest();
-    if (recycled) {
-      await serialiseNavigation(() => recycled.goto("about:blank", { waitUntil: "commit" })).catch(() => {});
-      this.stats.recycled += 1;
-      const entry = this.owned.get(recycled);
-      if (entry) entry.blanked = true;
-      return this.touch(recycled);
-    }
+    if (recycled) return this.#recycle(recycled);
     await this.#admit();
     this._creating += 1;
     try {
@@ -249,6 +260,120 @@ export class TabGuard {
     } finally {
       this._creating -= 1;
     }
+  }
+
+  /** Hand a tab we already own back to the caller, emptied first. */
+  async #recycle(page) {
+    await serialiseNavigation(() => page.goto("about:blank", { waitUntil: "commit" })).catch(() => {});
+    this.stats.recycled += 1;
+    const entry = this.owned.get(page);
+    if (entry) entry.blanked = true;
+    return this.touch(page);
+  }
+
+  /**
+   * The page bound to `name`, creating or recycling one if needed.
+   *
+   * This is the whole tab-handle problem turned inside out: the caller says
+   * what a tab is FOR, not which tab it is, so there is no handle to leak and
+   * no close() to forget. A bound name is a hold, so a named surface is never
+   * recycled and never reaped while it is bound — the name is the evidence the
+   * cadence cannot supply. Called with no name this is exactly newPage(): the
+   * scratch surface, governed by the measured windows like everything else.
+   * @param {string} [name] non-empty surface name, or nothing for scratch
+   */
+  async surface(name) {
+    if (name === undefined || name === null) return this.newPage();
+    const key = typeof name === "string" ? name.trim() : "";
+    if (!key) throw new Error("surface(name) wants a non-empty string name (or no argument at all for the scratch surface).");
+    const bound = this.named.get(key);
+    // Same name, same page — even if it was blanked while nobody was looking.
+    if (bound && !bound.isClosed?.() && this.owned.has(bound)) return this.touch(bound);
+    if (bound) this.release(key); // the tab went away under us
+    const evicted = this.#surfaceToEvict();
+    const page = evicted ? await this.#recycle(evicted) : await this.newPage();
+    this.named.set(key, page);
+    const entry = this.owned.get(page);
+    if (entry) entry.name = key;
+    this.hold(page);
+    return this.touch(page);
+  }
+
+  /**
+   * Drop a binding. The tab stays open and becomes an ordinary owned tab again:
+   * recyclable, reapable, no longer pinned.
+   * @returns {boolean} whether the name was bound
+   */
+  release(name) {
+    const key = typeof name === "string" ? name.trim() : "";
+    const page = key ? this.named.get(key) : undefined;
+    if (!page) return false;
+    this.named.delete(key);
+    const entry = this.owned.get(page);
+    if (entry && entry.name === key) delete entry.name;
+    this.unhold(page);
+    return true;
+  }
+
+  /** What is bound right now, for humans and for the agent to read back. */
+  surfaces() {
+    const now = Date.now();
+    const out = [];
+    for (const [name, page] of this.named) {
+      const entry = this.owned.get(page);
+      if (!entry) continue;
+      out.push({ name, url: page.url?.() ?? "", idleMs: now - entry.lastUsed, blanked: isBlank(page) });
+    }
+    return out;
+  }
+
+  /** Forget whatever name pointed at this page (the page is gone or taken). */
+  #unbind(page) {
+    const entry = this.owned.get(page);
+    const name = entry?.name;
+    if (name !== undefined && this.named.get(name) === page) {
+      this.named.delete(name);
+      return name;
+    }
+    for (const [key, bound] of this.named) {
+      if (bound === page) {
+        this.named.delete(key);
+        return key;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * The ceiling is full and every tab we own is a bound surface.
+   *
+   * Refusing here would be the wrong answer: the caller asked for a name, not
+   * for a tab, and "no" is not something a naming API should ever say. So the
+   * least-recently-used name loses its binding and its tab is handed to the new
+   * one — no close, no new renderer. That is a real loss for whoever held the
+   * old name, so it is counted (surfacesEvicted) and shown in report().
+   */
+  #surfaceToEvict() {
+    if (this.owned.size < this.ceiling) return null;
+    if (this.#idlest() || this.#lru()) return null; // an unbound tab can pay instead
+    let best = null;
+    let bestAt = Infinity;
+    for (const [, page] of this.named) {
+      const entry = this.owned.get(page);
+      // holds > 1 means somebody else (TabPool) is working in this tab too.
+      if (!entry || entry.holds > 1 || page.isClosed?.()) continue;
+      if (entry.lastUsed < bestAt) {
+        best = page;
+        bestAt = entry.lastUsed;
+      }
+    }
+    if (!best) return null;
+    const name = this.#unbind(best);
+    this.unhold(best);
+    const entry = this.owned.get(best);
+    if (entry && entry.name === name) delete entry.name;
+    this.stats.surfacesEvicted += 1;
+    return best;
   }
 
   /** An unheld tab nobody has touched for a while: the natural one to reuse. */
@@ -320,6 +445,7 @@ export class TabGuard {
       url: page.url?.().slice(0, 70) ?? "",
       origin: entry.origin,
       held: entry.holds > 0,
+      name: entry.name ?? null,
       idleMs: Date.now() - entry.lastUsed,
     }));
     return {
@@ -333,6 +459,7 @@ export class TabGuard {
       idleAfterMs: this.idleAfter(),
       evict: this.evict,
       ...this.stats,
+      surfaces: this.surfaces(),
       tabs,
     };
   }

@@ -21,7 +21,7 @@ packages/browser-control/   how to control the browser (app-agnostic)
   src/transfer.mjs             upload / drop / drag (no CDP required)
   src/fixtures.mjs             zero-dependency xlsx / csv / png generation
   src/pool.mjs                 TabPool: parallel work across tabs, with the extension-transport limits
-  src/tab-guard.mjs            TabGuard: tab budget, LRU eviction, idle reaping
+  src/tab-guard.mjs            TabGuard: named surfaces, recycle-first, measured idle windows, reaping
   src/cdp-shim.mjs             /json/* rebuild + single-socket CDP proxy (cdp transport only)
   src/ws-server.mjs            hand-rolled RFC 6455 server used by the shim
   test/                        node:test suites — browserless + real-browser
@@ -57,7 +57,7 @@ npm i && node scripts/install-hooks.mjs   # Node >= 22. Not Bun: its WebSocket c
 # one-time: install the Playwright Extension, store the token from its status page
 mkdir -p ~/.config/browser-control && pbpaste > ~/.config/browser-control/token && chmod 600 $_
 
-npm run test:offline   # tab governance + websocket codec, 21 cases, no browser needed
+npm run test:offline   # tab governance, websocket codec, shim, MCP protocol — 69 cases, no browser needed
 npm run test:unit      # DOM input, 16 cases   (needs Chrome + token)
 npm run test:pool      # parallel pool, 8 cases (needs Chrome + token)
 npm test               # all four suites, --test-concurrency=1
@@ -136,7 +136,15 @@ await browser.close();   // hands back our tabs and the relay's, then disconnect
 | **Transport ceiling** | The one hard number, and not a style choice: the extension bridge drops the connection past 3 attached tabs. Pin your own with `BC_TAB_BUDGET` | `BC_MAX_TABS_EXTENSION`, `BC_TAB_BUDGET` |
 | **Ownership** | Tabs that existed before `attach()` belong to the operator and are **never closed, navigated or counted**; `window.open` / `target=_blank` popups are adopted as ours | — |
 | **Holds** | `TabPool` tabs call `hold()` and are immune to recycling, eviction and reaping | `BC_TAB_EVICT=0` to error instead of evicting |
+| **Named surfaces** | `guard.surface("docs")` binds a name to a page: the same name always returns the same page, and a bound surface is never recycled or reaped. `guard.surface()` is the scratch page, recycled as aggressively as before. `guard.release(name)` turns it back into an ordinary owned tab; `guard.surfaces()` lists `{ name, url, idleMs, blanked }` | — |
 | **Nothing is left behind** | `browser.close()` returns our tabs *and* the relay's `connect.html`; a process that forgets reclaims on `beforeExit`/`SIGINT`/`SIGTERM` | `BC_KEEP_BRIDGE_TAB=1`, `BC_TAB_GUARD=0`, `attach({ guard: false })` |
+
+The two questions are answered by different mechanisms and both stay true: the measured
+cadence answers *"is this scratch tab idle?"*, and a name answers *"is this page still
+wanted?"*. When the transport ceiling is reached and **every** tab is a bound surface,
+the least-recently-used surface is released and its tab reused — never an error, and
+`report().surfacesEvicted` plus the tool output say so, because losing a named page has
+to be visible.
 
 Measured against the real browser: ten `newPage()` calls in a row produced **3 tabs created, 7 recycled, 0 evicted**, and the browser was back to its original tab count after `close()`; three consecutive full test runs leave the tab count exactly where it started. A dead end worth recording: an earlier version gated admission on free system memory, which is unmeasurable portably (macOS reported 1% free on a healthy 16 GB machine against 24% actually available) and wrong in principle — refusing a tab frees nothing, it only breaks the caller. Reuse and reclaiming do the work instead.
 
@@ -160,17 +168,24 @@ Agents keep wrapping this repo in ad-hoc MCP servers that drop connections and o
 
 | Property | How it is enforced |
 | --- | --- |
-| **No tab sprawl** | There is no tool that opens a tab. `browser_navigate` reuses the active tab; the whole tab API is list / select / close, and `TabGuard` runs with budget 2 |
+| **No tab sprawl** | The agent has no word for "tab". It names a *surface* — `browser_navigate {url, as: "docs"}` keeps one, `{on: "docs"}` returns to it, omitting both uses the scratch surface — and the server owns the lifetime. There is no tool that opens or closes a tab, so an agent cannot leak one |
 | **Stable connection** | One `attach()` per process, created lazily and re-created if the browser goes away; concurrent first calls share one in-flight attach; stdin EOF is the only shutdown path |
 | **Clean stdout** | JSON-RPC only, logs go to stderr, writes respect backpressure — the usual cause of "the MCP server keeps disconnecting" |
 | **Light** | `browser-control` and playwright are imported lazily on the first browser call: idle RSS measured at 40 MB, ~3 MB over a bare Node process |
 | **Failures are results** | A failing tool returns `isError: true` with text, never a JSON-RPC error and never a crash |
 
-Twelve tools, one terse line each: `browser_status`, `browser_navigate`, `browser_click`, `browser_type`, `browser_fill`, `browser_text`, `browser_evaluate`, `browser_screenshot`, `browser_tabs`, `browser_tab_select`, `browser_tab_close`, `browser_wait_for`. See [`packages/mcp-server/README.md`](packages/mcp-server/README.md).
+Every rule that needs the agent's cooperation is a failure point, so the tab is removed
+from its vocabulary instead of policed — the same move as the shim (one approved
+connection, every client proxied over it) and recycle-first (the caller no longer
+decides whether a tab is opened). What is left is intent: a name. At the transport
+ceiling, when every tab is a bound surface, the least-recently-used one is released and
+its tab reused, and the tool says which name was lost — reported, not refused.
+
+Ten tools, one terse line each: `browser_status`, `browser_navigate` (`{url, as?, waitUntil?}`), `browser_click`, `browser_type`, `browser_fill`, `browser_text`, `browser_evaluate`, `browser_screenshot`, `browser_wait_for` (each taking an optional `on`), and `browser_surfaces` — which lists the named surfaces for humans and agents alike. An `on` naming a surface that does not exist is a tool error listing the names that do. See [`packages/mcp-server/README.md`](packages/mcp-server/README.md).
 
 ```bash
 npm run mcp            # run it by hand
-node --test packages/mcp-server/test/protocol.test.mjs   # 12 protocol cases, no browser needed
+node --test packages/mcp-server/test/protocol.test.mjs   # protocol cases, no browser needed
 ```
 
 ## Guards derived from crashes

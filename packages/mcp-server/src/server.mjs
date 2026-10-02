@@ -8,7 +8,7 @@
 // batching. The server never exits because a page threw; it exits on stdin EOF
 // or an explicit shutdown, and nothing else.
 import { createStdioTransport, log } from "./transport.mjs";
-import { InvalidParams, Session, callTool, toolSpecs } from "./tools.mjs";
+import { INSTRUCTIONS, InvalidParams, Session, callTool, toolSpecs } from "./tools.mjs";
 
 // Keep in sync with package.json.
 const SERVER_INFO = { name: "browser-control-mcp", version: "0.1.0" };
@@ -48,10 +48,13 @@ export function startServer({ input, output } = {}) {
   };
 
   const methods = {
+    // instructions is the one place the addressing model is explained: once,
+    // before the first call, instead of a reminder in every tool description.
     initialize: (params) => ({
       protocolVersion: negotiateProtocol(params.protocolVersion),
       capabilities: { tools: {} },
       serverInfo: SERVER_INFO,
+      instructions: INSTRUCTIONS,
     }),
     ping: () => ({}),
     "tools/list": () => ({ tools: toolSpecs() }),

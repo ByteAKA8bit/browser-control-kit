@@ -355,3 +355,155 @@ describe("guardContext", () => {
     guard.dispose();
   });
 });
+
+// Names are the agent-facing lifetime: the caller says what a tab is FOR and
+// never touches a handle, so these pin the promises the MCP tools lean on.
+describe("named surfaces", () => {
+  it("gives the same page back for the same name", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 3 });
+
+    const first = await guard.surface("docs");
+    await first.goto("https://docs.example/guide");
+    age(guard, first, 10_000);
+    const again = await guard.surface("docs");
+
+    assert.equal(again, first, "a name means one tab");
+    assert.equal(guard.owned.size, 1, "re-requesting a name opens nothing");
+    assert.ok(guard.owned.get(first).lastUsed > Date.now() - 1_000, "asking for it counts as using it");
+    assert.equal(first.url(), "https://docs.example/guide", "and it is not blanked on the way back");
+    guard.dispose();
+  });
+
+  it("binds a new name to an idle tab we already own instead of opening one", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 4, recycleMs: 50 });
+
+    const spare = await guard.newPage();
+    age(guard, spare, 10_000);
+    const bound = await guard.surface("docs");
+
+    assert.equal(bound, spare, "recycling comes before opening, named or not");
+    assert.equal(guard.owned.size, 1);
+    assert.equal(guard.stats.recycled, 1);
+    assert.equal(guard.stats.created, 1, "exactly one tab was ever opened");
+    guard.dispose();
+  });
+
+  it("the scratch surface is still just newPage()", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 4, recycleMs: 50 });
+
+    const first = await guard.surface();
+    age(guard, first, 10_000);
+    const second = await guard.surface(null);
+
+    assert.equal(second, first, "unnamed pages are recycled as aggressively as ever");
+    assert.deepEqual(guard.surfaces(), [], "and nothing is bound by using it");
+    guard.dispose();
+  });
+
+  it("survives a reap that takes the unbound tab, and is reapable again once released", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 3, idleMs: 50, blankMs: 10 });
+
+    const kept = await guard.surface("docs");
+    await kept.goto("https://docs.example/guide");
+    const scratch = await guard.newPage();
+    age(guard, kept, 10_000);
+    age(guard, scratch, 10_000);
+
+    assert.equal((await guard.reap()).reaped, 1, "only the unbound tab goes");
+    assert.equal(scratch._closed, true);
+    assert.equal(kept._closed, false, "a named surface is not a leak, it is a request");
+    assert.equal(kept.url(), "https://docs.example/guide", "nor is it blanked under the name");
+
+    assert.equal(guard.release("docs"), true);
+    assert.equal(guard.release("docs"), false, "releasing twice is not a thing");
+    age(guard, kept, 10_000);
+    assert.equal((await guard.reap()).reaped, 1);
+    assert.equal(kept._closed, true, "released means ordinary again");
+    guard.dispose();
+  });
+
+  it("at the ceiling with everything bound it releases the least-recently-used name instead of refusing", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 2 });
+
+    const one = await guard.surface("one");
+    const two = await guard.surface("two");
+    age(guard, one, 10_000);
+    age(guard, two, 1_000);
+
+    const three = await guard.surface("three");
+    assert.equal(three, one, "the oldest name's tab is the one handed over");
+    assert.equal(one._closed, false, "reused, not closed: no new renderer either");
+    assert.equal(guard.owned.size, 2, "the ceiling holds");
+    assert.equal(guard.stats.surfacesEvicted, 1, "losing a name must be visible");
+    assert.deepEqual(
+      guard.surfaces().map((s) => s.name),
+      ["two", "three"],
+    );
+    assert.equal(guard.report().surfacesEvicted, 1);
+
+    const back = await guard.surface("one");
+    assert.notEqual(back, three, "the old name is genuinely gone, not aliased");
+    assert.equal(guard.stats.surfacesEvicted, 2);
+    guard.dispose();
+  });
+
+  it("drops the binding when the tab closes underneath it", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 3 });
+
+    const page = await guard.surface("docs");
+    await page.close(); // the operator closed it
+
+    assert.deepEqual(guard.surfaces(), []);
+    assert.equal(guard.release("docs"), false, "a dead page leaves no binding behind");
+    const fresh = await guard.surface("docs");
+    assert.notEqual(fresh, page, "asking again gets a live tab, not a corpse");
+    assert.equal(fresh._closed, false);
+    guard.dispose();
+  });
+
+  it("reports what is bound, for humans and for the agent", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 3 });
+
+    const docs = await guard.surface("docs");
+    await docs.goto("https://docs.example/guide");
+    const parked = await guard.surface("parked");
+    age(guard, docs, 5_000);
+
+    const view = guard.surfaces();
+    assert.deepEqual(
+      view.map((s) => s.name),
+      ["docs", "parked"],
+    );
+    assert.deepEqual(Object.keys(view[0]).sort(), ["blanked", "idleMs", "name", "url"]);
+    assert.equal(view[0].url, "https://docs.example/guide");
+    assert.equal(view[0].blanked, false);
+    assert.ok(view[0].idleMs >= 5_000);
+    assert.equal(view[1].blanked, true, "a fresh tab is still on about:blank");
+
+    const report = guard.report();
+    assert.deepEqual(
+      report.surfaces.map((s) => [s.name, s.url, s.blanked]),
+      [
+        ["docs", "https://docs.example/guide", false],
+        ["parked", "about:blank", true],
+      ],
+    );
+    assert.equal(report.tabs.find((t) => t.name === "docs").held, true, "a bound tab reads as held");
+    guard.dispose();
+  });
+
+  it("refuses an empty name rather than inventing one", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 3 });
+    await assert.rejects(() => guard.surface("   "), /non-empty string name/);
+    assert.equal(guard.owned.size, 0, "a bad name opens nothing");
+    guard.dispose();
+  });
+});

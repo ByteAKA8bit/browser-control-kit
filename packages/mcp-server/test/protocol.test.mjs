@@ -114,6 +114,12 @@ describe("stdio JSON-RPC", () => {
     assert.deepEqual(result.capabilities, { tools: {} });
     assert.equal(result.serverInfo.name, "browser-control-mcp");
     assert.ok(result.serverInfo.version, "serverInfo carries a version");
+    // The addressing model is stated once, here, so no tool description has to
+    // nag about it. One paragraph: a client renders it as a preamble.
+    assert.ok(result.instructions?.length > 80, "initialize carries usage instructions");
+    assert.ok(!result.instructions.includes("\n"), "instructions stay one paragraph");
+    assert.match(result.instructions, /\bas\b/);
+    assert.match(result.instructions, /\bon\b/);
   });
 
   it("falls back to its own version when the client asks for an unknown one", async () => {
@@ -138,9 +144,7 @@ describe("stdio JSON-RPC", () => {
       "browser_navigate",
       "browser_screenshot",
       "browser_status",
-      "browser_tab_close",
-      "browser_tab_select",
-      "browser_tabs",
+      "browser_surfaces",
       "browser_text",
       "browser_type",
       "browser_wait_for",
@@ -148,8 +152,7 @@ describe("stdio JSON-RPC", () => {
     for (const tool of result.tools) {
       assert.match(tool.description, /^\S.*\.$/, `${tool.name} needs a description that reads as a sentence`);
       assert.ok(!tool.description.includes("\n"), `${tool.name} description must be one line`);
-      // Long enough to steer behaviour, short enough to stay in a tool list: the
-      // tab tools have to explain why they will not open a tab for you.
+      // Long enough to steer behaviour, short enough to stay in a tool list.
       assert.ok(tool.description.length <= 320, `${tool.name} description must stay readable (${tool.description.length} chars)`);
       assert.equal(tool.inputSchema.type, "object", `${tool.name} schema`);
       assert.equal(typeof tool.inputSchema.properties, "object");
@@ -158,10 +161,32 @@ describe("stdio JSON-RPC", () => {
         assert.ok(tool.inputSchema.properties[key], `${tool.name} requires "${key}" but does not declare it`);
       }
     }
-    assert.ok(
-      !result.tools.some((tool) => /new_tab|open_tab|tab_new/.test(tool.name)),
-      "no tool may let an agent grow the tab count",
-    );
+  });
+
+  it("offers no vocabulary for tabs at all", async () => {
+    const { result } = await client.request("tools/list", {});
+    for (const tool of result.tools) {
+      // Not "no tool that opens one" — no tool that *names* one. A handle the
+      // agent can hold is a handle the agent can leak.
+      assert.ok(!/tab/i.test(tool.name), `${tool.name} speaks of tabs`);
+      assert.ok(!/\b(open|close|select|new)\b/i.test(tool.name), `${tool.name} sounds like lifetime management`);
+      const params = Object.keys(tool.inputSchema.properties);
+      assert.ok(!params.includes("index"), `${tool.name} takes a tab index`);
+      // Pages are addressed by name only: `as` to keep one, `on` to return.
+      for (const key of params) {
+        assert.ok(!/tab|index|handle/i.test(key), `${tool.name}.${key} is a handle`);
+        if (key === "as" || key === "on") assert.equal(tool.inputSchema.properties[key].type, "string");
+      }
+    }
+  });
+
+  it("has forgotten the handle-based tab tools entirely", async () => {
+    for (const gone of ["browser_tabs", "browser_tab_select", "browser_tab_close"]) {
+      const { error, result } = await client.request("tools/call", { name: gone, arguments: {} });
+      assert.equal(result, undefined, `${gone} must not run`);
+      assert.equal(error.code, -32602, `${gone} is not a tool any more`);
+      assert.match(error.message, /unknown tool/);
+    }
   });
 
   it("answers unknown methods with -32601 instead of dying", async () => {
@@ -181,6 +206,28 @@ describe("stdio JSON-RPC", () => {
     const { error } = await client.request("tools/call", { name: "browser_navigate", arguments: {} });
     assert.equal(error.code, -32602);
     assert.match(error.message, /url/);
+  });
+
+  it("takes a page name on every acting tool and rejects a non-string one", async () => {
+    const bad = await client.request("tools/call", { name: "browser_click", arguments: { selector: "#go", on: 2 } });
+    assert.equal(bad.error.code, -32602, "a page is named, so an index is a type error");
+    assert.match(bad.error.message, /on must be a string/);
+    // `as` and `on` are real parameters, not silently ignored extras: with no
+    // browser this gets as far as attach() and fails there instead.
+    const kept = await client.request("tools/call", {
+      name: "browser_navigate",
+      arguments: { url: "https://example.com", as: "docs" },
+    });
+    assert.equal(kept.error, undefined);
+    assert.equal(kept.result.isError, true);
+    assert.match(kept.result.content[0].text, /browser_navigate failed/);
+  });
+
+  it("reports surfaces as a tool error when there is no browser", async () => {
+    const { error, result } = await client.request("tools/call", { name: "browser_surfaces", arguments: {} });
+    assert.equal(error, undefined);
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /browser_surfaces failed/);
   });
 
   it("handles two messages arriving in one chunk", async () => {

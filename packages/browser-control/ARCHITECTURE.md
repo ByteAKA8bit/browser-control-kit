@@ -134,7 +134,13 @@ per connection and refuses to run with no ordinary tab present.
 never closed, forty renderers later in the browser the operator is personally using.
 `attach()` returns a guarded context (`newPage()` routed through the guard,
 `context.tabGuard` exposed) and a guarded browser whose `close()` hands the tabs back
-first. Rules, each opt-outable and none silent (`BC_TAB_GUARD=0` disables the lot):
+first. Rules, each opt-outable and none silent (`BC_TAB_GUARD=0` disables the lot).
+The deeper move: every rule that needs the caller's cooperation is a failure point, so
+the tab stops being something a caller can hold. `surface(name)` asks for a page *by
+intent* and the guard owns the lifetime — the same shape as recycle-first (the caller no
+longer decides whether a tab opens) and as the shim's single approved connection. The
+measured cadence answers "is this scratch tab idle?"; a name answers "is this page still
+wanted?".
 
 | Rule | Behaviour | Why |
 | --- | --- | --- |
@@ -144,12 +150,16 @@ first. Rules, each opt-outable and none silent (`BC_TAB_GUARD=0` disables the lo
 | Ownership | tabs present at `attach()` are `protectedPages`: never closed, counted or marked | the browser is the operator's |
 | Adoption | `window.open` / `target=_blank` popups are adopted and re-trim the ceiling | uninvited tabs still cost RAM |
 | Holds | `hold(page)` pins a tab; `TabPool` holds its tabs for the run | a working tab must not be reaped |
+| Named surfaces | `surface(name)` binds one page to a name (recycling an idle owned tab first); the same name returns the same page, blanked or not. Bound surfaces are exempt from recycling and reaping; `release(name)` makes the tab ordinary again, `surfaces()` / `report().surfaces` list `{ name, url, idleMs, blanked }` | an agent should express intent, not manage handles |
+| Surface eviction | at the ceiling with every tab bound, the least-recently-used surface is released and its tab reused — counted in `stats.surfacesEvicted`, never an error | losing a named page must be visible, not fatal |
+| Dropped bindings | a page whose tab closes underneath us loses its name | a binding may not outlive its page |
 | Reclaiming | quiet past the blank window → `about:blank`; past the idle window → closed; timer every 30 s, `unref`'d | memory comes back before the tab does |
 | Last tab | `#close` refuses when ≤ 1 tab remains, counting the relay's own | Chrome exits and takes the bridge with it |
 | Nothing left behind | `browser.close()` also closes the relay's `connect.html`; `beforeExit`/`SIGINT`/`SIGTERM` reclaim | sixteen runs once left sixteen tabs |
 | Serialised closes | one at a time with `BC_TAB_SETTLE_MS` (400 ms) | attach/detach churn crashed Chrome |
 
-`report()` exposes budget, owned/operator counts and per-tab origin/held/idle. Known
+`report()` exposes budget, owned/operator counts, per-tab origin/held/idle/`name`, the
+`surfaces` list and the `surfacesEvicted` counter. Known
 blind spot: a tab the extension may not attach to (`chrome://`, Web Store, other
 extensions, `file://` without access) never becomes a Playwright page, so the guard
 cannot see it. `cleanup.mjs` finishes the job out of band: it closes only marked/scratch
@@ -195,7 +205,7 @@ packages/browser-control/
   src/transfer.mjs           in-page uploads and drag & drop via DataTransfer
   src/fixtures.mjs           zero-dependency xlsx/csv/png bytes for upload paths
   src/pool.mjs               TabPool + parallelMap, tab ceilings
-  src/tab-guard.mjs          budget, LRU eviction, idle reaping, holds, ownership
+  src/tab-guard.mjs          named surfaces, budget, LRU eviction, idle reaping, holds, ownership
   cleanup.mjs                close only what we left behind (--dry-run)
   selftest.mjs               end-to-end smoke; writes selftest.png, exit 1 on failure
   test/                      tab-guard 13 · ws-server 8 · shim-autostart 8 (browserless)
