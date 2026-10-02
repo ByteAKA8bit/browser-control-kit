@@ -54,9 +54,27 @@ export function extensionSupport() {
   return { version, supported: factory };
 }
 
+/** Where the channel's Chrome lives, asked of playwright's own registry. */
+function channelExecutable(channel) {
+  try {
+    return require(bundlePath()).registry?.registry?.findExecutable(channel)?.executablePath();
+  } catch {
+    return undefined; // unknown channel: the caller falls back to the original error
+  }
+}
+
+// playwright decides whether the extension is installed by listing the profile
+// directories under the channel's user-data-dir — and listProfileDirectories()
+// swallows EVERY readdir error (coreBundle.js: `catch { return []; }`). On macOS
+// that directory is TCC-protected, so a terminal without Full Disk Access gets
+// EPERM, sees zero profiles, and reports "Playwright Extension not found" for an
+// extension that is installed and working. Passing an executablePath skips the
+// scan entirely (coreBundle.js:73249-73252), which is why the retry below exists.
+const CONNECT_MS = Number(process.env.BC_EXTENSION_CONNECT_MS ?? 20_000);
+
 /**
  * Connect to the browser the operator already has open, through the extension.
- * @returns {Promise<{ browser: import("playwright-core").Browser }>}
+ * @returns {Promise<{ browser: import("playwright-core").Browser, token: object }>}
  */
 export async function connectViaExtension({ clientName = "browser-control", browserChannel = "chrome" } = {}) {
   const token = loadToken();
@@ -68,7 +86,37 @@ export async function connectViaExtension({ clientName = "browser-control", brow
     );
   }
   const { tools } = require(bundlePath());
-  const config = await tools.resolveCLIConfigForMCP({ extension: true, browser: browserChannel }, process.env);
-  const { browser } = await tools.createBrowserWithInfo(config, { clientName }, { browser: browserChannel });
-  return { browser, token };
+  // executablePath rides in the CLI options, not the config: createBrowserWithInfo
+  // reads it from its third argument via resolveExtensionOptions().
+  const open = async (executablePath) => {
+    const config = await tools.resolveCLIConfigForMCP({ extension: true, browser: browserChannel }, process.env);
+    const { browser } = await tools.createBrowserWithInfo(config, { clientName }, { browser: browserChannel, executablePath });
+    return { browser, token };
+  };
+  try {
+    return await open(undefined);
+  } catch (err) {
+    if (!/Playwright Extension not found/.test(String(err?.message ?? err))) throw err;
+    const executablePath = channelExecutable(browserChannel);
+    if (!executablePath) throw err;
+    // The scan is unreliable, the extension may well be there: ask the browser
+    // instead of the filesystem, but bound the wait — with no extension to
+    // answer, the relay would otherwise hang forever.
+    return await Promise.race([
+      open(executablePath),
+      new Promise((_, reject) =>
+        setTimeout(
+          () =>
+            reject(
+              new Error(
+                `the Playwright Extension did not connect within ${CONNECT_MS}ms. Either it is not installed in the ${browserChannel} profile ` +
+                  "(install it from https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm), " +
+                  "or this terminal cannot read the Chrome profile directory — grant it Full Disk Access, or raise BC_EXTENSION_CONNECT_MS.",
+              ),
+            ),
+          CONNECT_MS,
+        ).unref(),
+      ),
+    ]);
+  }
 }

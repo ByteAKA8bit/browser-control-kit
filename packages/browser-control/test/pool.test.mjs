@@ -65,6 +65,10 @@ describe("TabPool guard rails", { skip }, () => {
 
 describe("TabPool parallelism", { skip }, () => {
   it("runs page work on separate tabs concurrently", async () => {
+    // Warm every tab first: the first evaluate on a freshly attached tab pays
+    // for the chrome.debugger attach, which has nothing to do with parallelism
+    // and was enough to push a cold run over the bound.
+    await pool.map([...Array(pool.size).keys()], (_, page) => page.evaluate(() => 1));
     const started = Date.now();
     // 4 tasks × 600ms over 2 tabs: serial ≈ 2.4s, parallel ≈ 1.2s.
     const results = await pool.map([...Array(4).keys()], async (i, page) => {
