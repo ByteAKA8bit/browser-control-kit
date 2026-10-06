@@ -55,14 +55,14 @@ npx playwright show-trace results/traces/08-upload.zip
 
 Measured output: 287 entries / 263 screencast frames / includes `trace.network`, about 7 MB for one suite — hence off by default.
 
-## The two transports
+## The two transports, and the `auto` that picks between them
 
-| Transport | Prerequisites | Approval clicks | Capabilities | Use when |
+| Transport | Prerequisites | Approval clicks | Takes the screen? | Capabilities |
 | --- | --- | --- | --- | --- |
-| `extension` (default) | [Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm) + `PLAYWRIGHT_MCP_EXTENSION_TOKEN` (shown on its status page) | **none** (the token replaces the dialog) | No raw CDP (measured: `Target.attachToBrowserTarget: Not allowed`), no `Browser.grantPermissions`, no focus emulation → DOM-level input covers it | **Default / unattended**: Chrome only has to be running |
-| `cdp` | Chrome with `--remote-debugging-port=9222` + `node src/cdp-shim.mjs` | **one per shim lifetime** (the shim proxies all clients) | Full CDP: focus emulation, pre-granted permissions, download directory, URL interception | You need a CDP-level switch |
+| `extension` | [Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm) + `PLAYWRIGHT_MCP_EXTENSION_TOKEN` (shown on its status page) | **none** (the token replaces the dialog) | ~150 ms per `attach()`: connecting launches Chrome, which raises itself | No raw CDP (measured: `Target.attachToBrowserTarget: Not allowed`), no `Browser.grantPermissions`, no focus emulation → DOM-level input covers it; new tabs are always foreground |
+| `cdp` | a Chrome with a debugging port + `node src/cdp-shim.mjs` (or `npm run shim:service`) | **one per shim lifetime** (the shim proxies all clients) | **no**: `attach()` opens no page, and tabs are created with `Target.createTarget { background: true }` | Full CDP: focus emulation, pre-granted permissions, download directory, URL interception |
 
-Switch with `BC_MODE=cdp` (or `attach({ mode: "cdp" })`); the shim address is `BC_CDP_URL`.
+`DEFAULT_MODE` is `BC_MODE ?? "auto"`: `auto` takes `cdp` when a shim already answers on `BC_CDP_URL`, `extension` otherwise, and never starts a shim itself — that is the one step that can pop Chrome's approval dialog. `capabilities.chose` records which and why. Pin with `BC_MODE=extension|cdp` or `attach({ mode })`.
 
 `cdp-shim.mjs` exists for two reasons, most painful first:
 
@@ -112,13 +112,13 @@ const xlsx = makeXlsx([["分類","分野","名称"], ["クラウド","IaaS","AWS
 
 | Export | Description |
 | --- | --- |
-| `attach({ mode, clientName, shimUrl, trace, guard })` | Connect to the running browser → `{ browser, context, mode, capabilities, tabs, saveTrace }`; `context` is under the tab budget by default, `tabs` is the `TabGuard`, and `browser.close()` hands our tabs back first |
+| `attach({ mode, clientName, shimUrl, trace, guard })` | Connect to the running browser → `{ browser, context, mode, capabilities, tabs, saveTrace }`; `context` is under the tab budget by default, `tabs` is the `TabGuard`, and `browser.close()` hands our tabs back first. On the extension transport, connecting launches Chrome and takes the screen, so the frontmost application is restored afterwards (macOS; `capabilities.focus` says what happened, `BC_RESTORE_FOCUS=0` opts out) |
 | `controlPage(page, capabilities)` | A puppeteer-flavoured page: multi-arg `evaluate`/`$eval`/`$$eval`, `waitForSelector({visible})`, `setViewport`, `evaluateOnNewDocument`, `createCDPSession` (a no-op shim when CDP is absent), `inputMode()`, `capabilities()`; everything else passes through to the native Playwright `Page` |
 | `blockUrls(page, pattern)` | `page.route` interception (translation services, analytics beacons…) |
 | `page.setInputFiles / dropFiles / dragAndDrop` | See above; available on the DOM path too |
 | `page.deepCount(selector)` | Match count across shadow roots and frames (diagnostics) |
 | `page.viewportInfo()` | Read-only window size; `setViewport` is inert by default (your window is not ours to resize) |
-| `TabGuard` / `guardContext(context, guard)` / `guardBrowser(browser, guard)` | The tab budget: `newPage()` evicts the LRU tab when over budget, adopts `window.open` popups, reaps idle tabs, `hold()` protects tabs in use, `report()` explains itself. `attach()` already wires this up; these exports are for manual use |
+| `TabGuard` / `guardContext(context, guard)` / `guardBrowser(browser, guard)` | The tab budget: `newPage()` evicts the LRU tab when over budget, adopts `window.open` popups, reaps idle tabs, `hold()` protects tabs in use, `report()` explains itself. `surface(name)` binds a page to a name and keeps it; `surface()` is the one scratch page every unnamed call shares. `attach()` already wires this up; these exports are for manual use |
 | `defaultBudget(mode)` | Budget default: `BC_TAB_BUDGET` wins, otherwise 3 on extension / 4 on cdp |
 | `TabPool` / `parallelMap` (`browser-control/pool`) | Run work across several tabs; `map()` never rejects — failures come back as `{ ok: false, error, ms, tab }` |
 
@@ -127,7 +127,7 @@ const xlsx = makeXlsx([["分類","分野","名称"], ["クラウド","IaaS","AWS
 ## Tests
 
 ```bash
-npm run test:offline   # tab-guard 42 + ws-server 17 + shim-autostart 11 + shim-policy 6 + shim-recovery 19 + shim-service 8 + shim-session 12 = 115 cases, no browser needed
+npm run test:offline   # tab-guard 47 + focus 7 + ws-server 17 + shim-autostart 14 + shim-policy 6 + shim-recovery 24 + shim-service 12 + shim-session 12 = 139 cases, no browser needed
 npm test               # the same plus dom-input 16 and pool 8, --test-concurrency=1
 npm run selftest       # end-to-end smoke, writes ./selftest.png
 npm run cleanup        # closes only the tabs this tool left behind (--dry-run reports only)

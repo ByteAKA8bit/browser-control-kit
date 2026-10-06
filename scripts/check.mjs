@@ -147,6 +147,7 @@ step("license + package metadata", () => {
 // rather than only when Chrome happens to be running.
 const OFFLINE_SUITES = [
   ["packages/browser-control", "test/tab-guard.test.mjs"],
+  ["packages/browser-control", "test/focus.test.mjs"],
   ["packages/browser-control", "test/ws-server.test.mjs"],
   ["packages/browser-control", "test/shim-autostart.test.mjs"],
   ["packages/browser-control", "test/shim-policy.test.mjs"],

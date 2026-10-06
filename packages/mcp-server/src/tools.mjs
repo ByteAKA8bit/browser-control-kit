@@ -3,8 +3,8 @@
 //
 // Non-goal: tab handles. Agents leak handles, and the earlier version spent
 // three tool descriptions policing them; instead `as` names a page, `on`
-// returns to a named page, and omitting both lands on the scratch page the
-// next unnamed navigation reuses. Lifetime belongs to browser-control's
+// returns to a named page, and omitting both lands on the scratch page, the
+// one page every unnamed call shares. Lifetime belongs to browser-control's
 // TabGuard — named pinned, unnamed recycled, idle reclaimed — so no tool here
 // can open or close a tab. browser-control (and playwright-core) is imported
 // lazily in #connect(), so merely listing tools costs nothing but a process.
@@ -15,7 +15,7 @@ const WAIT_TIMEOUT_MS = () => Number(process.env.BC_MCP_WAIT_MS ?? 20_000);
 
 /** Shown by a client before the first tool call (MCP `initialize.instructions`). */
 export const INSTRUCTIONS =
-  "Pages are addressed by name, never by handle. Pass `as` to browser_navigate to keep that page under a name, and `on` to come back to it from any later call; leave both out and you get the scratch page, which the next unnamed navigation reuses. Nothing needs closing — named pages are kept while you use them, unnamed ones are recycled, idle ones are reclaimed — and browser_surfaces lists what is named right now.";
+  "Pages are addressed by name, never by handle. Pass `as` to browser_navigate to keep that page under a name, and `on` to come back to it from any later call; leave both out and you get the scratch page, the single page every unnamed call shares. Nothing needs closing — named pages are kept while you use them, the scratch page is reused, idle ones are reclaimed — and browser_surfaces lists what is named right now.";
 
 /** Reject instead of hanging forever when the operator never approves a connection. */
 function withTimeout(promise, ms, what) {
@@ -87,7 +87,8 @@ export class Session {
     const guard = this.#guard(live);
     return {
       surfaces: guard.surfaces(),
-      note: "Nothing here needs closing: named pages are held while you use them, unnamed ones are recycled, idle ones are reclaimed.",
+      scratch: guard.report().scratch,
+      note: "Nothing here needs closing: named pages are held while you use them, the scratch page is reused by every unnamed call, idle ones are reclaimed.",
     };
   }
 
@@ -350,7 +351,7 @@ export const TOOLS = [
   },
   {
     name: "browser_surfaces",
-    description: "List the pages you have named, with their URL and how long each has been idle.",
+    description: "List the pages you have named, with their URL and how long each has been idle, plus the scratch page.",
     inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
     run: (_args, session) => session.surfaces(),
   },

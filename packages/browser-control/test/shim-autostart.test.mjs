@@ -14,7 +14,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { ensureShim, probeShim, transportSupport } from "../src/attach.mjs";
+import { chooseMode, ensureShim, probeShim, transportSupport } from "../src/attach.mjs";
 
 /** A stub that answers /json/version like the shim does, on an OS-chosen port. */
 async function stubShim(port = 0) {
@@ -124,6 +124,42 @@ describe("ensureShim", () => {
   // Not covered here: a shim that actually serves CDP. It needs Chrome's
   // DevToolsActivePort to be of any use — that path is proven live. The spawn
   // branch itself IS covered below, with a child that cannot outlive the test.
+});
+
+// `auto` is what an unattended agent gets: the transport must be decided from
+// what is already running, never by starting something that needs a click.
+describe("chooseMode", () => {
+  let stub;
+  before(async () => {
+    stub = await stubShim();
+    process.env.BC_SHIM_PROBE_MS = "500";
+  });
+  after(async () => {
+    await stub.close();
+    restoreEnv();
+  });
+  afterEach(restoreEnv);
+
+  it("takes cdp when a shim is already answering, and says why", async () => {
+    const { mode, chose } = await chooseMode(stub.url);
+    assert.equal(mode, "cdp");
+    assert.equal(chose.mode, "cdp");
+    assert.ok(chose.why.includes(stub.url), `the reason names what it probed: ${chose.why}`);
+  });
+
+  it("falls back to the extension, which needs no port and no approval", async () => {
+    const { mode, chose } = await chooseMode(await deadUrl());
+    assert.equal(mode, "extension");
+    assert.match(chose.why, /no debugging port and no approval/);
+  });
+
+  it("starts nothing: deciding must never cost an approval click", async () => {
+    process.env.BC_SHIM_AUTOSTART = "1"; // even with autostart on, choosing stays passive
+    const url = await deadUrl();
+    const { mode } = await chooseMode(url);
+    assert.equal(mode, "extension");
+    assert.equal(await probeShim(url, 200), false, "nothing was spawned on that port");
+  });
 });
 
 // The spawn branch, with the child's fate forced instead of waited for: a

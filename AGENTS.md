@@ -12,12 +12,12 @@ Dependency direction is one-way and must stay that way: consumer suites → `ant
 
 ## Architecture & Data Flow
 
-Two transports, selected by `BC_MODE` (`DEFAULT_MODE = process.env.BC_MODE ?? "extension"`):
+Two transports and an `auto` that picks between them (`DEFAULT_MODE = process.env.BC_MODE ?? "auto"`). `chooseMode(shimUrl)` (exported from `src/attach.mjs`) probes the shim and takes `cdp` when one is already answering, `extension` otherwise — it NEVER starts a shim, because starting one is the only step that can pop Chrome's approval dialog; the decision and its reason land in `capabilities.chose`:
 
 ```mermaid
 graph LR
-  A[attach] -->|extension default| E[extension-transport.mjs<br/>Playwright Extension + token]
-  A -->|BC_MODE=cdp| S[cdp-shim.mjs :9333<br/>rebuilds /json/*]
+  A[attach mode=auto] -->|no shim answers| E[extension-transport.mjs<br/>Playwright Extension + token]
+  A -->|shim answers| S[cdp-shim.mjs :9333<br/>rebuilds /json/* + proxies one socket]
   E --> C[context = browser.contexts 0]
   S --> C
   C --> P[controlPage proxy]
@@ -38,12 +38,16 @@ graph LR
 
 **Shim autostart.** `attach({ mode: "cdp" })` calls `ensureShim()` (both `ensureShim`/`probeShim` are exported from `src/attach.mjs`): it probes `BC_CDP_URL ?? http://localhost:9333` (`/json/version`, `BC_SHIM_PROBE_MS` = 1 s) and, when nothing answers, spawns `src/cdp-shim.mjs` **detached and unref'd** so it outlives this run, waiting up to `BC_SHIM_START_MS` (15 s). `BC_SHIM_AUTOSTART=0` turns a missing shim back into an error; a non-local `BC_CDP_URL` always errors. `capabilities.shim = { url, started, pid }` records whether the operator saw a dialog. The shim keeps its approved socket warm with a `Browser.getVersion` every `BC_SHIM_KEEPALIVE_MS` (30 s, `0` disables) — unref'd, and never fired before the first client, so it cannot pop the approval dialog on its own.
 
+**Reaching Chrome without the port file.** `endpoint()` prefers `DevToolsActivePort` (per-launch websocket id) but macOS keeps the Chrome profile directory behind Full Disk Access, so a shim started without it reads `EPERM` on a file that is right there. 2026-10-06: the id-less `ws://host:port/devtools/browser` endpoint upgrades just the same, so that is the fallback, and the failure message then names Full Disk Access instead of blaming the browser. Consequence for tests: a shim with no readable port file dials `CHROME_PORT`, so every suite pins it to a dead port — a test must NEVER reach the operator's real Chrome.
+
+**Dialling Chrome.** A dial refused the instant it is made is transient — Chrome binds the debugging port before the DevTools handler behind it is ready, measured 2026-10-06 at 285 ms to fail against ~2.2 s for a healthy dial — so `connect()` retries `BC_SHIM_DIAL_RETRIES` (3) times with a `BC_SHIM_DIAL_BACKOFF_MS` (400 ms) ramp. A `connect timeout` is NEVER retried: that one means an approval dialog is open and hammering it helps nobody.
+
 ## Key Directories
 
 | Path | Purpose |
 | --- | --- |
-| `packages/browser-control/src/` | All library code (10 modules, see below) |
-| `packages/browser-control/test/` | `node:test` suites, flat, `<area>.test.mjs` (9 files; only `dom-input` and `pool` need a browser) |
+| `packages/browser-control/src/` | All library code (11 modules, see below) |
+| `packages/browser-control/test/` | `node:test` suites, flat, `<area>.test.mjs` (10 files; only `dom-input` and `pool` need a browser) |
 | `packages/mcp-server/` | `browser-control-mcp`: MCP stdio server wrapping `browser-control` (`bin/`, `src/server.mjs` + `tools.mjs` + `transport.mjs`, `test/protocol.test.mjs`), its only dependency |
 | `packages/antd-kit/` | Single-file `index.mjs`, antd v6 overlay helpers |
 | `scripts/` | Local CI (`check.mjs`), hook installer, launchd shim installer, `crash-repro.mjs` |
@@ -54,8 +58,8 @@ graph LR
 ```bash
 npm i && node scripts/install-hooks.mjs   # one-time: git config core.hooksPath .githooks
 
-npm test            # 10 suites in one process, --test-concurrency=1 (dom-input + pool need Chrome + token)
-npm run test:offline # browserless tier: tab-guard (42) + ws-server (17) + shim-autostart (11) + shim-policy (6) + shim-recovery (19) + shim-service (8) + shim-session (12) + mcp protocol (25) = 140
+npm test            # 11 suites in one process, --test-concurrency=1 (dom-input + pool need Chrome + token)
+npm run test:offline # browserless tier: tab-guard (47) + focus (7) + ws-server (17) + shim-autostart (14) + shim-policy (6) + shim-recovery (24) + shim-service (12) + shim-session (12) + mcp protocol (25) = 164
 npm run test:unit   # dom-input.test.mjs  (16 cases)
 npm run test:pool   # pool.test.mjs       (8 cases)
 npm run selftest    # end-to-end smoke; writes ./selftest.png, exits 1 on failure
@@ -112,7 +116,10 @@ Chrome 152 + Playwright Extension killed the browser process 11 times; each guar
 4. **One `TabPool` per extension connection**; size ≤ `MAX_TABS_EXTENSION` (3) on extension, ≤ `MAX_TABS` (4) otherwise; `start()` throws with no ordinary tab present.
 5. **Never touch the operator's tabs or profile**: reuse only `bcPoolTab`-marked tabs (`BC_REUSE_ANY=1` opts in), never `evaluate` on extension/devtools pages, `setViewport` is a no-op unless `BC_VIEWPORT=1`, the token is read but never written or echoed.
 6. **Tab creation on extension requires `BC_ALLOW_TAB_CREATE=1`**; otherwise the pool degrades its size.
-7. **Tab discipline is enforced, not requested** (`src/tab-guard.mjs`): `attach()` returns a guarded context whose `newPage()` recycles an idle owned tab before opening one, sizes every idle window from the caller's measured cadence (not constants), blanks idle tabs before closing them, adopts `window.open` popups, never counts or closes a tab that existed before attach, closes the relay's `connect.html` on teardown, and reclaims on `beforeExit`/`SIGINT`/`SIGTERM`. It deliberately does NOT probe system memory. The only refusal is the transport ceiling. `TabPool` calls `context.tabGuard?.hold()`. Opt out with `BC_TAB_GUARD=0`. Callers that need a page to survive bind a **named surface** (`guard.surface(name)`, `guard.release(name)`, `guard.surfaces()`): one page per name, exempt from recycling and reaping while bound, reusing an idle owned tab before opening anything. At the ceiling with every tab bound, the least-recently-used surface is released and its tab reused — reported via `stats.surfacesEvicted` / `report().surfaces`, never an error. The cadence answers "is this scratch tab idle?"; the name answers "is this page still wanted?".
+7. **Tab discipline is enforced, not requested** (`src/tab-guard.mjs`): `attach()` returns a guarded context whose `newPage()` recycles an idle owned tab before opening one, sizes every idle window from the caller's measured cadence (not constants), blanks idle tabs before closing them, adopts `window.open` popups, never counts or closes a tab that existed before attach, closes the relay's `connect.html` on teardown, and reclaims on `beforeExit`/`SIGINT`/`SIGTERM`. It deliberately does NOT probe system memory. The only refusal is the transport ceiling. `TabPool` calls `context.tabGuard?.hold()`. Opt out with `BC_TAB_GUARD=0`. Callers that need a page to survive bind a **named surface** (`guard.surface(name)`, `guard.release(name)`, `guard.surfaces()`): one page per name, exempt from recycling and reaping while bound, reusing an idle owned tab before opening anything. At the ceiling with every tab bound, the least-recently-used surface is released and its tab reused — reported via `stats.surfacesEvicted` / `report().surfaces`, never an error. `guard.surface()` with no name is the **scratch page**: one page shared by every unnamed call, off the cadence (`report().scratch`) but never held, because a cadence-sized window made a slow agent open and evict a tab per step. The cadence answers "is this unnamed tab idle?"; the name answers "is this page still wanted?".
+8. **Attaching must not take the operator's screen** (`src/focus.mjs`): connecting over the extension transport launches Chrome and Chrome raises *itself* — measured 2026-10-06, the binary spawn, `open -g` and AppleScript `make new tab` all foreground an already-running Chrome, so the raise is damage-controlled, not prevented. `watchFocus` notes the frontmost app before connecting, polls every 100 ms during the handshake and reactivates it the moment Chrome appears (~100–150 ms exposure, reported as `capabilities.focus` with `bounces`; `BC_RESTORE_FOCUS=0`, `BC_FOCUS_WATCH_MS`). NEVER take the screen back from anything but Chrome/Chromium (`isBrowser`) — the operator switching applications is not something to undo. Fewer attaches is the only real cure; `cdp` mode opens no page at all.
+9. **A new tab must not take the operator's place** (`src/tab-guard.mjs` `#backgroundPage`): on raw CDP a tab is opened with `Target.createTarget { background: true }`, so the operator's active tab stays active; the extension relay forwards `chrome.tabs.create`, which always activates, so there the guard does not even ask. One browser CDP session per guard, detached in `dispose()`; the `page` listener and its timer are removed on EVERY path (success, refusal, timeout) — a leaked listener here fires on every later tab, and an uncleared timer rejects into nothing. One refusal sets `_background = false` and it never asks again (`report().backgroundTabs`).
+10. **One directory, and it is removable** (`scripts/install-shim-service.mjs` `footprint()`): everything this kit writes lives in `~/.cache/browser-control` (`BC_SHIM_LOG_DIR`) plus the plist launchd owns; the token in `~/.config/browser-control` is the operator's and is read-only to us. Adding a file that an install creates means adding it to `footprint()` in the same commit — `--status` and `--uninstall` both read that list, so an unlisted file is one nobody can find or remove. Logs are truncated past `BC_SHIM_LOG_MAX` (256 KiB) at shim startup rather than rotated.
 
 ### antd-kit specifics
 
@@ -123,18 +130,19 @@ antd **v6**: modal bodies are `.ant-modal-container` (v5's `.ant-modal-content` 
 | File | Role |
 | --- | --- |
 | `packages/browser-control/index.mjs` | Barrel: `attach, transportSupport, DEFAULT_MODE, controlPage, blockUrls, TabPool, parallelMap, MAX_TABS, MAX_TABS_EXTENSION, TabGuard, guardContext, guardBrowser, defaultBudget, makeXlsx, makeCsv, makePng, asUpload, extensionSupport, loadToken`. |
-| `src/attach.mjs` | Transport choice + capability probe + shim autostart (`ensureShim`, `probeShim`; not re-exported by the barrel) |
+| `src/attach.mjs` | Transport choice (`chooseMode` resolves `auto`) + capability probe + shim autostart (`ensureShim`, `probeShim`; not re-exported by the barrel) |
 | `src/extension-transport.mjs` | Token load + playwright-core private API (quarantine) |
 | `src/cdp-shim.mjs` | `/json/*` rebuild + single-socket CDP proxy (browser endpoint and `/devtools/page/<id>` tunnel) + keep-alive, `127.0.0.1:${SHIM_PORT ?? 9333}` |
 | `src/ws-server.mjs` | Dependency-free RFC 6455 server: `accept`, `upgrade`, `WsConnection`, `encodeFrame`, `decodeFrame` |
 | `src/page.mjs` | `controlPage` Proxy, nav lock, frame fan-out, `blockUrls` |
 | `src/dom-input.mjs` / `src/transfer.mjs` | Stringified in-page click/type/upload/drag primitives |
 | `src/pool.mjs` | `TabPool`, `parallelMap`, tab ceilings, and the single source of `wouldEmptyBrowser`, `MARKER` (`bcPoolTab`) and `TAB_SETTLE_MS` |
-| `src/tab-guard.mjs` | `TabGuard`: named surfaces (`surface`/`release`/`surfaces`, LRU release at the ceiling), recycling, measured idle windows, blank-then-close reclaiming, `guardContext`, `guardBrowser`, `tabCeiling`; imports the crash constants from `src/pool.mjs` |
+| `src/tab-guard.mjs` | `TabGuard`: named surfaces (`surface`/`release`/`surfaces`, LRU release at the ceiling), the shared scratch page, recycling, measured idle windows, blank-then-close reclaiming, `guardContext`, `guardBrowser`, `tabCeiling`; imports the crash constants from `src/pool.mjs` |
+| `src/focus.mjs` | `frontmostApp` / `isBrowser` / `restoreFrontmost` / `watchFocus`: take the operator's screen back while attach launches Chrome (macOS, `BC_RESTORE_FOCUS=0`) |
 | `src/fixtures.mjs` | `makeXlsx/makeCsv/makePng/asUpload`, hand-rolled ZIP+CRC32 |
 | `selftest.mjs` / `cleanup.mjs` | Operator scripts (not published tests) |
 | `scripts/check.mjs` | The CI |
-| `scripts/install-shim-service.mjs` | Installs the shim as a launchd KeepAlive agent, capturing `SHIM_PORT`/`CHROME_PORT`/`CHROME_PORT_FILE`/`CHROME_HOST`/`BC_SHIM_KEEPALIVE_MS` into the plist; `--uninstall` removes it |
+| `scripts/install-shim-service.mjs` | Installs the shim as a launchd KeepAlive agent, capturing `SHIM_PORT`/`CHROME_PORT`/`CHROME_PORT_FILE`/`CHROME_HOST`/`BC_SHIM_KEEPALIVE_MS` into the plist. `footprint()` is the single list of every path the kit can create: `--status` prints it with live sizes, `--uninstall` deletes exactly the entries marked `ours` (never the operator's token) |
 | `README.md` / `README.zh-CN.md` | English-first docs with a Chinese translation alongside; keep both in step |
 | `CONTRIBUTING.md` | Setup, the two CI tiers, PR expectations |
 | `packages/browser-control/ARCHITECTURE.md` | Design rationale (rewritten against the current tree) |
@@ -147,11 +155,11 @@ Subpath exports: `browser-control/fixtures`, `/pool`, `/tab-guard`, `/shim`. Add
 - **npm** workspaces; `package-lock.json` is committed (CI runs `npm ci`) — lockfile changes belong in the commit. The root manifest is `private: true` but still carries `license`/`author`/`repository`/`homepage`/`bugs`.
 - All source is `.mjs`. Do not introduce `.js`, `.ts`, or a build step.
 - **Supported platforms are macOS and Windows** — the operator's own logged-in Chrome lives on a desktop, and CI runs the offline tier on both. Linux is not a target (it runs non-blocking in CI for information). Cross-platform where it counts: the shim resolves Chrome's user-data-dir per platform (`CHROME_PROFILE_DIRS` in `src/cdp-shim.mjs`, override with `CHROME_PORT_FILE`), and `scripts/check.mjs` probes for a running Chrome on win32/posix. `scripts/install-shim-service.mjs` is launchd-only and says so; `scripts/crash-repro.mjs` is macOS-only by design.
-- Key env flags: `BC_MODE`, `BC_CDP_URL`, `BC_TRACE`, `BC_MAX_TABS`, `BC_MAX_TABS_EXTENSION`, `BC_TAB_SETTLE_MS`, `BC_ALLOW_TAB_CREATE`, `BC_REUSE_ANY`, `BC_PARALLEL_NAV`, `BC_VIEWPORT`, `BC_ALLOW_INIT_SCRIPT`, `BC_TAB_GUARD`, `BC_TAB_BUDGET`, `BC_TAB_RECYCLE_MS`, `BC_TAB_BLANK_MS`, `BC_TAB_IDLE_MS`, `BC_TAB_EVICT`, `BC_KEEP_BRIDGE_TAB`, `BC_TOKEN_FILE`, `PLAYWRIGHT_MCP_EXTENSION_TOKEN`, `SHIM_PORT`, `CHROME_PORT_FILE`, `BC_SHIM_AUTOSTART`, `BC_SHIM_KEEPALIVE_MS`, `BC_SHIM_PROBE_MS`, `BC_SHIM_START_MS`, `BC_SHIM_PROXY_TIMEOUT_MS`, `BC_CRASH_REPRO`.
+- Key env flags: `BC_MODE` (`auto` by default), `BC_CDP_URL`, `BC_TRACE`, `BC_MAX_TABS`, `BC_MAX_TABS_EXTENSION`, `BC_TAB_SETTLE_MS`, `BC_ALLOW_TAB_CREATE`, `BC_REUSE_ANY`, `BC_PARALLEL_NAV`, `BC_VIEWPORT`, `BC_ALLOW_INIT_SCRIPT`, `BC_TAB_GUARD`, `BC_TAB_BUDGET`, `BC_TAB_RECYCLE_MS`, `BC_TAB_BLANK_MS`, `BC_TAB_IDLE_MS`, `BC_TAB_EVICT`, `BC_KEEP_BRIDGE_TAB`, `BC_RESTORE_FOCUS`, `BC_FOCUS_WATCH_MS`, `BC_TOKEN_FILE`, `PLAYWRIGHT_MCP_EXTENSION_TOKEN`, `SHIM_PORT`, `CHROME_PORT_FILE`, `BC_SHIM_AUTOSTART`, `BC_SHIM_KEEPALIVE_MS`, `BC_SHIM_PROBE_MS`, `BC_SHIM_START_MS`, `BC_SHIM_PROXY_TIMEOUT_MS`, `BC_SHIM_LOG_DIR`, `BC_SHIM_LOG_MAX`, `BC_SHIM_DIAL_RETRIES`, `BC_SHIM_DIAL_BACKOFF_MS`, `BC_CRASH_REPRO`.
 
 ## Testing & QA
 
-Framework: built-in `node:test` (BDD) + `node:assert/strict`. No mocks, no snapshots, no coverage tooling, no reporters. Browserless: `tab-guard` (42), `ws-server` (17), `shim-autostart` (11), `shim-policy` (6), `shim-recovery` (19), `shim-service` (8), `shim-session` (12), and `packages/mcp-server/test/protocol` (25). Needing a running Chrome and an extension token: `dom-input` (16), `pool` (8).
+Framework: built-in `node:test` (BDD) + `node:assert/strict`. No mocks, no snapshots, no coverage tooling, no reporters. Browserless: `tab-guard` (47), `focus` (7), `ws-server` (17), `shim-autostart` (14), `shim-policy` (6), `shim-recovery` (24), `shim-service` (12), `shim-session` (12), and `packages/mcp-server/test/protocol` (25). Needing a running Chrome and an extension token: `dom-input` (16), `pool` (8).
 
 `shim-recovery.test.mjs` pins the shim's recovery semantics: every pending call ends definitely (a timeout, the browser socket dropping, the client dropping all produce an id-matched error reply), a late real answer is neither delivered twice nor fatal, the `EADDRINUSE` loser exits 0 without ever having dialled Chrome — so losing the race costs no approval click — `/shim/status` still answers while Chrome is unreachable, and the three cdp `attach()` failures give three different messages. `shim-service.test.mjs` pins launchd plist generation: XML escaping that does not change the value launchd actually receives, `KeepAlive` paired with `ThrottleInterval` so a crashing shim cannot loop, and only the environment variables that were really set being captured. Its `plutil` cross-check is darwin-only and skips rather than fails elsewhere, because the offline tier runs on a Linux runner.
 

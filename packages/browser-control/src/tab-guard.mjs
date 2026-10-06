@@ -36,6 +36,7 @@ const RECYCLE = { beats: 5, min: 1_000, max: 60_000, pinned: process.env.BC_TAB_
 const BLANK = { beats: 30, min: 30_000, max: 600_000, pinned: process.env.BC_TAB_BLANK_MS };
 const IDLE = { beats: 120, min: 120_000, max: 1_800_000, pinned: process.env.BC_TAB_IDLE_MS };
 const REAP_EVERY_MS = 30_000;
+const BACKGROUND_MS = 5_000; // how long a background Target.createTarget may take to surface its page
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** A window expressed in the caller's own beats, unless it was pinned. */
@@ -93,6 +94,9 @@ export class TabGuard {
     this.owned = new Map();
     /** name -> page. One name, one tab; the binding is a hold. */
     this.named = new Map();
+    /** The unnamed page. One per guard: an agent that navigates without a name
+     * must not get a new renderer (and an eviction) per step. */
+    this._scratch = null;
     this.stats = { created: 0, recycled: 0, spawned: 0, evicted: 0, reaped: 0, blanked: 0, refused: 0, closed: 0, overflow: 0, surfacesEvicted: 0 };
     this._closeChain = Promise.resolve();
     this._timer = null;
@@ -131,6 +135,7 @@ export class TabGuard {
     // A tab can go away under us; the name must not outlive the page it meant.
     page.on?.("close", () => {
       this.#unbind(page);
+      if (this._scratch === page) this._scratch = null;
       this.owned.delete(page);
     });
     // Activity signals, cheap ones: a tab that navigates or loads is in use.
@@ -191,7 +196,7 @@ export class TabGuard {
     await this.#admit();
     this._creating += 1;
     try {
-      const page = await this.context.newPage();
+      const page = (await this.#backgroundPage()) ?? (await this.context.newPage());
       await sleep(this.settleMs); // serialise attach churn (see pool.mjs SAFETY GATE)
       return this.adopt(page, "created");
     } finally {
@@ -199,8 +204,40 @@ export class TabGuard {
     }
   }
 
+  /**
+   * A tab that does NOT become the operator's active tab. Only raw CDP can ask
+   * for one (`Target.createTarget { background: true }`); the extension relay
+   * forwards `chrome.tabs.create` with no such option, so there this returns
+   * null and the caller opens an ordinary — therefore foreground — tab.
+   * One browser session for the whole guard, detached in dispose(); the page
+   * listener and its timer are removed on every path, including the failing one.
+   */
+  async #backgroundPage() {
+    if (this.mode === "extension" || this._background === false) return null;
+    let onPage = null;
+    let timer = null;
+    try {
+      this._bgSession ??= await this.context.browser().newBrowserCDPSession();
+      const appeared = new Promise((resolve, reject) => {
+        onPage = resolve;
+        this.context.on("page", onPage);
+        timer = setTimeout(() => reject(new Error("the background target never surfaced as a page")), BACKGROUND_MS);
+        timer.unref?.();
+      });
+      await this._bgSession.send("Target.createTarget", { url: "about:blank", background: true });
+      return await appeared;
+    } catch {
+      this._background = false; // one refusal is enough; every later tab is an ordinary one
+      return null;
+    } finally {
+      clearTimeout(timer);
+      if (onPage) this.context.off?.("page", onPage);
+    }
+  }
+
   /** Hand a tab we already own back to the caller, emptied first. */
   async #recycle(page) {
+    if (this._scratch === page) this._scratch = null; // it belongs to whoever asked for it now
     await serialiseNavigation(() => page.goto("about:blank", { waitUntil: "commit" })).catch(() => {});
     this.stats.recycled += 1;
     const entry = this.owned.get(page);
@@ -210,11 +247,13 @@ export class TabGuard {
 
   /**
    * The page bound to `name`, creating or recycling one if needed; with no name
-   * this is exactly newPage(). A bound name is a hold, so a named surface is
-   * never recycled and never reaped until release(name) or surface eviction.
+   * this is the scratch page, which every unnamed call shares. A bound name is
+   * a hold, so a named surface is never recycled and never reaped until
+   * release(name) or surface eviction; the scratch page is held by nobody and
+   * is the first thing spent when the ceiling bites.
    */
   async surface(name) {
-    if (name === undefined || name === null) return this.newPage();
+    if (name === undefined || name === null) return this.#scratch();
     const key = typeof name === "string" ? name.trim() : "";
     if (!key) throw new Error("surface(name) wants a non-empty string name (or no argument at all for the scratch surface).");
     const bound = this.named.get(key);
@@ -228,6 +267,20 @@ export class TabGuard {
     if (entry) entry.name = key;
     this.hold(page);
     return this.touch(page);
+  }
+
+  /**
+   * The scratch page: the same tab for every unnamed call, so a run of unnamed
+   * navigations costs one tab instead of one per step (which, at the ceiling,
+   * meant open-evict-open — the operator watching tabs appear and vanish).
+   * Not held: it is still recycled, evicted and reaped like any unnamed tab.
+   */
+  async #scratch() {
+    const page = this._scratch;
+    const entry = page && this.owned.get(page);
+    if (entry && !page.isClosed?.() && entry.name === undefined) return this.touch(page);
+    this._scratch = await this.newPage();
+    return this._scratch;
   }
 
   /**
@@ -382,6 +435,8 @@ export class TabGuard {
       evict: this.evict,
       ...this.stats,
       surfaces: this.surfaces(),
+      scratch: this._scratch && !this._scratch.isClosed?.() ? (this._scratch.url?.() ?? "") : null,
+      backgroundTabs: this.mode !== "extension" && this._background !== false,
       tabs,
     };
   }
@@ -391,6 +446,8 @@ export class TabGuard {
     clearInterval(this._timer);
     this._timer = null;
     this.context.off?.("page", this._onPage);
+    this._bgSession?.detach().catch(() => {}); // the browser may already be gone
+    this._bgSession = null;
     process.off("beforeExit", this._onBeforeExit);
     process.off("SIGINT", this._onSignal);
     process.off("SIGTERM", this._onSignal);

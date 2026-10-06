@@ -11,22 +11,26 @@
 //
 // Node only: Bun's WebSocket client cannot carry Playwright's CDP transport.
 import { spawn } from "node:child_process";
-import { mkdirSync, openSync } from "node:fs";
+import { mkdirSync, openSync, statSync, truncateSync } from "node:fs";
 import { createRequire } from "node:module";
 import { connect } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { connectViaExtension, extensionSupport } from "./extension-transport.mjs";
+import { frontmostApp, watchFocus } from "./focus.mjs";
 import { TabGuard, guardBrowser, guardContext } from "./tab-guard.mjs";
 
 const require = createRequire(import.meta.url);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export const DEFAULT_MODE = process.env.BC_MODE ?? "extension";
+/** `auto` picks cdp when a shim is already answering, extension otherwise; BC_MODE pins either. */
+export const DEFAULT_MODE = process.env.BC_MODE ?? "auto";
 const SHIM_URL = process.env.BC_CDP_URL ?? "http://localhost:9333";
 const SHIM_SCRIPT = path.join(import.meta.dirname, "cdp-shim.mjs");
-// Same files scripts/install-shim-service.mjs points launchd at, so one log.
-const SHIM_LOG_DIR = path.join(os.homedir(), ".cache", "browser-control");
+// One directory for everything this kit writes, and the same files
+// scripts/install-shim-service.mjs points launchd at, so there is only one log.
+const SHIM_LOG_DIR = process.env.BC_SHIM_LOG_DIR ?? path.join(os.homedir(), ".cache", "browser-control");
+const SHIM_LOG_MAX = Number(process.env.BC_SHIM_LOG_MAX ?? 262_144);
 
 /** Is a CDP shim listening on `url`? An open port counts even without an answer: the shim replies to nothing while Chrome's approval dialog is up, and a second one could only fail to bind. */
 export async function probeShim(url = SHIM_URL, timeoutMs = Number(process.env.BC_SHIM_PROBE_MS ?? 1_000)) {
@@ -108,11 +112,16 @@ export async function ensureShim(url = SHIM_URL) {
   );
 }
 
-/** stdout/stderr targets for the detached shim; falls back to /dev/null-ish "ignore". */
+/** stdout/stderr targets for the detached shim, truncated past SHIM_LOG_MAX so an
+ * install that runs for months stays two small files; "ignore" when unwritable. */
 function shimLogFds() {
   try {
     mkdirSync(SHIM_LOG_DIR, { recursive: true });
-    return [openSync(path.join(SHIM_LOG_DIR, "shim.log"), "a"), openSync(path.join(SHIM_LOG_DIR, "shim.err.log"), "a")];
+    return ["shim.log", "shim.err.log"].map((name) => {
+      const file = path.join(SHIM_LOG_DIR, name);
+      if (statSync(file, { throwIfNoEntry: false })?.size > SHIM_LOG_MAX) truncateSync(file, 0);
+      return openSync(file, "a");
+    });
   } catch {
     return ["ignore", "ignore"]; // unwritable cache dir must not stop the attach
   }
@@ -150,29 +159,66 @@ async function shimStatus(url, timeoutMs = Number(process.env.BC_SHIM_PROBE_MS ?
 }
 
 /**
- * Attach over `extension` (the attached tab reports visibilityState=hidden while in the background; page.mjs compensates) or `cdp`.
- * @param {{ mode?: "extension"|"cdp", clientName?: string, shimUrl?: string, trace?: boolean,
+ * Which transport `auto` means right now. Deliberately never starts a shim:
+ * starting one is the single step that can pop Chrome's approval dialog, and an
+ * unattended run must not wait on a click.
+ * @returns {Promise<{ mode: "cdp"|"extension", chose: { mode: string, why: string } }>}
+ */
+export async function chooseMode(shimUrl = SHIM_URL) {
+  const warm = await probeShim(shimUrl);
+  const mode = warm ? "cdp" : "extension";
+  const why = warm
+    ? `a shim is answering on ${shimUrl}: cdp opens no page, so attaching cannot take the operator's screen`
+    : `nothing answered on ${shimUrl}; the extension transport needs no debugging port and no approval (npm run shim:service for cdp)`;
+  return { mode, chose: { mode, why } };
+}
+
+/**
+ * Attach over `extension` (the attached tab reports visibilityState=hidden while in the background; page.mjs compensates), `cdp`, or
+ * `auto` — cdp when a shim is already answering (it opens no page, so it never takes the operator's screen), extension otherwise.
+ * @param {{ mode?: "extension"|"cdp"|"auto", clientName?: string, shimUrl?: string, trace?: boolean,
  *          guard?: boolean | { budget?: number, idleMs?: number, evict?: boolean } }} options
  * @returns {Promise<{ browser: import("playwright-core").Browser, context: import("playwright-core").BrowserContext, mode: string, capabilities: object, tabs: TabGuard | null, saveTrace: (file: string) => Promise<object> }>}
  */
 export async function attach({ mode = DEFAULT_MODE, clientName = "browser-control", shimUrl = SHIM_URL, trace = false, guard = true } = {}) {
   let browser;
   let shim = null;
+  let focus = null;
+  let chose = null;
+  if (mode === "auto") ({ mode, chose } = await chooseMode(shimUrl));
   if (mode === "cdp") {
     shim = await ensureShim(shimUrl);
     const { chromium } = require("playwright-core");
     try {
       browser = await chromium.connectOverCDP(shimUrl, { timeout: 30_000 });
     } catch (err) {
-      throw new Error(await whyCdpFailed(shimUrl, err));
+      const why = await whyCdpFailed(shimUrl, err);
+      // A shim that is listening is not a shim that reached Chrome (an unanswered
+      // Allow dialog looks identical from outside). `auto` promised a working
+      // browser, not a transport, so it takes the other road instead of failing.
+      if (!chose) throw new Error(why);
+      chose = { mode: "extension", why: `a shim answered on ${shimUrl} but could not serve CDP, so this fell back to the extension transport — ${why}` };
+      mode = "extension";
     }
-  } else {
-    ({ browser } = await connectViaExtension({ clientName }));
+  }
+  if (mode === "extension") {
+    // Connecting launches Chrome with the relay's connect page and Chrome raises
+    // itself: watch for that during the connect, not after it, so the screen is
+    // gone for ~200 ms instead of the whole handshake.
+    const disabled = process.env.BC_RESTORE_FOCUS === "0";
+    const watch = watchFocus(disabled ? null : await frontmostApp());
+    try {
+      ({ browser } = await connectViaExtension({ clientName }));
+    } finally {
+      focus = disabled ? { restored: false, skipped: true, reason: "BC_RESTORE_FOCUS=0" } : await watch.stop();
+    }
   }
   const context = browser.contexts()[0];
   const capabilities = await probeCapabilities(context, mode);
   // `pid` is null for a reused shim: we know the port answered, not who owns it.
   if (shim) capabilities.shim = shim;
+  if (focus) capabilities.focus = focus;
+  if (chose) capabilities.chose = chose;
   // Verified over the extension bridge too (trace.trace + trace.network + screencast).
   if (trace || process.env.BC_TRACE === "1") {
     try {

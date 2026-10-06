@@ -74,7 +74,7 @@ before(async () => {
   await new Promise((r) => probe.close(r));
 
   shim = spawn(process.execPath, [SHIM], {
-    env: { ...process.env, SHIM_PORT: String(shimPort), CHROME_PORT_FILE: portFile, BC_SHIM_KEEPALIVE_MS: "0" },
+    env: { ...process.env, SHIM_PORT: String(shimPort), CHROME_PORT_FILE: portFile, CHROME_PORT: "1", BC_SHIM_KEEPALIVE_MS: "0" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   await new Promise((resolve, reject) => {

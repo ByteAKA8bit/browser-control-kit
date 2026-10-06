@@ -15,7 +15,7 @@ persist site settings, and `cleanup.mjs` exists to leave the browser as found.
 
 ## 2. Two transports, and what each one actually cannot do
 
-Both run against the live browser. `DEFAULT_MODE` is `BC_MODE ?? "extension"`.
+Both run against the live browser. `DEFAULT_MODE` is `BC_MODE ?? "auto"`: `chooseMode()` probes the shim and takes `cdp` when one is already answering, `extension` otherwise. It never starts a shim — that is the only step that can pop Chrome’s approval dialog — and the choice plus its reason are reported as `capabilities.chose`.
 
 **`extension`** — Playwright Extension relay over `chrome.debugger`. No approval
 dialog when `PLAYWRIGHT_MCP_EXTENSION_TOKEN` is set, and no
@@ -25,7 +25,22 @@ dialog when `PLAYWRIGHT_MCP_EXTENSION_TOKEN` is set, and no
 - therefore no `Emulation.setFocusEmulationEnabled` (no focus emulation),
 - therefore no `Browser.grantPermissions`,
 - the attached tab reports `visibilityState=hidden` while in the background, which
-  is why Playwright's own `click`/`fill` time out there.
+  is why Playwright's own `click`/`fill` time out there,
+- connecting **launches Chrome** with the relay's `connect.html`, and Chrome raises
+  itself even when already running; `chrome.tabs.create` has no background option.
+
+The raise cannot be prevented — measured 2026-10-06 against a running Chrome, the
+binary spawn, `open -g -a Chrome <url>` and AppleScript `make new tab` all foreground
+it, because Chrome activates itself on an external URL. So `src/focus.mjs` takes the
+screen back instead, and early: it reads the frontmost application before connecting and
+polls every 100 ms *during* the handshake, reactivating it the moment Chrome appears
+(macOS `lsappinfo` + `open -b`, no accessibility grant, `BC_RESTORE_FOCUS=0` to disable,
+`BC_FOCUS_WATCH_MS` to bound the watcher). Measured exposure: ~100–150 ms rather than
+the ~600 ms handshake, reported as `capabilities.focus` with a `bounces` count. Only
+Chrome/Chromium may lose the screen to us; an operator who switched applications is
+never pulled back. The remaining cost — a new tab is always the active tab — is the real
+argument for the scratch page in §5: open fewer tabs. `cdp` mode opens no page at
+`attach()` and never raises the browser at all.
 
 **`cdp`** — `chromium.connectOverCDP()` against Chrome started with
 `--remote-debugging-port`, through `src/cdp-shim.mjs` (Chrome 152 also disables
@@ -47,6 +62,12 @@ approved browser socket and proxies every client over it: the number of clicks
 equals the number of shim **processes**, not runs. Handing out Chrome's own
 websocket URL (the earlier design) meant a fresh dialog per attach.
 
+- **Finding Chrome**: `DevToolsActivePort` carries the per-launch websocket id, but
+  macOS keeps the profile directory behind Full Disk Access, so a shim started without
+  it reads `EPERM` on a file that is right there. Measured 2026-10-06: the id-less
+  `ws://host:port/devtools/browser` endpoint upgrades just the same, so that is the
+  fallback, and a failure then names Full Disk Access instead of blaming the browser.
+  Chrome's `/json/*` stays 404 throughout — that is what the shim rebuilds.
 - **Server**: `src/ws-server.mjs`, a hand-rolled RFC 6455 server — Node 22 ships a
   WebSocket *client* but no server, and the package keeps exactly one dependency.
   Scope: text frames, continuation frames, ping/pong, close; no permessage-deflate,
@@ -153,7 +174,7 @@ The deeper move: every rule that needs the caller's cooperation is a failure poi
 the tab stops being something a caller can hold. `surface(name)` asks for a page *by
 intent* and the guard owns the lifetime — the same shape as recycle-first (the caller no
 longer decides whether a tab opens) and as the shim's single approved connection. The
-measured cadence answers "is this scratch tab idle?"; a name answers "is this page still
+measured cadence answers "is this unnamed tab idle?"; a name answers "is this page still
 wanted?".
 
 | Rule | Behaviour | Why |
@@ -165,15 +186,17 @@ wanted?".
 | Adoption | `window.open` / `target=_blank` popups are adopted and re-trim the ceiling | uninvited tabs still cost RAM |
 | Holds | `hold(page)` pins a tab; `TabPool` holds its tabs for the run | a working tab must not be reaped |
 | Named surfaces | `surface(name)` binds one page to a name (recycling an idle owned tab first); the same name returns the same page, blanked or not. Bound surfaces are exempt from recycling and reaping; `release(name)` makes the tab ordinary again, `surfaces()` / `report().surfaces` list `{ name, url, idleMs, blanked }` | an agent should express intent, not manage handles |
+| Scratch page | `surface()` with no name is one page shared by every unnamed call, off the cadence entirely (`report().scratch`). It is never held, so recycling, eviction and reaping still apply | at a 30 s cadence nothing looked idle, so every unnamed step opened a tab and evicted the previous one: the operator watched tabs blink |
 | Surface eviction | at the ceiling with every tab bound, the least-recently-used surface is released and its tab reused — counted in `stats.surfacesEvicted`, never an error | losing a named page must be visible, not fatal |
 | Dropped bindings | a page whose tab closes underneath us loses its name | a binding may not outlive its page |
 | Reclaiming | quiet past the blank window → `about:blank`; past the idle window → closed; timer every 30 s, `unref`'d | memory comes back before the tab does |
 | Last tab | `#close` refuses when ≤ 1 tab remains, counting the relay's own | Chrome exits and takes the bridge with it |
 | Nothing left behind | `browser.close()` also closes the relay's `connect.html`; `beforeExit`/`SIGINT`/`SIGTERM` reclaim | sixteen runs once left sixteen tabs |
 | Serialised closes | one at a time with `BC_TAB_SETTLE_MS` (400 ms) | attach/detach churn crashed Chrome |
+| Background tabs | on raw CDP `newPage()` opens the tab with `Target.createTarget { background: true }` — one browser session per guard, detached in `dispose()`, listener and timer removed on every path; the extension relay has no such option, so it is not asked and one refusal disables it (`report().backgroundTabs`) | a tab that becomes the active tab is the operator losing their place |
 
 `report()` exposes budget, owned/operator counts, per-tab origin/held/idle/`name`, the
-`surfaces` list and the `surfacesEvicted` counter. Known
+`surfaces` list, the `scratch` URL and the `surfacesEvicted` counter. Known
 blind spot: a tab the extension may not attach to (`chrome://`, Web Store, other
 extensions, `file://` without access) never becomes a Playwright page, so the guard
 cannot see it. `cleanup.mjs` finishes the job out of band: it closes only marked/scratch
@@ -220,17 +243,18 @@ packages/browser-control/
   src/transfer.mjs           in-page uploads and drag & drop via DataTransfer
   src/fixtures.mjs           zero-dependency xlsx/csv/png bytes for upload paths
   src/pool.mjs               TabPool + parallelMap, tab ceilings
-  src/tab-guard.mjs          named surfaces, budget, LRU eviction, idle reaping, holds, ownership
+  src/tab-guard.mjs          named surfaces, scratch page, budget, LRU eviction, idle reaping, holds, ownership
+  src/focus.mjs              give the operator's frontmost application back after attach (macOS)
   cleanup.mjs                close only what we left behind (--dry-run)
   selftest.mjs               end-to-end smoke; writes selftest.png, exit 1 on failure
-  test/                      tab-guard 42 · ws-server 17 · shim-autostart 11 ·
-                             shim-policy 6 · shim-recovery 19 · shim-service 8 ·
+  test/                      tab-guard 47 · focus 7 · ws-server 17 · shim-autostart 14 ·
+                             shim-policy 6 · shim-recovery 24 · shim-service 12 ·
                              shim-session 12 (browserless) · dom-input 16 ·
                              pool 8 (need Chrome)
 ```
 
 Dependency direction is one-way: `tab-guard → pool → page → {dom-input, transfer,
-fixtures}`, `attach → {extension-transport, tab-guard}`, `cdp-shim → ws-server`.
+fixtures}`, `attach → {extension-transport, focus, tab-guard}`, `cdp-shim → ws-server`.
 Nothing points back up.
 
 All coupling to playwright-core internals lives in `src/extension-transport.mjs`: the

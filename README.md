@@ -36,16 +36,20 @@ examples/                   minimal runnable sample
 
 Dependency direction is one-way: `your suites → antd-kit → browser-control → playwright-core`. `playwright-core` (exact pin) is the only third-party dependency in the repo; everything else is hand-rolled on purpose.
 
-## The two transports
+## The two transports, and the `auto` that picks between them
 
-| Transport | Prerequisites | Approval clicks | Capabilities |
-| --- | --- | --- | --- |
-| `extension` (default) | [Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm) + its token | **none** — the token replaces the dialog | No browser-level CDP (`Target.attachToBrowserTarget: Not allowed`), no `Browser.grantPermissions`, no focus emulation → input falls back to DOM primitives. Tab lifecycle is restricted (see the guards table) |
-| `cdp` | Chrome started with `--remote-debugging-port` + `npm run shim` | **one**, per Chrome/shim restart | Full CDP: focus emulation, pre-granted permissions, download directory, URL interception |
+| Transport | Prerequisites | Approval clicks | Takes your screen? | Capabilities |
+| --- | --- | --- | --- | --- |
+| `extension` | [Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm) + its token | **none** — the token replaces the dialog | yes, ~150 ms per `attach()` (Chrome is launched with the relay's connect page, and raises itself) | No browser-level CDP (`Target.attachToBrowserTarget: Not allowed`), no `Browser.grantPermissions`, no focus emulation → input falls back to DOM primitives. Tab lifecycle is restricted (see the guards table) |
+| `cdp` | a Chrome with a debugging port + `npm run shim:service` | **one**, per Chrome restart | **no** — `attach()` opens no page at all, and new tabs are created in the background | Full CDP: focus emulation, pre-granted permissions, download directory, URL interception, `Target.createTarget { background: true }` |
 
-Honest trade-off: `extension` costs you raw CDP and makes tab creation/navigation deliberately conservative, but it is unattended — Chrome just has to be running. `cdp` gives you everything CDP can do, at the price of a background process and one approval dialog whenever Chrome or the shim restarts.
+`DEFAULT_MODE` is `BC_MODE ?? "auto"`, and **`auto` is the recommended setting**: it probes `BC_CDP_URL` (default `http://localhost:9333`) and takes `cdp` when a shim is already answering, `extension` otherwise. It deliberately **never starts a shim** — starting one is the single step that can pop Chrome's approval dialog, and an unattended agent must not wait on a click. `capabilities.chose` records the decision and the reason.
 
-Select with `BC_MODE=cdp` or `attach({ mode: "cdp" })`; the shim address is `BC_CDP_URL`.
+So the undisturbing setup is: install the shim once (`npm run shim:service`), click Allow once per Chrome restart, and leave everything on `auto`. Without the shim nothing breaks — you get the extension transport, unattended, at the cost of that ~150 ms screen flash per attach.
+
+Honest trade-off: `extension` costs you raw CDP and makes tab creation/navigation deliberately conservative, but it needs nothing beyond a running Chrome. `cdp` gives you everything CDP can do, at the price of a background process and one approval dialog whenever Chrome or the shim restarts.
+
+Pin either with `BC_MODE=extension` / `BC_MODE=cdp` or `attach({ mode })`; the shim address is `BC_CDP_URL`.
 
 ## Quick start
 
@@ -57,7 +61,7 @@ npm i && node scripts/install-hooks.mjs   # Node >= 22. Not Bun: its WebSocket c
 # one-time: install the Playwright Extension, store the token from its status page
 mkdir -p ~/.config/browser-control && pbpaste > ~/.config/browser-control/token && chmod 600 $_
 
-npm run test:offline   # tab governance, websocket codec, shim, MCP protocol — 140 cases, no browser needed
+npm run test:offline   # tab governance, focus, websocket codec, shim, MCP protocol — 164 cases, no browser needed
 npm run test:unit      # DOM input, 16 cases   (needs Chrome + token)
 npm run test:pool      # parallel pool, 8 cases (needs Chrome + token)
 npm test               # all ten suites, --test-concurrency=1
@@ -136,19 +140,72 @@ await browser.close();   // hands back our tabs and the relay's, then disconnect
 | **Transport ceiling** | The one hard number, and not a style choice: the extension bridge drops the connection past 3 attached tabs. Pin your own with `BC_TAB_BUDGET` | `BC_MAX_TABS_EXTENSION`, `BC_TAB_BUDGET` |
 | **Ownership** | Tabs that existed before `attach()` belong to the operator and are **never closed, navigated or counted**; `window.open` / `target=_blank` popups are adopted as ours | — |
 | **Holds** | `TabPool` tabs call `hold()` and are immune to recycling, eviction and reaping | `BC_TAB_EVICT=0` to error instead of evicting |
-| **Named surfaces** | `guard.surface("docs")` binds a name to a page: the same name always returns the same page, and a bound surface is never recycled or reaped. `guard.surface()` is the scratch page, recycled as aggressively as before. `guard.release(name)` turns it back into an ordinary owned tab; `guard.surfaces()` lists `{ name, url, idleMs, blanked }` | — |
+| **Named surfaces** | `guard.surface("docs")` binds a name to a page: the same name always returns the same page, and a bound surface is never recycled or reaped. `guard.surface()` is the **scratch page** — one page shared by every unnamed call, so a run of unnamed work costs one tab, not one tab per step; it stays unheld, so it is still recycled, evicted and reaped like any unnamed tab. `guard.release(name)` turns a name back into an ordinary owned tab; `guard.surfaces()` lists `{ name, url, idleMs, blanked }` | — |
+| **Background tabs** | On raw CDP a new tab is opened with `Target.createTarget { background: true }`, so it never becomes the tab you are looking at. The extension relay has no such option (`chrome.tabs.create` always activates), so there it degrades to an ordinary foreground tab and stops asking. `report().backgroundTabs` says which you are getting | — |
 | **Nothing is left behind** | `browser.close()` returns our tabs *and* the relay's `connect.html`; a process that forgets reclaims on `beforeExit`/`SIGINT`/`SIGTERM` | `BC_KEEP_BRIDGE_TAB=1`, `BC_TAB_GUARD=0`, `attach({ guard: false })` |
 
 The two questions are answered by different mechanisms and both stay true: the measured
-cadence answers *"is this scratch tab idle?"*, and a name answers *"is this page still
+cadence answers *"is this unnamed tab idle?"*, and a name answers *"is this page still
 wanted?"*. When the transport ceiling is reached and **every** tab is a bound surface,
 the least-recently-used surface is released and its tab reused — never an error, and
 `report().surfacesEvicted` plus the tool output say so, because losing a named page has
 to be visible.
 
+The scratch page is deliberately *not* on the cadence: an agent that pauses to think for
+30 s used to make every unnamed step open a fresh tab and evict the previous one, so the
+operator watched tabs blink in and out. `report().scratch` is its URL, or `null` when
+none is open.
+
 Measured against the real browser: ten `newPage()` calls in a row produced **3 tabs created, 7 recycled, 0 evicted**, and the browser was back to its original tab count after `close()`; three consecutive full test runs leave the tab count exactly where it started. A dead end worth recording: an earlier version gated admission on free system memory, which is unmeasurable portably (macOS reported 1% free on a healthy 16 GB machine against 24% actually available) and wrong in principle — refusing a tab frees nothing, it only breaks the caller. Reuse and reclaiming do the work instead.
 
 Two measured facts about the extension transport that shape all of this (2026-10-02): `context.pages()` lists **only the relay's own tab plus tabs opened during this connection** — the operator's existing tabs are not enumerable, so they are safe but also invisible to `cleanup.mjs`; and the relay opens a `connect.html` tab per `attach()` that nothing used to close. Tabs the extension cannot attach to at all (`chrome://`, the Web Store, other extensions' pages, `file://` without access) never appear either.
+
+## Not taking the screen
+
+`attach()` on the extension transport makes playwright-core **launch Chrome** with the
+relay's `connect.html` URL, and Chrome raises itself over whatever the operator is doing
+— even when it was already running, which is the annoying case.
+
+That raise cannot be prevented, measured three ways on 2026-10-06 against an
+already-running Chrome: spawning the binary with the URL (what playwright does),
+`open -g -a "Google Chrome" <url>` (`-g` = do not foreground), and AppleScript
+`make new tab`. All three put Chrome in front — it activates itself on an external URL.
+
+So the screen is taken back instead, and early: the frontmost application is read before
+connecting (`lsappinfo`), a watcher polls every 100 ms **during** the connect and
+reactivates it (`open -b`) the moment Chrome grabs the screen, and `capabilities.focus`
+reports what happened:
+
+```json
+{ "restored": true, "app": "com.microsoft.VSCode", "took": "com.google.Chrome", "bounces": 1 }
+```
+
+Measured with a 50 ms sampler around a real `attach()`: Chrome holds the screen for
+**~100–150 ms**, not the ~600 ms the handshake takes. The screen is only ever taken back
+from Chrome/Chromium — an operator who switches to another application themselves is
+never yanked back (`not-the-browser (com.apple.Terminal)` in the report). macOS only; no
+accessibility grant needed, and Windows has no equivalent short of a native
+`SetForegroundWindow`. `BC_RESTORE_FOCUS=0` turns it off, `BC_FOCUS_WATCH_MS` (10 s)
+bounds the watcher.
+
+The cure, and it is measured: **`auto` + a resident shim + a resident MCP server**. On
+`cdp` the whole class of interruption disappears — `attach()` opens no page, so nothing is
+raised, and tabs are created in the background, so the tab you are reading stays the
+active one. Verified end to end on 2026-10-06 against the operator's own logged-in
+Chrome, driving the real MCP server over stdio (three unnamed navigations plus one named
+page, twice in a row):
+
+```text
+mode: cdp | chose: "cdp"
+guard: {"owned":2,"created":2,"evicted":0,"backgroundTabs":true,"operatorTabs":4}
+front before/after: com.microsoft.VSCode / com.microsoft.VSCode
+operator tab https://www.zhihu.com/ visibility before/after: visible / visible
+```
+
+On `extension` the residue is one ~150 ms flash per `attach()` plus a tab activation per
+new tab (`chrome.tabs.create` has no background option), which is why the scratch page
+matters there: the cure for "a tab appeared in front of me again" is opening fewer tabs,
+not fighting the browser for them.
 
 ## MCP server
 
@@ -201,6 +258,39 @@ On 2026-09-05, Chrome 152 + the Playwright Extension were crashed or made to qui
 | Every `attach()` leaves the relay's `connect.html` tab behind (sixteen runs left sixteen tabs) | `browser.close()` closes it too, and the guard reclaims on `beforeExit`/`SIGINT`/`SIGTERM`; `BC_KEEP_BRIDGE_TAB=1` to keep it |
 | **The extension accepts one client at a time**: two test files in parallel means one cannot connect and the other is interrupted | Suites run serially (`--test-concurrency=1`) |
 | `setViewport` issues `Emulation.setDeviceMetricsOverride` and shrinks the operator's page | No-op unless `BC_VIEWPORT=1` |
+
+## Footprint on your machine
+
+Installing this must not scatter files around. It writes to **one directory**, plus the
+plist launchd insists on owning:
+
+| Path | What | Removed by `--uninstall` |
+| --- | --- | --- |
+| `~/Library/LaunchAgents/com.browser-control.shim.plist` | the launchd agent — only if you installed the service | yes |
+| `~/.cache/browser-control/shim.log`, `shim.err.log` | the shim's own output, **truncated at 256 KiB** on every start, so a service running for months stays two small files | yes |
+| `~/.cache/browser-control/` | the only directory this kit writes to | yes, when empty |
+| `~/.config/browser-control/token` | **your** extension token, pasted by you: read, never written, never echoed | **no** — deleting a secret you pasted is not cleanup |
+| `<node prefix>/bin/browser-control-mcp` + `lib/node_modules/browser-control-mcp` | symlinks, only if you ran `npm link` in `packages/mcp-server` | **no** — npm's: `npm rm -g browser-control-mcp` |
+
+Nothing else: no state file, no database, no node_modules outside the repo, nothing in
+the Chrome profile (permission probes are cleared immediately, `setViewport` is inert,
+and tabs that existed before `attach()` are never touched). `BC_SHIM_LOG_DIR` moves the
+directory, `BC_SHIM_LOG_MAX` the cap.
+
+Measured on 2026-10-06, a whole agent session (attach → open a tab → navigate →
+evaluate → close) against a timestamp and a sweep of `~/.cache`, `~/.config`, `~/.local`,
+`~/Library/LaunchAgents`, `/tmp` and `/var/folders`: **51 bytes**, all of them appended to
+`shim.log`. No temp directory, no profile copy, no browser download — `playwright-core`
+is the only dependency and this kit never installs a browser.
+
+```bash
+node scripts/install-shim-service.mjs --status      # every path, its size, and what is ours
+node scripts/install-shim-service.mjs --uninstall    # stop the agent and delete all of it
+```
+
+`--status` prints the list above with live sizes and marks each line `rm` or not; the two
+commands read the same list in `scripts/install-shim-service.mjs`, so "what did you
+install" and "remove it" cannot drift apart (pinned by `shim-service.test.mjs`).
 
 ## Local CI (git hooks, now plus GitHub Actions)
 

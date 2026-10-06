@@ -10,9 +10,15 @@
 // Runs on Node >= 22 (global WebSocket), pinned by ../.nvmrc.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
+import { statSync, truncateSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { upgrade } from "./ws-server.mjs";
+
+// Everything this kit writes lives in ONE directory, so "what did you put on my
+// machine?" has a one-line answer (plus launchd's own plist). BC_SHIM_LOG_DIR moves it.
+const LOG_DIR = process.env.BC_SHIM_LOG_DIR ?? path.join(os.homedir(), ".cache", "browser-control");
+const LOG_MAX = Number(process.env.BC_SHIM_LOG_MAX ?? 262_144);
 
 const CHROME_HOST = process.env.CHROME_HOST ?? "127.0.0.1";
 const LISTEN_PORT = Number(process.env.SHIM_PORT ?? 9333);
@@ -38,11 +44,23 @@ let connects = 0;
 // shared socket killed the operator's real browser — measured twice 2026-10-02.
 const REFUSED_METHODS = new Set(["Browser.close", "Browser.crash", "Browser.crashGpuProcess"]);
 
+/**
+ * Chrome's browser websocket. The per-launch id lives in DevToolsActivePort,
+ * which macOS keeps behind Full Disk Access — when that read fails, the id-less
+ * `/devtools/browser` endpoint upgrades just the same, so a shim without the
+ * permission still works instead of sending the operator to restart Chrome.
+ */
 async function endpoint() {
-  const [port, path] = (await readFile(ACTIVE_PORT_FILE, "utf8")).trim().split("\n");
-  if (!path) throw new Error("DevToolsActivePort has no websocket path");
-  chromePort = Number(port) || chromePort;
-  return `ws://${CHROME_HOST}:${chromePort}${path}`;
+  try {
+    const [port, wsPath] = (await readFile(ACTIVE_PORT_FILE, "utf8")).trim().split("\n");
+    if (wsPath) {
+      chromePort = Number(port) || chromePort;
+      return `ws://${CHROME_HOST}:${chromePort}${wsPath}`;
+    }
+  } catch (err) {
+    portFileReason = String(err?.message ?? err).split("\n")[0];
+  }
+  return `ws://${CHROME_HOST}:${chromePort}/devtools/browser`;
 }
 
 let socket = null;
@@ -50,6 +68,9 @@ let connecting = null;
 // Why the one socket is down, phrased for the operator, or null while healthy.
 // /shim/status hands it to attach.mjs: "no debugging port" vs "click Allow".
 let notAttached = null;
+// Set when DevToolsActivePort could not be read: the connection still goes
+// ahead over the id-less endpoint, but a failure must name this.
+let portFileReason = null;
 let seq = 0;
 // Ceiling for a proxied command Chrome never answers, looser than our own 15s
 // because a client's navigation may be slow. BC_SHIM_PROXY_TIMEOUT_MS moves it.
@@ -64,58 +85,43 @@ const clients = new Set();
 const sessionOwner = new Map();
 const ATTACH_METHODS = new Set(["Target.attachToTarget", "Target.attachToBrowserTarget"]);
 
-/** Why connect() failed: a hung handshake means Chrome is listening and waiting on Allow, ENOENT/refusal means no debugging port at all. */
+/** Why connect() failed: a hung handshake means Chrome is listening and waiting on Allow, anything else means nothing usable is on that port. */
 function whyNotAttached(err) {
   const detail = String(err?.message ?? err).split("\n")[0];
   if (detail.includes("connect timeout")) {
     return `Chrome is listening but never finished the websocket handshake, which is what it does while an approval dialog is open: click Allow in Chrome (${detail})`;
   }
-  if (detail.includes("ENOENT")) {
-    return `no DevToolsActivePort at ${ACTIVE_PORT_FILE}, so this Chrome was not started with --remote-debugging-port, or it runs on another profile — set CHROME_PORT_FILE to that profile's file (${detail})`;
-  }
-  return `nothing usable answered on ${CHROME_HOST}:${chromePort} — set CHROME_HOST/CHROME_PORT if Chrome's debugging port is not the default one (${detail})`;
+  // The port file is a hint now, not a requirement — but when it could not be
+  // read, say so, because that is the difference between "grant Full Disk
+  // Access" and "this Chrome has no debugging port at all".
+  const aside = portFileReason
+    ? ` — and ${ACTIVE_PORT_FILE} could not be read (${portFileReason}), so the id-less /devtools/browser endpoint was used instead: on macOS grant Full Disk Access to whatever starts the shim, or point CHROME_PORT_FILE at a readable copy`
+    : "";
+  return `nothing usable answered on ${CHROME_HOST}:${chromePort} — set CHROME_HOST/CHROME_PORT if Chrome's debugging port is not the default one (${detail})${aside}`;
 }
+
+// Chrome binds 9222 before its DevTools handler is ready, so the first dial after
+// a browser restart is closed instantly (measured 2026-10-06: 285 ms, while a
+// healthy dial takes ~2.2 s). Retrying that is the difference between "the agent's
+// next call works" and "it fell back to the other transport for no reason". A
+// `connect timeout` is NOT retried: that one means an approval dialog is open.
+const DIAL_RETRIES = Number(process.env.BC_SHIM_DIAL_RETRIES ?? 3);
+const DIAL_BACKOFF_MS = Number(process.env.BC_SHIM_DIAL_BACKOFF_MS ?? 400);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function connect() {
   if (socket?.readyState === WebSocket.OPEN) return socket;
   if (connecting) return connecting;
   connecting = (async () => {
-    const url = await endpoint();
-    const ws = new WebSocket(url);
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("connect timeout")), 10_000);
-      ws.onopen = () => {
-        clearTimeout(timer);
-        resolve();
-      };
-      ws.onerror = () => {
-        clearTimeout(timer);
-        reject(new Error("connect failed"));
-      };
-      ws.onclose = (e) => {
-        clearTimeout(timer);
-        reject(new Error(`connect closed ${e.code}`));
-      };
-    });
-    ws.onmessage = (event) => route(JSON.parse(event.data));
-    ws.onclose = () => {
-      socket = null;
-      for (const [id, waiter] of pending) {
-        pending.delete(id);
-        if (waiter.client) failProxied(waiter, "the shim's browser socket closed before Chrome answered this command; the next attach reconnects and Chrome will ask the operator to click Allow once more");
-        else waiter.reject(new Error("browser socket closed"));
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await dial();
+      } catch (err) {
+        const dialogIsUp = String(err?.message ?? err).includes("timeout");
+        if (dialogIsUp || attempt > DIAL_RETRIES) throw err;
+        await sleep(DIAL_BACKOFF_MS * attempt);
       }
-      // Reconnecting costs the operator another approval dialog, so say so.
-      for (const client of clients) client.conn.close(1001);
-      clients.clear();
-      sessionOwner.clear(); // every session died with the socket they lived on
-      console.error("browser socket closed; the next request reconnects and Chrome will ask the operator to click Allow ONCE more");
-    };
-    socket = ws;
-    connects += 1;
-    if (connects > 1) console.error(`reconnected to Chrome (connection #${connects}) — that cost one more approval click`);
-    console.log(`attached to ${url}`);
-    return ws;
+    }
   })();
   try {
     const ws = await connecting;
@@ -127,6 +133,46 @@ async function connect() {
   } finally {
     connecting = null;
   }
+}
+
+/** One dial: the websocket, wired up, or a throw naming how it failed. */
+async function dial() {
+  const url = await endpoint();
+  const ws = new WebSocket(url);
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("connect timeout")), 10_000);
+    ws.onopen = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    ws.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error("connect failed"));
+    };
+    ws.onclose = (e) => {
+      clearTimeout(timer);
+      reject(new Error(`connect closed ${e.code}`));
+    };
+  });
+  ws.onmessage = (event) => route(JSON.parse(event.data));
+  ws.onclose = () => {
+    socket = null;
+    for (const [id, waiter] of pending) {
+      pending.delete(id);
+      if (waiter.client) failProxied(waiter, "the shim's browser socket closed before Chrome answered this command; the next attach reconnects and Chrome will ask the operator to click Allow once more");
+      else waiter.reject(new Error("browser socket closed"));
+    }
+    // Reconnecting costs the operator another approval dialog, so say so.
+    for (const client of clients) client.conn.close(1001);
+    clients.clear();
+    sessionOwner.clear(); // every session died with the socket they lived on
+    console.error("browser socket closed; the next request reconnects and Chrome will ask the operator to click Allow ONCE more");
+  };
+  socket = ws;
+  connects += 1;
+  if (connects > 1) console.error(`reconnected to Chrome (connection #${connects}) — that cost one more approval click`);
+  console.log(`attached to ${url}`);
+  return ws;
 }
 
 /** Chrome → us: answer our own calls, or hand the message back to its client. */
@@ -378,6 +424,17 @@ server.on("error", (err) => {
 process.on("unhandledRejection", (err) => {
   console.error(`shim ignored an unhandled rejection: ${String(err?.message ?? err).split("\n")[0]} — the shim stays up so the approved Chrome socket survives`);
 });
+
+// The two log files are the only thing this process leaves on the machine, and
+// launchd appends to them forever. Truncating at startup (the fd is O_APPEND, so
+// the next write restarts at 0) bounds the footprint without a rotation scheme
+// nobody would ever read. BC_SHIM_LOG_DIR / BC_SHIM_LOG_MAX move the numbers.
+for (const name of ["shim.log", "shim.err.log"]) {
+  const file = path.join(LOG_DIR, name);
+  try {
+    if (statSync(file).size > LOG_MAX) truncateSync(file, 0);
+  } catch {} // no log file, or none we may touch: nothing to cap
+}
 
 // Dialling Chrome only after the bind succeeds is what keeps approval clicks =
 // shim processes: the EADDRINUSE loser must not spend a grant it takes to the

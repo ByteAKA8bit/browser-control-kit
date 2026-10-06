@@ -41,21 +41,58 @@ function fakePage(url = "https://example.com/") {
   };
 }
 
-/** Minimal stand-in for a BrowserContext. */
+/** Minimal stand-in for a BrowserContext. `off` really removes: a listener the
+ * guard forgets to drop is a leak, and these tests are where that shows up. */
 function fakeContext(initial = []) {
   const pages = [...initial];
   const handlers = [];
-  return {
+  const context = {
+    opened: 0,
+    browser: () => context._browser ?? null,
     pages: () => pages.filter((p) => !p._closed),
-    on: (event, fn) => event === "page" && handlers.push(fn),
-    off: () => {},
-    async newPage(url = "about:blank") {
+    on: (event, fn) => {
+      if (event === "page") handlers.push(fn);
+    },
+    off: (event, fn) => {
+      const at = handlers.indexOf(fn);
+      if (event === "page" && at >= 0) handlers.splice(at, 1);
+    },
+    once: (event, fn) => context.on(event, fn),
+    listeners: () => handlers.length,
+    /** A tab that appeared without newPage(): a popup, or a CDP-created target. */
+    emit(url = "about:blank") {
       const page = fakePage(url);
       pages.push(page);
-      for (const fn of handlers) fn(page);
+      for (const fn of [...handlers]) fn(page);
       return page;
     },
+    async newPage(url = "about:blank") {
+      context.opened += 1;
+      return context.emit(url);
+    },
   };
+  return context;
+}
+
+/** A browser whose one CDP session answers Target.createTarget by producing a tab. */
+function fakeCdpBrowser(context, { refuse = false } = {}) {
+  const session = { sent: [], detached: false, calls: 0 };
+  session.send = async (method, params) => {
+    session.sent.push([method, params]);
+    if (refuse) throw new Error("Target.createTarget: Not allowed");
+    context.emit("about:blank");
+    return {};
+  };
+  session.detach = async () => {
+    session.detached = true;
+  };
+  context._browser = {
+    newBrowserCDPSession: async () => {
+      session.calls += 1;
+      return session;
+    },
+  };
+  return session;
 }
 
 const settled = () => new Promise((r) => setTimeout(r, 0));
@@ -483,16 +520,54 @@ describe("named surfaces", () => {
     guard.dispose();
   });
 
-  it("the scratch surface is still just newPage()", async () => {
+  it("hands every unnamed call the same scratch page, however slow the caller is", async () => {
     const context = fakeContext([fakePage()]);
-    const guard = guardFor(context, { ceiling: 4, recycleMs: 50 });
+    const guard = guardFor(context, { ceiling: 2, recycleMs: 60_000 }); // nothing counts as idle yet
+
+    const first = await guard.surface();
+    age(guard, first, 10_000); // an agent that stopped to think, not a free tab
+    const second = await guard.surface(null);
+
+    assert.equal(second, first, "unnamed work reuses its tab instead of opening and then evicting one");
+    assert.equal(guard.stats.created, 1);
+    assert.equal(guard.stats.evicted, 0, "the open-evict-open churn the operator used to watch");
+    assert.deepEqual(guard.surfaces(), [], "and nothing is bound by using it");
+    assert.equal(guard.report().scratch, "about:blank");
+    guard.dispose();
+  });
+
+  it("gives the scratch tab up when a name takes it, rather than sharing one page", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 3, recycleMs: 50 });
+
+    const scratch = await guard.surface();
+    age(guard, scratch, 10_000);
+    const named = await guard.surface("docs");
+    assert.equal(named, scratch, "an idle tab is an idle tab, named or not");
+
+    const again = await guard.surface();
+    assert.notEqual(again, named, "the scratch page is not quietly somebody's named page");
+    assert.equal(guard.owned.size, 2);
+    assert.deepEqual(
+      guard.surfaces().map((s) => s.name),
+      ["docs"],
+    );
+    guard.dispose();
+  });
+
+  it("opens a new scratch page once the reaper has taken the old one", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 3, idleMs: 50, blankMs: 10 });
 
     const first = await guard.surface();
     age(guard, first, 10_000);
-    const second = await guard.surface(null);
+    assert.equal((await guard.reap()).reaped, 1, "unnamed means reclaimable: the task is over");
+    assert.equal(first._closed, true);
+    assert.equal(guard.report().scratch, null);
 
-    assert.equal(second, first, "unnamed pages are recycled as aggressively as ever");
-    assert.deepEqual(guard.surfaces(), [], "and nothing is bound by using it");
+    const second = await guard.surface();
+    assert.notEqual(second, first);
+    assert.equal(second.isClosed(), false);
     guard.dispose();
   });
 
@@ -692,6 +767,59 @@ describe("named surfaces", () => {
     assert.equal(fresh.isClosed(), false);
     assert.equal(guard.stats.surfacesEvicted, 1);
     assert.equal(guard.owned.size, 2, "and no new renderer was opened either");
+    guard.dispose();
+  });
+});
+
+// A tab that becomes the active tab is the operator losing their place. Raw CDP
+// can ask for one that does not; the extension relay cannot, and must not pay
+// for asking (nor leak a listener, a timer or a session while trying).
+describe("background tabs", () => {
+  it("opens the tab without taking the operator's active tab", async () => {
+    const context = fakeContext([fakePage()]);
+    const session = fakeCdpBrowser(context);
+    const guard = guardFor(context, { mode: "cdp", ceiling: 3 });
+    const listeners = context.listeners();
+
+    const page = await guard.newPage();
+    assert.deepEqual(session.sent, [["Target.createTarget", { url: "about:blank", background: true }]]);
+    assert.equal(context.opened, 0, "an ordinary newPage() is the one that steals the foreground");
+    assert.ok(guard.owned.has(page));
+    assert.equal(context.listeners(), listeners, "the page listener is removed on the way out");
+    assert.equal(guard.report().backgroundTabs, true);
+
+    guard.dispose();
+    await settled();
+    assert.equal(session.detached, true, "the browser session is handed back, not left open");
+  });
+
+  it("falls back to an ordinary tab when the browser refuses, and stops asking", async () => {
+    const context = fakeContext([fakePage()]);
+    const session = fakeCdpBrowser(context, { refuse: true });
+    const guard = guardFor(context, { mode: "cdp", ceiling: 3 });
+
+    const first = await guard.newPage();
+    assert.ok(guard.owned.has(first), "the caller still gets a tab");
+    assert.equal(context.opened, 1);
+    assert.equal(guard.report().backgroundTabs, false);
+
+    const listeners = context.listeners();
+    await guard.newPage();
+    assert.equal(session.sent.length, 1, "one refusal is enough");
+    assert.equal(session.calls, 1, "and no second CDP session is opened either");
+    assert.equal(context.listeners(), listeners, "the failed attempt left no listener behind");
+    guard.dispose();
+  });
+
+  it("never asks on the extension transport, where the option does not exist", async () => {
+    const context = fakeContext([fakePage()]);
+    const session = fakeCdpBrowser(context);
+    const guard = guardFor(context, { mode: "extension", ceiling: 3 });
+
+    await guard.newPage();
+    assert.deepEqual(session.sent, [], "asking costs a round trip that can only fail there");
+    assert.equal(context.opened, 1);
+    assert.equal(guard.report().backgroundTabs, false);
     guard.dispose();
   });
 });

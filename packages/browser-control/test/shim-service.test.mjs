@@ -21,7 +21,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { ENV_KEYS, buildPlist, captureEnv } from "../../../scripts/install-shim-service.mjs";
+import { ENV_KEYS, buildPlist, captureEnv, footprint } from "../../../scripts/install-shim-service.mjs";
 
 const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
 const TAG = /^<(\/?)([A-Za-z_][\w.:-]*)((?:\s+[A-Za-z_][\w.:-]*\s*=\s*"[^"<]*")*)\s*(\/?)>/;
@@ -236,4 +236,53 @@ describe("launchd agent plist", () => {
       assert.equal(apple.ThrottleInterval > 0, true);
     },
   );
+});
+
+// "What did installing this put on my machine?" must have one answer, and
+// --uninstall must delete exactly that answer. Both read the same list, so the
+// list is what gets pinned: miss a file here and it is left behind forever.
+describe("footprint", () => {
+  const home = "/Users/op";
+  const paths = footprint({ home });
+
+  it("names every path the kit can create, and nothing outside one cache directory", () => {
+    const ours = paths.filter((entry) => entry.ours).map((entry) => entry.path);
+    assert.deepEqual(ours, [
+      `${home}/Library/LaunchAgents/com.browser-control.shim.plist`,
+      `${home}/.cache/browser-control/shim.log`,
+      `${home}/.cache/browser-control/shim.err.log`,
+      `${home}/.cache/browser-control`,
+    ]);
+    assert.ok(
+      ours.every((file) => file.startsWith(`${home}/.cache/browser-control`) || file.endsWith(".plist")),
+      "one directory plus the plist launchd insists on owning",
+    );
+  });
+
+  it("keeps the operator's token out of what gets removed", () => {
+    const token = paths.find((entry) => entry.path.endsWith("/token"));
+    assert.equal(token.ours, false, "deleting a secret the operator pasted is not cleanup");
+    assert.match(token.what, /never written/);
+  });
+
+  it("follows BC_SHIM_LOG_DIR, so the logs cannot end up somewhere unlisted", () => {
+    const moved = footprint({ home, logDir: "/tmp/bc-logs" });
+    assert.deepEqual(
+      moved.filter((entry) => entry.path.endsWith(".log")).map((entry) => entry.path),
+      ["/tmp/bc-logs/shim.log", "/tmp/bc-logs/shim.err.log"],
+    );
+    assert.ok(moved.some((entry) => entry.path === "/tmp/bc-logs" && entry.dir));
+  });
+
+  it("names the global npm link too, without claiming the right to delete it", () => {
+    const listed = footprint({ home, npmPrefix: "/opt/node" }).filter((entry) => entry.path.startsWith("/opt/node"));
+    assert.deepEqual(
+      listed.map((entry) => [entry.path, entry.ours]),
+      [
+        ["/opt/node/bin/browser-control-mcp", false],
+        ["/opt/node/lib/node_modules/browser-control-mcp", false],
+      ],
+    );
+    assert.match(listed[0].what, /npm rm -g/);
+  });
 });

@@ -17,7 +17,7 @@ Everything is ESM `.mjs` with no build step. Do not add `.js`, `.ts`, a bundler,
 ## The two test tiers
 
 ```bash
-npm run test:offline   # 140 cases, no browser needed (tab guard, ws codec, shim autostart + policy + recovery + service + session, MCP protocol)
+npm run test:offline   # 164 cases, no browser needed (tab guard, focus restore, ws codec, shim autostart + policy + recovery + service + session, MCP protocol)
 npm run test:unit      # dom-input, 16 cases   (needs Chrome + the Playwright Extension + a token)
 npm run test:pool      # pool, 8 cases         (needs Chrome + the Playwright Extension + a token)
 npm test               # every suite, --test-concurrency=1

@@ -47,7 +47,7 @@ npm i && node scripts/install-hooks.mjs      # Node ≥ 22；不要用 Bun（其
 # 一次性：装 Playwright Extension，把 status 页的 token 存起来
 mkdir -p ~/.config/browser-control && pbpaste > ~/.config/browser-control/token && chmod 600 $_
 
-npm run test:offline     # 标签治理、WebSocket 编解码、shim、MCP 协议 140 例（不需要浏览器，pre-commit 也跑）
+npm run test:offline     # 标签治理、焦点归还、WebSocket 编解码、shim、MCP 协议 164 例（不需要浏览器，pre-commit 也跑）
 npm run test:unit        # DOM 输入 16 例
 npm run test:pool        # 并行 8 例
 npm run selftest         # 端到端自检
@@ -68,12 +68,18 @@ const pool = await new TabPool(context, { size: 2, capabilities }).start();
 const results = await pool.map(items, async (item, tab) => tab.evaluate(/* … */));
 ```
 
-## 两种通道
+## 两种通道，和自动选路的 `auto`
 
-| 通道 | 前置条件 | 要点"允许"吗 | 能力 |
-| --- | --- | --- | --- |
-| `extension`（默认） | Playwright Extension + token | **不用** | 无浏览器级 CDP（无焦点模拟/权限预授权/下载目录）→ 由 DOM 级输入兜住；标签生命周期受限（见下） |
-| `cdp` | Chrome 带 `--remote-debugging-port` + `npm run shim` | **一次**（shim 代理住那条连接） | 完整 CDP |
+| 通道 | 前置条件 | 要点"允许"吗 | 会抢你的屏幕吗 | 能力 |
+| --- | --- | --- | --- | --- |
+| `extension` | Playwright Extension + token | **不用** | 会：每次 `attach()` 约 150ms（启动 Chrome 带 relay 页，Chrome 自己提到最前） | 无浏览器级 CDP（无焦点模拟/权限预授权/下载目录）→ 由 DOM 级输入兜住;标签生命周期受限（见下） |
+| `cdp` | Chrome 开着调试端口 + `npm run shim:service` | **一次**（Chrome 重启才再要一次） | **不会**：`attach()` 根本不开页面,新标签也开在后台 | 完整 CDP,含 `Target.createTarget { background: true }` |
+
+`DEFAULT_MODE` 是 `BC_MODE ?? "auto"`,**推荐就用 `auto`**:它探一下 `BC_CDP_URL`(默认 `http://localhost:9333`),有 shim 在应答就走 `cdp`,否则走 `extension`。它**绝不会去启动 shim**——启动 shim 是唯一可能弹出 Chrome 授权框的动作,无人值守的 agent 不能等一次点击。决策和理由记在 `capabilities.chose`。
+
+所以"不打扰"的配置就是:装一次 shim 常驻(`npm run shim:service`),Chrome 重启后点一次"允许",其余全部交给 `auto`。没装也不会坏——退回 extension 通道,无人值守,代价是每次 attach 那约 150ms 的闪。
+
+用 `BC_MODE=extension` / `BC_MODE=cdp` 或 `attach({ mode })` 可以钉死某一条;shim 地址是 `BC_CDP_URL`。
 
 ## 不想反复点"允许"
 
@@ -142,14 +148,42 @@ await browser.close();   // 自己的标签 + relay 的桥接页,一起还回去
 | **通道上限** | 唯一一个硬数字,而且不是审美问题:扩展桥超过 3 个附着标签就断连。想自己定死用 `BC_TAB_BUDGET` | `BC_MAX_TABS_EXTENSION`、`BC_TAB_BUDGET` |
 | **归属** | `attach()` 之前就存在的标签属于操作者,**永不关闭、不导航、不计数**;`window.open`/`target=_blank` 弹窗算我们的 | — |
 | **占用** | `TabPool` 的标签 `hold()` 住,不会被复用、淘汰或回收 | `BC_TAB_EVICT=0` 改为只报错不淘汰 |
-| **具名页面（surface）** | `guard.surface("docs")` 把一个名字绑到一个页面:同名总是返回同一个页面,绑定期间既不会被复用也不会被回收。`guard.surface()` 是草稿页,仍按原来的策略激进复用。`guard.release(name)` 把它变回普通的自有标签;`guard.surfaces()` 列出 `{ name, url, idleMs, blanked }` | — |
+| **具名页面（surface）** | `guard.surface("docs")` 把一个名字绑到一个页面:同名总是返回同一个页面,绑定期间既不会被复用也不会被回收。`guard.surface()` 是**草稿页**——所有不具名的调用共用这一个页面,所以一串不具名的操作只占一个标签,而不是一步一个;它不被 hold,因此照样会被复用、淘汰、回收。`guard.release(name)` 把名字解绑、标签变回普通的自有标签;`guard.surfaces()` 列出 `{ name, url, idleMs, blanked }` | — |
+| **后台开标签** | raw CDP 下新标签用 `Target.createTarget { background: true }` 打开,永远不会变成你正在看的那个标签;扩展 relay 没有这个选项(`chrome.tabs.create` 必然激活),于是退回普通前台标签并且不再重试。`report().backgroundTabs` 告诉你当前是哪一种 | — |
 | **不留尾巴** | `browser.close()` 连 relay 的 `connect.html` 一起关;调用方忘了收尾,`beforeExit`/`SIGINT`/`SIGTERM` 也会还 | `BC_KEEP_BRIDGE_TAB=1`、`BC_TAB_GUARD=0`、`attach({ guard: false })` |
 
-两个问题由两套机制分别回答,而且都成立:量出来的节拍回答"这个草稿标签闲了吗",名字回答"这个页面还要不要"。当通道上限已满、而且**每个**标签都是绑定的具名页面时,**最久未用**的那个会被释放、它的标签被复用——不报错,而是记进 `report().surfacesEvicted` 并在工具输出里说出来:丢掉一个具名页面必须是可见的。
+两个问题由两套机制分别回答,而且都成立:量出来的节拍回答"这个不具名的标签闲了吗",名字回答"这个页面还要不要"。当通道上限已满、而且**每个**标签都是绑定的具名页面时,**最久未用**的那个会被释放、它的标签被复用——不报错,而是记进 `report().surfacesEvicted` 并在工具输出里说出来:丢掉一个具名页面必须是可见的。
+
+草稿页**故意不走节拍**:一个每 30 秒才动一次的 agent,以前每一步不具名操作都会新开一个标签、再把上一个淘汰掉——操作者看到的就是标签一个个蹦出来又消失。`report().scratch` 给出它的 URL,没有就是 `null`。
 
 实测(真实 Chrome):连续 10 次 `newPage()` → **新建 3 个、复用 7 次、淘汰 0 个**,`close()` 后标签数回到原样;连跑三轮完整测试,标签数一个不多一个不少。一条值得记下的弯路:早期版本按"系统剩余内存"做准入,既无法跨平台测准(macOS 上 16 GB 健康机器报 1%,实际可用 24%),原理上也站不住——**拒绝一个标签省不下一个字节,只会让活干不成**。复用和回收才是真正起作用的两件事。
 
 盲区：扩展通道附着不了的标签（`chrome://`、Web Store、其他扩展的页面、无 file 权限的 `file://`）不会出现在 `context.pages()` 里，这个守卫看不见、也关不掉。
+
+## 不抢屏幕
+
+扩展通道下的 `attach()` 会让 playwright-core **启动 Chrome** 并带上 relay 的 `connect.html`,而 Chrome 会把自己提到最前面——**哪怕它本来就在运行**,这正是最烦人的那种情况。
+
+这个"提前"挡不住。2026-10-06 对着已经在运行的 Chrome 实测了三条路:直接 spawn 浏览器二进制带 URL(playwright 的做法)、`open -g -a "Google Chrome" <url>`(`-g` 就是"别切到前台")、AppleScript `make new tab`。三条路都把 Chrome 顶到最前——外部给 URL,Chrome 自己会 activate。
+
+所以改成"抢回来",而且要早:连接前读一次最前台的应用(`lsappinfo`),连接**过程中**每 100ms 轮询一次,一旦发现 Chrome 抢走屏幕立刻 `open -b` 抢回,结果写在 `capabilities.focus` 里:
+
+```json
+{ "restored": true, "app": "com.microsoft.VSCode", "took": "com.google.Chrome", "bounces": 1 }
+```
+
+用 50ms 采样器围着真实 `attach()` 量到的数:Chrome 占住屏幕 **约 100–150ms**,而不是整个握手的 ~600ms。而且只从 Chrome/Chromium 手里抢——你自己切到别的应用,永远不会被拽回来(报告里是 `not-the-browser (com.apple.Terminal)`)。只支持 macOS,不需要辅助功能授权;Windows 上没有不写原生 `SetForegroundWindow` 的等价做法。`BC_RESTORE_FOCUS=0` 关掉,`BC_FOCUS_WATCH_MS`(10s)给轮询封顶。
+
+真正的解法,而且是量过的:**`auto` + 常驻 shim + 常驻 MCP server**。走 `cdp` 时这一整类打扰直接消失——`attach()` 不开页面,所以没有任何东西被提到前台;标签开在后台,所以你正在看的标签还是当前标签。2026-10-06 对着你自己登录的 Chrome、用真实 MCP server 跑 stdio 协议实测(3 次不具名导航 + 1 次具名页面,连跑两轮):
+
+```text
+mode: cdp | chose: "cdp"
+guard: {"owned":2,"created":2,"evicted":0,"backgroundTabs":true,"operatorTabs":4}
+front before/after: com.microsoft.VSCode / com.microsoft.VSCode
+operator tab https://www.zhihu.com/ visibility before/after: visible / visible
+```
+
+走 `extension` 时剩下的打扰是:每次 `attach()` 约 150ms 的闪,外加每开一个新标签会切走当前标签。所以草稿页在那条路上才重要——"又一个标签跳到我面前"的解法是少开标签,而不是跟浏览器抢焦点。
 
 ## MCP server
 
@@ -183,6 +217,27 @@ Agent 总爱把这个仓库现场包成 MCP,然后连接断断续续、标签越
 npm run mcp            # 手动跑
 node --test packages/mcp-server/test/protocol.test.mjs   # 25 个协议用例,不需要浏览器
 ```
+
+## 它在你机器上留下的东西
+
+装了不能满地撒文件。除了 launchd 强制要求的 plist,它只写**一个目录**:
+
+| 路径 | 是什么 | `--uninstall` 会删吗 |
+| --- | --- | --- |
+| `~/Library/LaunchAgents/com.browser-control.shim.plist` | launchd 服务定义——只有你装了常驻服务才有 | 会 |
+| `~/.cache/browser-control/shim.log`、`shim.err.log` | shim 自己的输出,**每次启动超过 256 KiB 就截断**,所以跑几个月也就是两个小文件 | 会 |
+| `~/.cache/browser-control/` | 这个工具唯一会写的目录 | 空了就删 |
+| `~/.config/browser-control/token` | **你自己**贴进去的扩展 token:只读,从不写、从不回显 | **不删**——删掉你贴的密钥不叫清理 |
+| `<node 前缀>/bin/browser-control-mcp` 等两个符号链接 | 只有你在 `packages/mcp-server` 里跑过 `npm link` 才有 | **不删**——归 npm:`npm rm -g browser-control-mcp` |
+
+除此之外什么都没有:没有状态文件、没有数据库、仓库外没有 node_modules,Chrome profile 里也不留东西(能力探测授予的权限立刻清掉,`setViewport` 默认无效,attach 之前就存在的标签永不触碰)。`BC_SHIM_LOG_DIR` 换目录,`BC_SHIM_LOG_MAX` 改上限。
+
+```bash
+node scripts/install-shim-service.mjs --status      # 每个路径、当前大小、哪些是我们的
+node scripts/install-shim-service.mjs --uninstall   # 停服务并删掉全部
+```
+
+`--status` 会把上表连同实时大小打出来,每行标注是不是 `rm`;两条命令读的是 `scripts/install-shim-service.mjs` 里**同一份清单**,所以"装了什么"和"删什么"不可能走偏(由 `shim-service.test.mjs` 钉住)。
 
 ## 本地 CI（git hook + GitHub Actions 的 offline 层）
 

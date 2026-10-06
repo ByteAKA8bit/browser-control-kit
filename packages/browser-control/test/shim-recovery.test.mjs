@@ -23,7 +23,7 @@ import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -75,10 +75,16 @@ async function freePort() {
  * sent before it. `connections` counts approval grants it would have cost.
  */
 function startFake() {
-  const fake = { connections: 0, held: [], mode: "reply", conn: null };
+  const fake = { connections: 0, refusals: 0, refuseFirst: 0, held: [], mode: "reply", conn: null };
   fake.server = createServer((_req, res) => res.end());
   fake.server.on("upgrade", (req, socket, head) => {
     if (new URL(req.url, "http://127.0.0.1").pathname !== FAKE_PATH) return socket.destroy();
+    // Chrome binds the port before its DevTools handler is ready, so the first
+    // dial after a browser restart is closed instantly. Reproduce that exactly.
+    if (fake.refusals < fake.refuseFirst) {
+      fake.refusals += 1;
+      return socket.destroy();
+    }
     const conn = upgrade(req, socket, head);
     if (!conn) return socket.destroy();
     fake.connections += 1;
@@ -131,7 +137,10 @@ async function portFileFor(port, wsPath = FAKE_PATH) {
 /** Spawn the real shim. `ready` resolves on its own readiness line, `exited` on its exit. */
 function startShim(env) {
   const child = spawn(process.execPath, [SHIM], {
-    env: { ...process.env, CHROME_HOST: "127.0.0.1", CHROME_PORT: "9222", BC_SHIM_KEEPALIVE_MS: "0", ...env },
+    // CHROME_PORT 1 on purpose: with no readable DevToolsActivePort the shim
+    // falls back to CHROME_PORT, and a test must never dial the operator's real
+    // Chrome — that is an approval dialog on somebody's screen.
+    env: { ...process.env, CHROME_HOST: "127.0.0.1", CHROME_PORT: "1", BC_SHIM_KEEPALIVE_MS: "0", ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
   children.add(child);
@@ -465,6 +474,38 @@ describe("/shim/status answers while Chrome is unreachable", () => {
   });
 });
 
+// macOS keeps Chrome's profile directory behind TCC, so a shim started without
+// Full Disk Access reads EPERM on a file that is right there. That used to be
+// reported as "Chrome was not started with --remote-debugging-port", which sent
+// the operator to restart a browser that was already correct.
+describe("an unreadable DevToolsActivePort is a permission problem, not a missing port", () => {
+  let shimPort;
+  let shim;
+  let portFile;
+
+  before(async () => {
+    portFile = await portFileFor(9222);
+    await chmod(portFile, 0o000);
+    ({ port: shimPort, shim } = await startShimOnFreePort({ CHROME_PORT_FILE: portFile }));
+  });
+
+  after(async () => {
+    shim.child.kill();
+    await chmod(portFile, 0o600).catch(() => {}); // so the temp dir can be cleaned up
+  });
+
+  it("says Full Disk Access instead of blaming the browser", async (t) => {
+    const reason = await until(async () => (await getJson(shimPort, "/shim/status")).body.reason, PATIENCE_MS, "a reason for not being attached");
+    if (/EPERM|EACCES/.test(reason) === false) {
+      t.skip(`this user can read a 000 file (root?): ${reason}`);
+      return;
+    }
+    assert.match(reason, /Full Disk Access/);
+    assert.ok(reason.includes(portFile), `the reason names the file: ${reason}`);
+    assert.doesNotMatch(reason, /was not started with --remote-debugging-port/);
+  });
+});
+
 describe("the reason distinguishes a Chrome with no debugging port from one that is there", () => {
   let missing;
   let refused;
@@ -575,5 +616,91 @@ describe("attach() in cdp mode says WHICH failure this is", () => {
   it("gives the three a different answer each, because each needs a different move", () => {
     const messages = [failure.none, failure.mute, failure.unattached];
     assert.equal(new Set(messages).size, 3, messages.join("\n---\n"));
+  });
+});
+
+// A service that runs for months must not quietly grow a log the operator never
+// asked for: the footprint is two files in one directory, and it stays small.
+describe("the shim bounds its own logs instead of growing them forever", () => {
+  let dir;
+  let shim;
+
+  before(async () => {
+    dir = await mkdtemp(join(tmpdir(), "shim-logs-"));
+    await writeFile(join(dir, "shim.log"), "x".repeat(40_000));
+    await writeFile(join(dir, "shim.err.log"), "y".repeat(40_000));
+    ({ shim } = await startShimOnFreePort({ BC_SHIM_LOG_DIR: dir, BC_SHIM_LOG_MAX: "1024" }));
+  });
+
+  after(() => shim.child.kill());
+
+  it("truncates a log past BC_SHIM_LOG_MAX at startup", async () => {
+    assert.equal((await stat(join(dir, "shim.log"))).size, 0);
+    assert.equal((await stat(join(dir, "shim.err.log"))).size, 0);
+  });
+
+  it("leaves a log that is still under the cap alone", async () => {
+    const small = await mkdtemp(join(tmpdir(), "shim-logs-"));
+    await writeFile(join(small, "shim.log"), "small");
+    const second = await startShimOnFreePort({ BC_SHIM_LOG_DIR: small, BC_SHIM_LOG_MAX: "1024" });
+    try {
+      assert.equal((await stat(join(small, "shim.log"))).size, 5);
+    } finally {
+      second.shim.child.kill();
+    }
+  });
+});
+
+// Chrome accepts connections on its debugging port before the DevTools handler
+// behind it is ready, so the dial right after a browser restart is closed
+// instantly. Measured 2026-10-06 against the real thing: 285 ms to fail, ~2.2 s
+// for the dial that works. Without a retry the shim sits unattached until some
+// client asks again, and the agent that asked first is told there is no browser.
+describe("a dial refused the instant Chrome restarted is retried, not reported", () => {
+  let fake;
+  let shimPort;
+  let shim;
+
+  before(async () => {
+    fake = startFake();
+    fake.refuseFirst = 2;
+    const chromePort = await fake.listen();
+    ({ port: shimPort, shim } = await startShimOnFreePort({
+      CHROME_PORT_FILE: await portFileFor(chromePort),
+      BC_SHIM_DIAL_BACKOFF_MS: "50",
+    }));
+  });
+
+  after(async () => {
+    shim.child.kill();
+    await fake.close();
+  });
+
+  it("attaches anyway, without the client having to ask twice", async () => {
+    await attachedToChrome(shimPort);
+    assert.equal(fake.refusals, 2, "both refusals were spent");
+    assert.equal(fake.connections, 1, "and the retry landed on the same socket the shim keeps");
+    const { body } = await getJson(shimPort, "/shim/status");
+    assert.equal(body.attached, true);
+    assert.equal(body.reason, null);
+  });
+
+  it("gives up rather than hammering a Chrome that keeps refusing", async () => {
+    const stubborn = startFake();
+    stubborn.refuseFirst = Number.MAX_SAFE_INTEGER;
+    const chromePort = await stubborn.listen();
+    const second = await startShimOnFreePort({
+      CHROME_PORT_FILE: await portFileFor(chromePort),
+      BC_SHIM_DIAL_RETRIES: "2",
+      BC_SHIM_DIAL_BACKOFF_MS: "20",
+    });
+    try {
+      const reason = await until(async () => (await getJson(second.port, "/shim/status")).body.reason, PATIENCE_MS, "a reason");
+      assert.match(reason, /nothing usable answered/);
+      assert.ok(stubborn.refusals <= 4, `tried ${stubborn.refusals} times: a refusing Chrome must not be hammered`);
+    } finally {
+      second.shim.child.kill();
+      await stubborn.close();
+    }
   });
 });
