@@ -146,6 +146,7 @@ describe("stdio JSON-RPC", () => {
       "browser_fill",
       "browser_navigate",
       "browser_screenshot",
+      "browser_script",
       "browser_status",
       "browser_surfaces",
       "browser_text",
@@ -177,6 +178,33 @@ describe("stdio JSON-RPC", () => {
         if (key === "as" || key === "on") assert.equal(tool.inputSchema.properties[key].type, "string");
       }
     }
+  });
+
+  // The cost an agent pays is turns, not milliseconds: 40 actions measured
+  // 878 ms as 40 tool calls and 642 ms in one script, but 41 turns against 1.
+  // So the batching tool has to exist, say what is in scope, and fail honestly.
+  it("offers one call that runs a whole flow, and says what the body can name", async () => {
+    const { result } = await client.request("tools/list", {});
+    const script = result.tools.find((tool) => tool.name === "browser_script");
+    assert.deepEqual(script.inputSchema.required, ["code"]);
+    for (const name of ["page", "surface", "state", "log"]) {
+      assert.ok(script.description.includes(name), `the description never mentions ${name}`);
+    }
+    assert.match(script.description, /survives between calls/, "state is the reason a flow can be resumed");
+  });
+
+  it("refuses a script with no body as a protocol mistake, not a tool error", async () => {
+    const { error, result } = await client.request("tools/call", { name: "browser_script", arguments: {} });
+    assert.equal(result, undefined);
+    assert.equal(error.code, -32602);
+    assert.match(error.message, /code/);
+  });
+
+  it("reports a script that cannot reach a browser as a tool error, like every other tool", async () => {
+    const { error, result } = await client.request("tools/call", { name: "browser_script", arguments: { code: "return 1;" } });
+    assert.equal(error, undefined);
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /browser_script failed/);
   });
 
   it("has forgotten the handle-based tab tools entirely", async () => {

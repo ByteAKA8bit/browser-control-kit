@@ -6,7 +6,7 @@
 
 - `packages/browser-control` — published; transport attach + a puppeteer-flavoured page wrapper + a parallel tab pool. Only third-party dep: `playwright-core@1.63.0-alpha-2026-08-31` (exact pin).
 - `packages/antd-kit` — private, zero-dep; `page.evaluate` helpers for Ant Design **v6** modals/drawers/forms.
-- `packages/mcp-server` — `browser-control-mcp`, an MCP stdio server exposing the kit as agent tools; depends only on `browser-control`. Its surface is ten tools over **named surfaces** (`as` / `on`) — no tab handles, and no tool that opens or closes a tab.
+- `packages/mcp-server` — `browser-control-mcp`, an MCP stdio server exposing the kit as agent tools; depends only on `browser-control`. Its surface is eleven tools over **named surfaces** (`as` / `on`) — no tab handles, and no tool that opens or closes a tab. The eleventh is `browser_script` (`src/script.mjs`): an async function body run against the attached session, because an agent pays in TURNS, not milliseconds (40 actions = 41 turns as tool calls, 1 as a script). It is deliberately unsandboxed — real page, real guard, `require`/`import()` — and injects a `state` object that survives between calls.
 
 Dependency direction is one-way and must stay that way: consumer suites → `antd-kit` → `browser-control` → `playwright-core`. `antd-kit` duck-types the `page` object; it has no dependency entry on `browser-control`.
 
@@ -48,7 +48,7 @@ graph LR
 | --- | --- |
 | `packages/browser-control/src/` | All library code (11 modules, see below) |
 | `packages/browser-control/test/` | `node:test` suites, flat, `<area>.test.mjs` (10 files; only `dom-input` and `pool` need a browser) |
-| `packages/mcp-server/` | `browser-control-mcp`: MCP stdio server wrapping `browser-control` (`bin/`, `src/server.mjs` + `tools.mjs` + `transport.mjs`, `test/protocol.test.mjs`), its only dependency |
+| `packages/mcp-server/` | `browser-control-mcp`: MCP stdio server wrapping `browser-control` (`bin/`, `src/server.mjs` + `tools.mjs` + `script.mjs` + `transport.mjs`, `test/protocol.test.mjs`), its only dependency |
 | `packages/antd-kit/` | Single-file `index.mjs`, antd v6 overlay helpers |
 | `scripts/` | Local CI (`check.mjs`), hook installer, launchd shim installer, `crash-repro.mjs` |
 | `examples/` | Runnable consumer sample, no npm script |
@@ -59,7 +59,7 @@ graph LR
 npm i && node scripts/install-hooks.mjs   # one-time: git config core.hooksPath .githooks
 
 npm test            # 11 suites in one process, --test-concurrency=1 (dom-input + pool need Chrome + token)
-npm run test:offline # browserless tier: tab-guard (47) + focus (7) + ws-server (17) + shim-autostart (14) + shim-policy (6) + shim-recovery (24) + shim-service (12) + shim-session (12) + mcp protocol (25) = 164
+npm run test:offline # browserless tier: tab-guard (47) + focus (7) + ws-server (17) + shim-autostart (14) + shim-policy (6) + shim-recovery (24) + shim-service (12) + shim-session (12) + mcp protocol (28) = 167
 npm run test:unit   # dom-input.test.mjs  (16 cases)
 npm run test:pool   # pool.test.mjs       (8 cases)
 npm run selftest    # end-to-end smoke; writes ./selftest.png, exits 1 on failure
@@ -159,7 +159,7 @@ Subpath exports: `browser-control/fixtures`, `/pool`, `/tab-guard`, `/shim`. Add
 
 ## Testing & QA
 
-Framework: built-in `node:test` (BDD) + `node:assert/strict`. No mocks, no snapshots, no coverage tooling, no reporters. Browserless: `tab-guard` (47), `focus` (7), `ws-server` (17), `shim-autostart` (14), `shim-policy` (6), `shim-recovery` (24), `shim-service` (12), `shim-session` (12), and `packages/mcp-server/test/protocol` (25). Needing a running Chrome and an extension token: `dom-input` (16), `pool` (8).
+Framework: built-in `node:test` (BDD) + `node:assert/strict`. No mocks, no snapshots, no coverage tooling, no reporters. Browserless: `tab-guard` (47), `focus` (7), `ws-server` (17), `shim-autostart` (14), `shim-policy` (6), `shim-recovery` (24), `shim-service` (12), `shim-session` (12), and `packages/mcp-server/test/protocol` (28). Needing a running Chrome and an extension token: `dom-input` (16), `pool` (8).
 
 `shim-recovery.test.mjs` pins the shim's recovery semantics: every pending call ends definitely (a timeout, the browser socket dropping, the client dropping all produce an id-matched error reply), a late real answer is neither delivered twice nor fatal, the `EADDRINUSE` loser exits 0 without ever having dialled Chrome — so losing the race costs no approval click — `/shim/status` still answers while Chrome is unreachable, and the three cdp `attach()` failures give three different messages. `shim-service.test.mjs` pins launchd plist generation: XML escaping that does not change the value launchd actually receives, `KeepAlive` paired with `ThrottleInterval` so a crashing shim cannot loop, and only the environment variables that were really set being captured. Its `plutil` cross-check is darwin-only and skips rather than fails elsewhere, because the offline tier runs on a Linux runner.
 

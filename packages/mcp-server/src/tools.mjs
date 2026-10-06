@@ -8,6 +8,8 @@
 // TabGuard — named pinned, unnamed recycled, idle reclaimed — so no tool here
 // can open or close a tab. browser-control (and playwright-core) is imported
 // lazily in #connect(), so merely listing tools costs nothing but a process.
+import { SCRIPT_DESCRIPTION, runScript } from "./script.mjs";
+
 const ATTACH_TIMEOUT_MS = () => Number(process.env.BC_MCP_ATTACH_TIMEOUT_MS ?? 60_000);
 const TEXT_LIMIT = () => Number(process.env.BC_MCP_TEXT_LIMIT ?? 20_000);
 const WAIT_TIMEOUT_MS = () => Number(process.env.BC_MCP_WAIT_MS ?? 20_000);
@@ -15,7 +17,7 @@ const WAIT_TIMEOUT_MS = () => Number(process.env.BC_MCP_WAIT_MS ?? 20_000);
 
 /** Shown by a client before the first tool call (MCP `initialize.instructions`). */
 export const INSTRUCTIONS =
-  "Pages are addressed by name, never by handle. Pass `as` to browser_navigate to keep that page under a name, and `on` to come back to it from any later call; leave both out and you get the scratch page, the single page every unnamed call shares. Nothing needs closing — named pages are kept while you use them, the scratch page is reused, idle ones are reclaimed — and browser_surfaces lists what is named right now.";
+  "Pages are addressed by name, never by handle. Pass `as` to browser_navigate to keep that page under a name, and `on` to come back to it from any later call; leave both out and you get the scratch page, the single page every unnamed call shares. Nothing needs closing — named pages are kept while you use them, the scratch page is reused, idle ones are reclaimed — and browser_surfaces lists what is named right now. For anything longer than one step, prefer browser_script: it runs a whole flow in one call against this same session, and `state` inside it survives between calls.";
 
 /** Reject instead of hanging forever when the operator never approves a connection. */
 function withTimeout(promise, ms, what) {
@@ -64,6 +66,19 @@ export class Session {
     this.#evicted = live.tabs?.stats?.surfacesEvicted ?? 0;
     this.#live = live;
     return live;
+  }
+
+  /** The attached session itself, for a script that wants more than one page. */
+  async live() {
+    const live = await this.browser();
+    this.#guard(live); // named pages are the whole model; without a guard there is none
+    live.scriptState ??= {}; // survives between browser_script calls, never across restarts
+    return live;
+  }
+
+  /** Wrap a raw page the way every tool does, reusing the proxy a page already has. */
+  wrap(raw) {
+    return this.#wrap(raw, this.#live);
   }
 
   /**
@@ -354,6 +369,26 @@ export const TOOLS = [
     description: "List the pages you have named, with their URL and how long each has been idle, plus the scratch page.",
     inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
     run: (_args, session) => session.surfaces(),
+  },
+  {
+    name: "browser_script",
+    description: SCRIPT_DESCRIPTION,
+    inputSchema: {
+      type: "object",
+      properties: {
+        code: { type: "string", description: "Async function body. `await` freely; `return` the result" },
+        on: { type: "string", description: "Name of the page `page` should be; omit for the scratch page" },
+        as: { type: "string", description: "Keep `page` under this name for later calls" },
+        timeoutMs: { type: "number", description: "Ceiling for the whole body (default BC_MCP_SCRIPT_MS, 120000)" },
+      },
+      required: ["code"],
+      additionalProperties: false,
+    },
+    async run({ code, on, as, timeoutMs }, session) {
+      const { page } = await session.target({ on, as });
+      const live = await session.live();
+      return new Payload(await runScript({ code, timeoutMs, page, live, wrap: (raw) => session.wrap(raw) }));
+    },
   },
 ];
 

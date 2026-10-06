@@ -76,6 +76,7 @@ Ten, and that is the whole surface.
 | `browser_screenshot` | `selector?`, `on?` | Capture a PNG of the viewport or one element. |
 | `browser_wait_for` | `selector`, `state?`, `timeoutMs?`, `on?` | Wait for a selector to reach a state. |
 | `browser_surfaces` | — | List the named pages with their URL and idle time, plus the scratch page's URL. |
+| `browser_script` | `code`, `on?`, `as?`, `timeoutMs?` | **Run a whole flow in one call.** Async function body against this session: `page`, `surface(name)`, `release`, `surfaces`, `state`, `log`, `guard`, `context`, `browser`, `capabilities`, `fixtures`, `controlPage`, `require`, `sleep`. Return JSON, or a Buffer for a PNG. |
 
 A tool that fails — no browser, no such selector, a page that threw — answers with `isError: true` and a sentence saying why. Only a protocol mistake (unknown tool, missing or mistyped argument, or `as` and `on` in the same call, which would name two different pages) is a JSON-RPC error. An `on` that names a page you never kept is a tool error listing the names that do exist:
 
@@ -86,6 +87,21 @@ browser_text failed: no page is named "a"; these are: b, c, d
 ## What it leaves on your machine
 
 This server itself writes nothing. The only files exist if you installed the resident shim: `~/Library/LaunchAgents/com.browser-control.shim.plist` and two truncated logs in `~/.cache/browser-control/`. `node scripts/install-shim-service.mjs --status` lists them with sizes, `--uninstall` removes all of them; your `~/.config/browser-control/token` is read and never touched. Nothing is written into the Chrome profile.
+
+## Why `browser_script` exists
+
+A tool call is cheap; an agent **turn** is not. Measured 2026-10-06: forty browser actions cost 878 ms as forty tool calls and 642 ms inside one script — 22 ms versus 16 ms per action, i.e. ~6 ms of JSON-RPC — but **41 agent turns against 1**, and the turns are the real bill (tokens, inference, latency). So the batch runs inside the attached session:
+
+```js
+// browser_script { "as": "flow", "code": "…" }
+await page.goto("https://example.com/");
+log("navigated to", page.url());
+const rows = await page.$$eval("a", (a) => a.map((x) => x.href));
+state.rows = rows;                    // survives into the next call
+return { count: rows.length, rows };
+```
+
+It is deliberately **not** a sandbox: the body gets the real page, the real guard, `require` and `import()`. An agent that can call this can already run bash, so fencing it would cost upload/download/file flows and buy nothing. What it adds over a bash script is the session: no second `attach()` (~723 ms on cdp), named pages still bound, and `state` carried between calls. A returned Buffer comes back as a PNG image block; `log()` and `console.log` ride along with the result; the body is capped by `timeoutMs` (default `BC_MCP_SCRIPT_MS`, 120 s).
 
 ## Protocol
 
@@ -111,9 +127,9 @@ Everything `browser-control` reads (`BC_MODE`, `BC_CDP_URL`, `BC_TAB_IDLE_MS`, �
 ## Test
 
 ```bash
-node --test packages/mcp-server/test/protocol.test.mjs   # 25 cases, no browser needed
+node --test packages/mcp-server/test/protocol.test.mjs   # 28 cases, no browser needed
 ```
 
-The suite speaks real stdio to the real binary: version negotiation, the version a client is told matching the manifest, the exact ten tools, no tool name or argument that could be a tab handle, the deleted tab tools answering "unknown tool", notifications answered with silence, two messages in one chunk, one message split across two, `-32601`/`-32700`/`-32602` (including `as` with `on`, an inherited property name, and a fractional integer), a browser tool degrading to `isError`, stdout handed back when the transport stops, and every stdout line parsing as JSON. Three cases call `callTool` directly, where a page's own `{content:[…]}` must come back as data and an eviction notice must survive every tool.
+The suite speaks real stdio to the real binary: version negotiation, the version a client is told matching the manifest, the exact eleven tools, no tool name or argument that could be a tab handle, the deleted tab tools answering "unknown tool", notifications answered with silence, two messages in one chunk, one message split across two, `-32601`/`-32700`/`-32602` (including `as` with `on`, an inherited property name, and a fractional integer), a browser tool degrading to `isError`, stdout handed back when the transport stops, and every stdout line parsing as JSON. Three cases call `callTool` directly, where a page's own `{content:[…]}` must come back as data and an eviction notice must survive every tool.
 
 MIT — see [LICENSE](../../LICENSE).
