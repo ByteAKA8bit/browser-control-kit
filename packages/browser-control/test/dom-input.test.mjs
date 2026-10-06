@@ -249,21 +249,45 @@ describe("real input", { skip: realSkip }, () => {
     assert.equal(await real.$eval("#picked", (el) => el.textContent), "picked 2");
   });
 
-  it("never claims a click the element never received", async () => {
-    // The pattern: focus is still in the field, so the click blurs it, the list
-    // re-renders under the cursor and the `click` reaches an ancestor instead.
+  it("completes a click that reached nothing, because then nothing can have happened", async () => {
+    // Focus is still in the field, so the click blurs it, the list re-renders
+    // under the cursor and the dispatch lands on a node that is already gone.
     await real.evaluate(() => {
       document.getElementById("picked").textContent = "";
       document.getElementById("base").value = "";
     });
     await real.fill("#base", "0"); // same rows, brand new nodes on blur
     const result = await real.click("[data-i='2']");
-    const picked = await real.$eval("#picked", (el) => el.textContent);
-    if (picked === "picked 2") assert.equal(result.verified, true, "a click that landed must read as verified");
-    else {
-      assert.equal(result.verified, false, `a click the app never got must not read as verified: ${JSON.stringify(result)}`);
-      assert.match(result.reason, /replaced|landed elsewhere/);
-    }
+    assert.equal(result.verified, true, JSON.stringify(result));
+    assert.equal(await real.$eval("#picked", (el) => el.textContent), "picked 2");
+  });
+
+  it("refuses to click again when another element took the click", async () => {
+    // The element jumps away on press, so the click is delivered to the zone —
+    // whose delegated handler has then ALREADY run. Clicking again would run it
+    // twice, which on a ticket or a payment is the bug that matters.
+    await real.evaluate(() => {
+      document.body.insertAdjacentHTML(
+        "beforeend",
+        `<div id="zone" style="padding:40px"><button id="runner" style="position:relative">runner</button></div><div id="zoneLog"></div>`,
+      );
+      const runner = document.getElementById("runner");
+      runner.addEventListener("pointerdown", () => {
+        runner.style.top = "300px";
+      });
+      document.getElementById("zone").addEventListener("click", () => {
+        document.getElementById("zoneLog").textContent += "zone;";
+      });
+    });
+    const result = await real.click("#runner");
+    assert.equal(result.verified, false, JSON.stringify(result));
+    assert.match(result.landedOn, /zone/);
+    assert.equal(await real.$eval("#zoneLog", (el) => el.textContent), "zone;", "the app must have been run exactly once");
+  });
+
+  it("leaves no watcher behind on the operator's page", async () => {
+    await real.click("[data-i='3']");
+    assert.equal(await real.evaluate(() => Object.prototype.hasOwnProperty.call(document, "__bcWatch")), false);
   });
 
   it("finds the element inside an iframe instead of searching only the main frame", async () => {

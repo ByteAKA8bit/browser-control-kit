@@ -48,7 +48,7 @@ npm i && node scripts/install-hooks.mjs      # Node ≥ 22；不要用 Bun（其
 mkdir -p ~/.config/browser-control && pbpaste > ~/.config/browser-control/token && chmod 600 $_
 
 npm run test:offline     # 标签治理、焦点归还、WebSocket 编解码、shim、MCP 协议 167 例（不需要浏览器，pre-commit 也跑）
-npm run test:unit        # DOM 输入 19 例
+npm run test:unit        # DOM 输入 21 例
 npm run test:pool        # 并行 8 例
 npm run selftest         # 端到端自检
 npm run cleanup          # 收尾：关掉本工具留下的标签、清掉探测用的站点权限

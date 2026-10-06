@@ -128,7 +128,7 @@ const xlsx = makeXlsx([["分類","分野","名称"], ["クラウド","IaaS","AWS
 
 ```bash
 npm run test:offline   # tab-guard 47 + focus 7 + ws-server 17 + shim-autostart 14 + shim-policy 6 + shim-recovery 24 + shim-service 12 + shim-session 12 = 139 cases, no browser needed
-npm test               # the same plus dom-input 19 and pool 8, --test-concurrency=1
+npm test               # the same plus dom-input 21 and pool 8, --test-concurrency=1
 npm run selftest       # end-to-end smoke, writes ./selftest.png
 npm run cleanup        # closes only the tabs this tool left behind (--dry-run reports only)
 ```

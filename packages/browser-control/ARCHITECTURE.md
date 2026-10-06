@@ -156,7 +156,7 @@ answers `{ skipped: true, reason: … }` on the extension transport.
 Two things the real-input path needs that Playwright does not do by itself, both measured on 2026-10-06 against a deliberately hostile page (shadow DOM, nested and cross-origin iframes, a virtualised list, an overlay, a late web component, a canvas):
 
 - **Frame scoping.** `page.click`/`$eval`/`waitForSelector` only ever search the main frame, so a form inside an iframe was unreachable on the real-input path while the DOM path found it. `frameFor(selector)` picks the frame that actually has the element — main frame first, then the rest, polled until the caller's timeout.
-- **A click the application received.** After a virtualised list re-renders, the element gets the `pointerdown` but the `click` lands on an ancestor, so the app's handler never runs and Playwright still reports success: 0/8 landed. `click()` instruments the target and returns `{ ok, via, verified, reason? }`. Only an unambiguous miss — element still attached, no pointer event at all — is retried through the DOM primitive; a press that landed or an element that vanished reads `verified: false` and stops, because a second real click buys two tickets. Pinned by `dom-input.test.mjs` (skipped where there is no real input).
+- **A click the application received.** After a virtualised list re-renders, the element gets the `pointerdown` but the `click` lands on an ancestor, so the app's handler never runs and Playwright still reports success: 0/8 landed. `click()` instruments the target and returns `{ ok, via, verified, reason? }`. The whole document is watched, so the compensating click is only sent when the dispatch provably did nothing (no click anywhere, any press on this element); when another element took the click its delegated handlers have already run, so the result reads `verified: false` with `landedOn` naming it and nothing is re-dispatched. Pinned by `dom-input.test.mjs` (skipped where there is no real input).
 
 ## 5. Tab lifecycle
 
@@ -254,7 +254,7 @@ packages/browser-control/
   selftest.mjs               end-to-end smoke; writes selftest.png, exit 1 on failure
   test/                      tab-guard 47 · focus 7 · ws-server 17 · shim-autostart 14 ·
                              shim-policy 6 · shim-recovery 24 · shim-service 12 ·
-                             shim-session 12 (browserless) · dom-input 19 ·
+                             shim-session 12 (browserless) · dom-input 21 ·
                              pool 8 (need Chrome)
 ```
 

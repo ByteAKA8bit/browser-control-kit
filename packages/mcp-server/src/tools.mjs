@@ -268,7 +268,7 @@ export const TOOLS = [
       const result = await page.click(selector);
       // An unverified click MUST reach the agent: the page may simply not have
       // acted, and only the caller knows whether clicking again is safe.
-      if (result?.verified === false) return `clicked ${selector}, but the element never received it (${result.reason}). The page may not have acted — check before clicking again.`;
+      if (result?.verified === false) return `clicked ${selector}, but ${result.reason}. Check the page before clicking again: repeating it may act twice.`;
       return `clicked ${selector}${result?.via === "dom-fallback" ? " (the real click went nowhere, so this was a DOM-level click)" : ""}`;
     },
   },

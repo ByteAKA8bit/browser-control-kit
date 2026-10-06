@@ -149,43 +149,66 @@ export function controlPage(page, capabilities = {}) {
     /**
      * 2026-10-06, measured: a field that re-renders its list on blur (an ordinary
      * pattern) replaces the node between mousedown and mouseup, so the `click`
-     * lands on an ancestor, the app's handler never runs, and Playwright reports
-     * success — 0/8 landed. So the target is instrumented and the answer is
-     * honest: `verified` says whether the element itself saw the click.
-     * A second real click is NEVER dispatched on a guess — on a ticket or a
-     * payment that buys two — so only the unambiguous case (element still there,
-     * no pointer event at all) is retried, through the DOM primitive.
-     * @returns {Promise<{ ok: boolean, via: string, verified: boolean, reason?: string }>}
+     * reaches an ancestor, the app never acts, and Playwright reports success —
+     * 0/8 landed. So the whole document is watched, not just the target, and the
+     * answer is honest: `verified` means THIS element saw the click.
+     * Clicking again is only safe when the dispatch provably did nothing: no
+     * click reached ANY element and the press, if there was one, was on this
+     * element. Anything else — a click that went to another element (delegation
+     * means that element's app code just ran), a press elsewhere, a node that
+     * vanished — reports and stops, because a second click on a ticket or a
+     * payment buys two. `landedOn` names the element that took it.
+     * @returns {Promise<{ ok: boolean, via: string, verified: boolean, reason?: string, landedOn?: string }>}
      */
     async click(selector, options = {}) {
       if (realInput()) {
         const scope = await frameFor(selector, options.timeout ?? 15_000);
         const handle = await scope.$(selector);
         await handle?.evaluate((el) => {
-          el.__bcSaw = { down: false, click: false };
-          el.addEventListener("pointerdown", () => {
-            el.__bcSaw.down = true;
-          }, { capture: true, once: true });
-          el.addEventListener("click", () => {
-            el.__bcSaw.click = true;
-          }, { capture: true, once: true });
+          const doc = el.ownerDocument;
+          const name = (node) =>
+            node?.tagName
+              ? `${node.tagName.toLowerCase()}${node.id ? `#${node.id}` : ""}${typeof node.className === "string" && node.className.trim() ? `.${node.className.trim().split(/\s+/)[0]}` : ""}`
+              : String(node);
+          const watch = { clickTarget: null, downTarget: null, clickOnThis: false, downOnThis: false };
+          const mine = (node) => node === el || el.contains(node);
+          watch.onDown = (event) => {
+            watch.downTarget ??= name(event.target);
+            watch.downOnThis ||= mine(event.target);
+          };
+          watch.onClick = (event) => {
+            watch.clickTarget ??= name(event.target);
+            watch.clickOnThis ||= mine(event.target);
+          };
+          doc.addEventListener("pointerdown", watch.onDown, true);
+          doc.addEventListener("click", watch.onClick, true);
+          doc.__bcWatch = watch;
         });
         await scope.click(selector, { timeout: 15_000, ...options });
-        // A handle that throws is an element the click itself removed: a hit.
-        const saw = await handle
-          ?.evaluate((el) => {
-            const seen = { ...el.__bcSaw, connected: el.isConnected };
-            delete el.__bcSaw; // leave no trace of ours in the operator's page
-            return seen;
+        // Listeners come off here on EVERY path: a watcher left behind on the
+        // operator's document would fire for the rest of that page's life.
+        const watch = await scope
+          .evaluate(() => {
+            const w = document.__bcWatch;
+            if (!w) return { clickOnThis: true };
+            document.removeEventListener("pointerdown", w.onDown, true);
+            document.removeEventListener("click", w.onClick, true);
+            delete document.__bcWatch;
+            return { clickTarget: w.clickTarget, downTarget: w.downTarget, clickOnThis: w.clickOnThis, downOnThis: w.downOnThis };
           })
-          .catch(() => ({ down: true, click: true, connected: false }));
-        if (saw?.click !== false) return { ok: true, via: "playwright", verified: true };
-        if (saw.down || saw.connected === false) {
-          const reason = saw.down ? "the element saw the press but the click landed elsewhere" : "the element was replaced while being clicked";
-          return { ok: true, via: "playwright", verified: false, reason }; // acting again could act twice
+          .catch(() => ({ clickOnThis: true })); // the page navigated away: the click did that
+        if (watch.clickOnThis) return { ok: true, via: "playwright", verified: true };
+        if (watch.clickTarget) {
+          return { ok: true, via: "playwright", verified: false, landedOn: watch.clickTarget, reason: `the click was delivered to ${watch.clickTarget}, whose own handlers may have run` };
         }
+        if (watch.downTarget && !watch.downOnThis) {
+          return { ok: true, via: "playwright", verified: false, landedOn: watch.downTarget, reason: `nothing was clicked, but ${watch.downTarget} received the press` };
+        }
+        // Nothing in the document was clicked at all and any press was on this
+        // element: the dispatch did nothing, so finishing it in-page cannot be a
+        // second action.
         const res = await inAnyFrame(DOM_CLICK, [selector, options.nth ?? 0]);
-        if (!res?.ok) throw new Error(`click(${selector}): the element received no pointer event at all, and the DOM fallback failed: ${res?.reason ?? "unknown"}`);
+        if (!res?.ok) throw new Error(`click(${selector}): the dispatch reached nothing, and the DOM fallback failed: ${res?.reason ?? "unknown"}`);
         return { ok: true, via: "dom-fallback", verified: true };
       }
       const clicks = options.clickCount ?? 1;
