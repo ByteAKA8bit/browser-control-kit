@@ -219,7 +219,7 @@ describe("real input", { skip: realSkip }, () => {
     real = controlPage(raw, attached.capabilities); // the real path, not the DOM one
     await raw.goto("about:blank");
     await raw.setContent(`<body>
-      <div id="rows"></div><div id="picked"></div>
+      <input id="base"><div id="rows"></div><div id="picked"></div>
       <iframe id="f" srcdoc="<button id='inner'>i</button><div id='innerOut'></div><script>inner.onclick=()=>innerOut.textContent='inner-clicked'</script>"></iframe>
       <script>
         window.render = (base) => {
@@ -232,19 +232,37 @@ describe("real input", { skip: realSkip }, () => {
             list.appendChild(d);
           }
         };
+        // The pattern that breaks a real click: the list re-renders on blur, so
+        // the node under the cursor is replaced between mousedown and mouseup.
+        document.getElementById('base').addEventListener('change', (e) => render(+e.target.value || 0));
         render(0);
       </script>
     </body>`);
   });
 
-  it("lands a click the app actually receives after the list re-renders", async () => {
-    for (const base of [100, 200, 300]) {
-      await real.evaluate(() => {
-        document.getElementById("picked").textContent = "";
-      });
-      await real.evaluate((b) => window.render(b), base);
-      await real.click(`[data-i='${base + 2}']`);
-      assert.equal(await real.$eval("#picked", (el) => el.textContent), `picked ${base + 2}`, `row ${base + 2} never saw its click`);
+  it("reports a click the element received, and says so", async () => {
+    await real.evaluate(() => {
+      document.getElementById("picked").textContent = "";
+    });
+    const result = await real.click("[data-i='2']");
+    assert.equal(result.verified, true, JSON.stringify(result));
+    assert.equal(await real.$eval("#picked", (el) => el.textContent), "picked 2");
+  });
+
+  it("never claims a click the element never received", async () => {
+    // The pattern: focus is still in the field, so the click blurs it, the list
+    // re-renders under the cursor and the `click` reaches an ancestor instead.
+    await real.evaluate(() => {
+      document.getElementById("picked").textContent = "";
+      document.getElementById("base").value = "";
+    });
+    await real.fill("#base", "0"); // same rows, brand new nodes on blur
+    const result = await real.click("[data-i='2']");
+    const picked = await real.$eval("#picked", (el) => el.textContent);
+    if (picked === "picked 2") assert.equal(result.verified, true, "a click that landed must read as verified");
+    else {
+      assert.equal(result.verified, false, `a click the app never got must not read as verified: ${JSON.stringify(result)}`);
+      assert.match(result.reason, /replaced|landed elsewhere/);
     }
   });
 

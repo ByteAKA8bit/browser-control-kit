@@ -147,36 +147,46 @@ export function controlPage(page, capabilities = {}) {
     },
 
     /**
-     * 2026-10-06, measured on a virtualised list: after the DOM under the cursor
-     * is replaced, the element gets the pointerdown but the `click` lands on an
-     * ancestor (the list scrolls between press and release), so the app's own
-     * handler never runs while Playwright reports success — 0/8 landed. Only a
-     * `click` ON THE TARGET counts; a miss is retried once and then falls back to
-     * the DOM path, which hit-tests in-page and cannot go stale.
+     * 2026-10-06, measured: a field that re-renders its list on blur (an ordinary
+     * pattern) replaces the node between mousedown and mouseup, so the `click`
+     * lands on an ancestor, the app's handler never runs, and Playwright reports
+     * success — 0/8 landed. So the target is instrumented and the answer is
+     * honest: `verified` says whether the element itself saw the click.
+     * A second real click is NEVER dispatched on a guess — on a ticket or a
+     * payment that buys two — so only the unambiguous case (element still there,
+     * no pointer event at all) is retried, through the DOM primitive.
+     * @returns {Promise<{ ok: boolean, via: string, verified: boolean, reason?: string }>}
      */
     async click(selector, options = {}) {
       if (realInput()) {
         const scope = await frameFor(selector, options.timeout ?? 15_000);
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-          const handle = await scope.$(selector);
-          await handle?.evaluate((el) => {
-            el.__bcClickSeen = false;
-            el.addEventListener(
-              "click",
-              () => {
-                el.__bcClickSeen = true;
-              },
-              { capture: true, once: true },
-            );
-          });
-          await scope.click(selector, { timeout: 15_000, ...options });
-          // A handle that threw is an element the click removed: that is a hit.
-          const seen = await handle?.evaluate((el) => el.__bcClickSeen === true).catch(() => true);
-          if (seen !== false) return;
+        const handle = await scope.$(selector);
+        await handle?.evaluate((el) => {
+          el.__bcSaw = { down: false, click: false };
+          el.addEventListener("pointerdown", () => {
+            el.__bcSaw.down = true;
+          }, { capture: true, once: true });
+          el.addEventListener("click", () => {
+            el.__bcSaw.click = true;
+          }, { capture: true, once: true });
+        });
+        await scope.click(selector, { timeout: 15_000, ...options });
+        // A handle that throws is an element the click itself removed: a hit.
+        const saw = await handle
+          ?.evaluate((el) => {
+            const seen = { ...el.__bcSaw, connected: el.isConnected };
+            delete el.__bcSaw; // leave no trace of ours in the operator's page
+            return seen;
+          })
+          .catch(() => ({ down: true, click: true, connected: false }));
+        if (saw?.click !== false) return { ok: true, via: "playwright", verified: true };
+        if (saw.down || saw.connected === false) {
+          const reason = saw.down ? "the element saw the press but the click landed elsewhere" : "the element was replaced while being clicked";
+          return { ok: true, via: "playwright", verified: false, reason }; // acting again could act twice
         }
         const res = await inAnyFrame(DOM_CLICK, [selector, options.nth ?? 0]);
-        if (!res?.ok) throw new Error(`click(${selector}) was dispatched twice and the element never saw it, and the DOM fallback failed: ${res?.reason ?? "unknown"}`);
-        return;
+        if (!res?.ok) throw new Error(`click(${selector}): the element received no pointer event at all, and the DOM fallback failed: ${res?.reason ?? "unknown"}`);
+        return { ok: true, via: "dom-fallback", verified: true };
       }
       const clicks = options.clickCount ?? 1;
       for (let i = 0; i < clicks; i += 1) {

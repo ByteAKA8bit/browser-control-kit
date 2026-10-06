@@ -62,7 +62,7 @@ npm i && node scripts/install-hooks.mjs   # Node >= 22. Not Bun: its WebSocket c
 mkdir -p ~/.config/browser-control && pbpaste > ~/.config/browser-control/token && chmod 600 $_
 
 npm run test:offline   # tab governance, focus, websocket codec, shim, MCP protocol — 167 cases, no browser needed
-npm run test:unit      # DOM input, 18 cases   (needs Chrome + token)
+npm run test:unit      # DOM input, 19 cases   (needs Chrome + token)
 npm run test:pool      # parallel pool, 8 cases (needs Chrome + token)
 npm test               # all ten suites, --test-concurrency=1
 npm run selftest       # end-to-end smoke; writes ./selftest.png
