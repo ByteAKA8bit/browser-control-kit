@@ -153,6 +153,11 @@ surfaces any other reason; the override then throws a sentence naming the select
 the reason. Degraded operations return instead of throwing, e.g. `evaluateOnNewDocument`
 answers `{ skipped: true, reason: … }` on the extension transport.
 
+Two things the real-input path needs that Playwright does not do by itself, both measured on 2026-10-06 against a deliberately hostile page (shadow DOM, nested and cross-origin iframes, a virtualised list, an overlay, a late web component, a canvas):
+
+- **Frame scoping.** `page.click`/`$eval`/`waitForSelector` only ever search the main frame, so a form inside an iframe was unreachable on the real-input path while the DOM path found it. `frameFor(selector)` picks the frame that actually has the element — main frame first, then the rest, polled until the caller's timeout.
+- **A click the application received.** After a virtualised list re-renders, the element gets the `pointerdown` but the `click` lands on an ancestor, so the app's handler never runs and Playwright still reports success: 0/8 landed. `click()` now instruments the target, retries a silent miss once, and then falls back to the DOM primitive, which hit-tests in-page: 8/8. Pinned by `dom-input.test.mjs` (skipped where there is no real input).
+
 ## 5. Tab lifecycle
 
 **`TabPool`** (`src/pool.mjs`) owns N tabs and hands them out, never running two tasks
@@ -249,7 +254,7 @@ packages/browser-control/
   selftest.mjs               end-to-end smoke; writes selftest.png, exit 1 on failure
   test/                      tab-guard 47 · focus 7 · ws-server 17 · shim-autostart 14 ·
                              shim-policy 6 · shim-recovery 24 · shim-service 12 ·
-                             shim-session 12 (browserless) · dom-input 16 ·
+                             shim-session 12 (browserless) · dom-input 18 ·
                              pool 8 (need Chrome)
 ```
 

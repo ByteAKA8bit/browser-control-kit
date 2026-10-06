@@ -75,6 +75,37 @@ export function controlPage(page, capabilities = {}) {
     return inAnyFrameRaw(fn, needsTransfer ? [...args, DEEP_SRC, DOM_MAKE_TRANSFER.toString()] : [...args, DEEP_SRC]);
   };
 
+  /**
+   * The frame a selector actually lives in — main frame first, then the others,
+   * polled until `timeoutMs`. Playwright's page.click only ever searches the
+   * main frame, so on the real-input path a form inside an iframe (every online
+   * spreadsheet, every payment widget) was unreachable while the DOM path
+   * found it. 2026-10-06: measured against a srcdoc iframe, page.click timed
+   * out at 15 s where frame.click worked.
+   */
+  const frameFor = async (selector, timeoutMs = 15_000) => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      for (const frame of [page.mainFrame(), ...page.frames().filter((f) => f !== page.mainFrame())]) {
+        try {
+          if (await frame.$(selector)) return frame;
+        } catch {} // a frame can navigate out from under the query: try the next one
+      }
+      if (Date.now() >= deadline) return page.mainFrame(); // let the caller's own wait raise the error
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  };
+
+  /** Every frame's answer, not the first hit: counting must not stop at zero. */
+  const inAnyFrameAll = async (fn, args) => {
+    const payload = { src: fn.toString(), args: [...args, DEEP_SRC] };
+    const out = [];
+    for (const frame of [page.mainFrame(), ...page.frames().filter((f) => f !== page.mainFrame())]) {
+      out.push(await frame.evaluate(applyInPage, payload).catch(() => null)); // a frame may be gone or cross-origin-detached
+    }
+    return out;
+  };
+
   const inAnyFrameRaw = async (fn, fullArgs) => {
     const payload = { src: fn.toString(), args: fullArgs };
     const frames = [page.mainFrame(), ...page.frames().filter((f) => f !== page.mainFrame())];
@@ -104,13 +135,49 @@ export function controlPage(page, capabilities = {}) {
       if (args.length <= 1) return page.evaluate(fn, args[0]);
       return page.evaluate(applyInPage, { src: fn.toString(), args });
     },
-    $eval: (selector, fn, ...args) =>
-      args.length <= 1 ? page.$eval(selector, fn, args[0]) : page.$eval(selector, applyInPageEl, { src: fn.toString(), args }),
-    $$eval: (selector, fn, ...args) =>
-      args.length <= 1 ? page.$$eval(selector, fn, args[0]) : page.$$eval(selector, applyInPageAll, { src: fn.toString(), args }),
+    // Reads scope to the frame that has the element too: an agent that can click
+    // a cell inside an iframe but cannot read it back is half a tool.
+    $eval: async (selector, fn, ...args) => {
+      const scope = await frameFor(selector, 5_000);
+      return args.length <= 1 ? scope.$eval(selector, fn, args[0]) : scope.$eval(selector, applyInPageEl, { src: fn.toString(), args });
+    },
+    $$eval: async (selector, fn, ...args) => {
+      const scope = await frameFor(selector, 5_000);
+      return args.length <= 1 ? scope.$$eval(selector, fn, args[0]) : scope.$$eval(selector, applyInPageAll, { src: fn.toString(), args });
+    },
 
+    /**
+     * 2026-10-06, measured on a virtualised list: after the DOM under the cursor
+     * is replaced, the element gets the pointerdown but the `click` lands on an
+     * ancestor (the list scrolls between press and release), so the app's own
+     * handler never runs while Playwright reports success — 0/8 landed. Only a
+     * `click` ON THE TARGET counts; a miss is retried once and then falls back to
+     * the DOM path, which hit-tests in-page and cannot go stale.
+     */
     async click(selector, options = {}) {
-      if (realInput()) return page.click(selector, { timeout: 15_000, ...options });
+      if (realInput()) {
+        const scope = await frameFor(selector, options.timeout ?? 15_000);
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const handle = await scope.$(selector);
+          await handle?.evaluate((el) => {
+            el.__bcClickSeen = false;
+            el.addEventListener(
+              "click",
+              () => {
+                el.__bcClickSeen = true;
+              },
+              { capture: true, once: true },
+            );
+          });
+          await scope.click(selector, { timeout: 15_000, ...options });
+          // A handle that threw is an element the click removed: that is a hit.
+          const seen = await handle?.evaluate((el) => el.__bcClickSeen === true).catch(() => true);
+          if (seen !== false) return;
+        }
+        const res = await inAnyFrame(DOM_CLICK, [selector, options.nth ?? 0]);
+        if (!res?.ok) throw new Error(`click(${selector}) was dispatched twice and the element never saw it, and the DOM fallback failed: ${res?.reason ?? "unknown"}`);
+        return;
+      }
       const clicks = options.clickCount ?? 1;
       for (let i = 0; i < clicks; i += 1) {
         const res = await inAnyFrame(DOM_CLICK, [selector, options.nth ?? 0]);
@@ -119,7 +186,10 @@ export function controlPage(page, capabilities = {}) {
     },
 
     async type(selector, text, options = {}) {
-      if (realInput()) return page.locator(selector).first().pressSequentially(text, { delay: options.delay ?? 10, timeout: 20_000 });
+      if (realInput()) {
+        const scope = await frameFor(selector);
+        return scope.locator(selector).first().pressSequentially(text, { delay: options.delay ?? 10, timeout: 20_000 });
+      }
       const current = await inAnyFrame(DOM_READ_VALUE, [selector]);
       const res = await inAnyFrame(DOM_SET_VALUE, [selector, `${current?.value ?? ""}${text}`]);
       if (!res?.ok) throw new Error(`type(${selector}) failed: ${res?.reason ?? "unknown"}`);
@@ -127,7 +197,10 @@ export function controlPage(page, capabilities = {}) {
 
     /** Replace a field's value outright (React-safe). */
     async fill(selector, value) {
-      if (realInput()) return page.fill(selector, value, { timeout: 20_000 });
+      if (realInput()) {
+        const scope = await frameFor(selector);
+        return scope.fill(selector, value, { timeout: 20_000 });
+      }
       const res = await inAnyFrame(DOM_SET_VALUE, [selector, value]);
       if (!res?.ok) throw new Error(`fill(${selector}) failed: ${res?.reason ?? "unknown"}`);
     },
@@ -139,7 +212,8 @@ export function controlPage(page, capabilities = {}) {
     async setInputFiles(selector, files) {
       const list = await normaliseFiles(files);
       if (realInput()) {
-        await page.setInputFiles(
+        const scope = await frameFor(selector);
+        await scope.setInputFiles(
           selector,
           list.map((f) => ({ name: f.name, mimeType: f.type, buffer: Buffer.from(f.base64, "base64") })),
         );
@@ -164,7 +238,8 @@ export function controlPage(page, capabilities = {}) {
      */
     async dragAndDrop(fromSelector, toSelector, { steps = 8 } = {}) {
       if (realInput()) {
-        await page.dragAndDrop(fromSelector, toSelector, { timeout: 20_000 });
+        const scope = await frameFor(fromSelector);
+        await scope.dragAndDrop(fromSelector, toSelector, { timeout: 20_000 });
         return { ok: true, via: "playwright" };
       }
       const res = await inAnyFrame(DOM_DRAG, [fromSelector, toSelector, steps]);
@@ -172,17 +247,22 @@ export function controlPage(page, capabilities = {}) {
       return { ...res, via: "dom" };
     },
 
-    /** Count matches including shadow roots and frames (diagnostics/tests). */
+    /** Count matches across shadow roots AND every frame — summed, because a hit
+     * in the main frame used to end the search and hide the ones in iframes. */
     async deepCount(selector) {
-      const res = await inAnyFrame(DOM_COUNT, [selector]);
-      return res?.count ?? 0;
+      const counts = await inAnyFrameAll(DOM_COUNT, [selector]);
+      return counts.reduce((sum, res) => sum + (res?.count ?? 0), 0);
     },
 
-    waitForSelector: (selector, options = {}) => {
+    /** Waits in whichever frame the element shows up in, not just the main one. */
+    waitForSelector: async (selector, options = {}) => {
       const state = options.visible ? "visible" : options.hidden ? "hidden" : "attached";
-      return page.waitForSelector(selector, { state, timeout: options.timeout ?? 20_000 });
+      const timeout = options.timeout ?? 20_000;
+      const scope = await frameFor(selector, timeout);
+      return scope.waitForSelector(selector, { state, timeout });
     },
-    waitForFunction: (fn, options = {}) => page.waitForFunction(fn, undefined, options),
+    /** puppeteer order (fn, options, arg); a null options used to crash inside Playwright. */
+    waitForFunction: (fn, options, arg) => page.waitForFunction(fn, arg, options ?? {}),
     // NEVER resize by default: on an attached real browser this becomes
     // Emulation.setDeviceMetricsOverride, which pins the viewport and leaves a
     // blank strip beside the operator's actual window. Opt in with BC_VIEWPORT=1.
@@ -217,19 +297,27 @@ export function controlPage(page, capabilities = {}) {
         return { send: async () => ({}), detach: async () => {} };
       }
     },
-    keyboard: {
-      press: async (key) => {
-        if (realInput()) return page.keyboard.press(key);
-        const res = await inAnyFrame(DOM_KEY, [null, key]);
-        if (!res?.ok) throw new Error(`press(${key}) failed: ${res?.reason ?? "unknown"}`);
+    // down/up/insertText and friends only exist on Playwright's keyboard, and a
+    // game or a hotkey needs them, so only press/type are intercepted and
+    // everything else falls through to the real one.
+    keyboard: new Proxy(page.keyboard, {
+      get(target, prop) {
+        if (!realInput() && (prop === "press" || prop === "type")) {
+          return prop === "press"
+            ? async (key) => {
+                const res = await inAnyFrame(DOM_KEY, [null, key]);
+                if (!res?.ok) throw new Error(`press(${key}) failed: ${res?.reason ?? "unknown"}`);
+              }
+            : async (text) => {
+                const id = await page.evaluate(() => document.activeElement?.id ?? null);
+                if (!id) throw new Error("keyboard.type without a focused element");
+                await overrides.type(`#${id}`, text);
+              };
+        }
+        const value = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
       },
-      type: async (text) => {
-        if (realInput()) return page.keyboard.type(text);
-        const id = await page.evaluate(() => document.activeElement?.id ?? null);
-        if (!id) throw new Error("keyboard.type without a focused element");
-        await overrides.type(`#${id}`, text);
-      },
-    },
+    }),
     /** Which input path is active — worth printing in test reports. */
     inputMode: () => (realInput() ? "real-input" : "dom-input"),
     capabilities: () => capabilities,

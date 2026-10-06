@@ -200,3 +200,56 @@ describe("upload & drag", { skip }, () => {
     assert.match(text, /html5drop/); // and the HTML5 drop landed
   });
 });
+
+// The real-input path (cdp, focus emulation) has failure modes the DOM path
+// cannot have, and both were measured against a live page on 2026-10-06:
+// a click on a row whose list had just re-rendered reached the element as a
+// pointerdown but delivered its `click` to an ancestor — 0/8 landed while
+// Playwright reported success — and page.click only ever searches the main
+// frame, so a form inside an iframe was unreachable. Skipped wherever the
+// transport has no real input (the extension bridge), since there is nothing
+// to regress there.
+const realSkip = skip || (attached?.capabilities?.focusEmulation !== true ? "needs the real-input path (BC_MODE=cdp)" : false);
+
+describe("real input", { skip: realSkip }, () => {
+  let real;
+
+  before(async () => {
+    const raw = attached.context.pages().find((p) => !p.url().startsWith("chrome-extension://")) ?? (await attached.context.newPage());
+    real = controlPage(raw, attached.capabilities); // the real path, not the DOM one
+    await raw.goto("about:blank");
+    await raw.setContent(`<body>
+      <div id="rows"></div><div id="picked"></div>
+      <iframe id="f" srcdoc="<button id='inner'>i</button><div id='innerOut'></div><script>inner.onclick=()=>innerOut.textContent='inner-clicked'</script>"></iframe>
+      <script>
+        window.render = (base) => {
+          const list = document.getElementById('rows');
+          list.innerHTML = '';
+          for (let i = base; i < base + 6; i++) {
+            const d = document.createElement('div');
+            d.dataset.i = i; d.textContent = 'row ' + i; d.style.height = '24px';
+            d.onclick = () => { document.getElementById('picked').textContent = 'picked ' + i; };
+            list.appendChild(d);
+          }
+        };
+        render(0);
+      </script>
+    </body>`);
+  });
+
+  it("lands a click the app actually receives after the list re-renders", async () => {
+    for (const base of [100, 200, 300]) {
+      await real.evaluate(() => {
+        document.getElementById("picked").textContent = "";
+      });
+      await real.evaluate((b) => window.render(b), base);
+      await real.click(`[data-i='${base + 2}']`);
+      assert.equal(await real.$eval("#picked", (el) => el.textContent), `picked ${base + 2}`, `row ${base + 2} never saw its click`);
+    }
+  });
+
+  it("finds the element inside an iframe instead of searching only the main frame", async () => {
+    await real.click("#inner");
+    assert.equal(await real.$eval("#innerOut", (el) => el.textContent), "inner-clicked");
+  });
+});

@@ -16,7 +16,7 @@ const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
 export const SCRIPT_TIMEOUT_MS = () => Number(process.env.BC_MCP_SCRIPT_MS ?? 120_000);
 
 /** Everything the body can name, in the order it is passed in. */
-const SCOPE = ["page", "surface", "release", "surfaces", "state", "log", "guard", "context", "browser", "capabilities", "fixtures", "controlPage", "require", "sleep"];
+const SCOPE = ["page", "surface", "release", "surfaces", "state", "jobs", "log", "guard", "context", "browser", "capabilities", "fixtures", "controlPage", "require", "sleep"];
 
 /** A result the transport can carry: Buffers become images, everything else JSON. */
 function present(value, logs) {
@@ -46,6 +46,7 @@ export async function runScript({ code, timeoutMs, page, live, wrap }) {
     release: (name) => guard.release(name),
     surfaces: () => guard.surfaces(),
     state: live.scriptState,
+    jobs: live.jobs,
     log,
     guard,
     context: live.context,
@@ -82,5 +83,8 @@ export const SCRIPT_DESCRIPTION =
   "The body is an async function: `await` freely, `return` a value (JSON, or a Buffer for a PNG). " +
   `In scope: ${SCOPE.join(", ")}. ` +
   "`page` is the same named/scratch page the other tools use, `surface(name)` opens or returns another one, " +
-  "`state` is an object that survives between calls (put anything you want to reuse there), `log()` and console.log are returned with the result. " +
+  "`state` is an object that survives between calls, `log()` and console.log are returned with the result. " +
+  "For work that outlives one call — waiting for the operator to log in or pay, polling for a slot, retrying a sold-out ticket, a loop that runs for an hour — " +
+  "hand it to a NAMED job: `jobs.start('snipe', async ({ signal, log }) => { while (!signal.aborted) { … } })` returns at once, " +
+  "and a later call reads `jobs.status('snipe')` / `jobs.list()` / `await jobs.wait('snipe', 5000)` / `jobs.cancel('snipe')`. " +
   "Example: `const p = await surface('docs'); await p.goto(url); return p.$$eval('h2', h => h.map(x => x.textContent));`";

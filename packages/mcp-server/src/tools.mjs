@@ -8,6 +8,7 @@
 // TabGuard — named pinned, unnamed recycled, idle reclaimed — so no tool here
 // can open or close a tab. browser-control (and playwright-core) is imported
 // lazily in #connect(), so merely listing tools costs nothing but a process.
+import { Jobs } from "./jobs.mjs";
 import { SCRIPT_DESCRIPTION, runScript } from "./script.mjs";
 
 const ATTACH_TIMEOUT_MS = () => Number(process.env.BC_MCP_ATTACH_TIMEOUT_MS ?? 60_000);
@@ -43,6 +44,8 @@ export class Session {
   #controlPage = null;
   #wrapped = new WeakMap(); // raw page → controlPage proxy, so a call does not rebuild one
   #evicted = 0; // last seen guard.stats.surfacesEvicted, to report only what is new
+  /** Named background work started by browser_script; see src/jobs.mjs. */
+  jobs = new Jobs();
 
   /** The attach() result, connecting at most once at a time. */
   async browser() {
@@ -73,6 +76,7 @@ export class Session {
     const live = await this.browser();
     this.#guard(live); // named pages are the whole model; without a guard there is none
     live.scriptState ??= {}; // survives between browser_script calls, never across restarts
+    live.jobs ??= this.jobs; // one job table per session: a reattach must not orphan a running loop
     return live;
   }
 
@@ -169,6 +173,7 @@ export class Session {
   async close() {
     const live = this.#live;
     this.#live = null;
+    this.jobs.cancelAll(); // a loop must not keep driving a browser nobody is watching
     await live?.browser.close().catch(() => {}); // the browser may already be gone
   }
 }
