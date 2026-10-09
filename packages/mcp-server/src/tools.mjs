@@ -46,6 +46,14 @@ export class Session {
   #evicted = 0; // last seen guard.stats.surfacesEvicted, to report only what is new
   /** Named background work started by browser_script; see src/jobs.mjs. */
   jobs = new Jobs();
+  // Aborted once, when the client is gone: an in-flight script stops waiting
+  // instead of driving a browser nobody is listening to.
+  #shutdown = new AbortController();
+
+  /** Ends with the client: `browser_script` hands this to every body it runs. */
+  get signal() {
+    return this.#shutdown.signal;
+  }
 
   /** The attach() result, connecting at most once at a time. */
   async browser() {
@@ -173,6 +181,7 @@ export class Session {
   async close() {
     const live = this.#live;
     this.#live = null;
+    this.#shutdown.abort(new Error("the MCP client disconnected")); // an in-flight script stops sleeping here
     this.jobs.cancelAll(); // a loop must not keep driving a browser nobody is watching
     await live?.browser.close().catch(() => {}); // the browser may already be gone
   }
@@ -395,7 +404,7 @@ export const TOOLS = [
     async run({ code, on, as, timeoutMs }, session) {
       const { page } = await session.target({ on, as });
       const live = await session.live();
-      return new Payload(await runScript({ code, timeoutMs, page, live, wrap: (raw) => session.wrap(raw) }));
+      return new Payload(await runScript({ code, timeoutMs, page, live, wrap: (raw) => session.wrap(raw), signal: session.signal }));
     },
   },
 ];

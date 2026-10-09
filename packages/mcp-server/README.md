@@ -76,7 +76,7 @@ Ten, and that is the whole surface.
 | `browser_screenshot` | `selector?`, `on?` | Capture a PNG of the viewport or one element. |
 | `browser_wait_for` | `selector`, `state?`, `timeoutMs?`, `on?` | Wait for a selector to reach a state. |
 | `browser_surfaces` | — | List the named pages with their URL and idle time, plus the scratch page's URL. |
-| `browser_script` | `code`, `on?`, `as?`, `timeoutMs?` | **Run a whole flow in one call.** Async function body against this session: `page`, `surface(name)`, `release`, `surfaces`, `state`, `log`, `guard`, `context`, `browser`, `capabilities`, `fixtures`, `controlPage`, `require`, `sleep`. Return JSON, or a Buffer for a PNG. |
+| `browser_script` | `code`, `on?`, `as?`, `timeoutMs?` | **Run a whole flow in one call.** Async function body against this session: `page`, `surface(name)`, `release`, `surfaces`, `state`, `jobs`, `signal`, `log`, `guard`, `context`, `browser`, `capabilities`, `fixtures`, `controlPage`, `require`, `sleep`. Return JSON, or a Buffer for a PNG. |
 
 A tool that fails — no browser, no such selector, a page that threw — answers with `isError: true` and a sentence saying why. Only a protocol mistake (unknown tool, missing or mistyped argument, or `as` and `on` in the same call, which would name two different pages) is a JSON-RPC error. An `on` that names a page you never kept is a tool error listing the names that do exist:
 
@@ -103,6 +103,8 @@ return { count: rows.length, rows };
 
 It is deliberately **not** a sandbox: the body gets the real page, the real guard, `require` and `import()`. An agent that can call this can already run bash, so fencing it would cost upload/download/file flows and buy nothing. What it adds over a bash script is the session: no second `attach()` (~723 ms on cdp), named pages still bound, and `state` carried between calls. A returned Buffer comes back as a PNG image block; `log()` and `console.log` ride along with the result; the body is capped by `timeoutMs` (default `BC_MCP_SCRIPT_MS`, 120 s).
 
+**A call that is over stops waiting.** The cap, and the client disconnecting, both abort the body's `signal` and make its `sleep()` throw — measured 2026-10-09, before that a body sleeping 3 s ran to completion 2.7 s after its 300 ms timeout had already answered the client, and kept the server process alive doing it. Check `signal.aborted` in your own loops; nothing can preempt a `while (true) {}` that ignores it, which is why shutdown also exits the process after `BC_MCP_EXIT_GRACE_MS`. Work that **must** outlive the call is a named job instead — `jobs.start('poll', async ({ signal, sleep, log }) => …)` returns at once and a later call reads `jobs.status('poll')` / `jobs.list()` / `jobs.wait('poll', 5000)` / `jobs.cancel('poll')`; jobs carry their own signal, and only the client leaving cancels them.
+
 ## Protocol
 
 Newline-delimited JSON-RPC 2.0 on stdin/stdout; **stdout carries protocol bytes and nothing else** — logs go to stderr, and any other writer's stdout is rerouted there too. `initialize` echoes the client's `protocolVersion` when it is one of `2025-06-18`, `2025-03-26`, `2024-11-05`, offers `2025-06-18` otherwise, and carries the one-paragraph `instructions` above. `tools/list`, `tools/call` and `ping` are the whole surface: no resources, prompts or sampling. Closing stdin shuts the server down.
@@ -120,6 +122,9 @@ Newline-delimited JSON-RPC 2.0 on stdin/stdout; **stdout carries protocol bytes 
 | `BC_MCP_ATTACH_TIMEOUT_MS` | `60000` | Give up waiting for a browser |
 | `BC_MCP_TEXT_LIMIT` | `20000` | Characters `browser_text` returns |
 | `BC_MCP_WAIT_MS` | `20000` | Default `browser_wait_for` timeout |
+| `BC_MCP_SCRIPT_MS` | `120000` | Default ceiling for a `browser_script` body; the cap aborts the body's `signal` |
+| `BC_MCP_JOB_LOG` | `200` | Log lines a named job keeps |
+| `BC_MCP_EXIT_GRACE_MS` | `250` | After the client goes: exit even if a script body left a timer behind (`0` waits for it) |
 | `BC_MCP_QUIET` | — | `1` silences stderr diagnostics |
 
 Everything `browser-control` reads (`BC_MODE`, `BC_CDP_URL`, `BC_TAB_IDLE_MS`, …) applies unchanged.
@@ -127,9 +132,9 @@ Everything `browser-control` reads (`BC_MODE`, `BC_CDP_URL`, `BC_TAB_IDLE_MS`, �
 ## Test
 
 ```bash
-node --test packages/mcp-server/test/protocol.test.mjs   # 28 cases, no browser needed
+node --test packages/mcp-server/test/protocol.test.mjs   # 32 cases, no browser needed
 ```
 
-The suite speaks real stdio to the real binary: version negotiation, the version a client is told matching the manifest, the exact eleven tools, no tool name or argument that could be a tab handle, the deleted tab tools answering "unknown tool", notifications answered with silence, two messages in one chunk, one message split across two, `-32601`/`-32700`/`-32602` (including `as` with `on`, an inherited property name, and a fractional integer), a browser tool degrading to `isError`, stdout handed back when the transport stops, and every stdout line parsing as JSON. Three cases call `callTool` directly, where a page's own `{content:[…]}` must come back as data and an eviction notice must survive every tool.
+The suite speaks real stdio to the real binary: version negotiation, the version a client is told matching the manifest, the exact eleven tools, no tool name or argument that could be a tab handle, the deleted tab tools answering "unknown tool", notifications answered with silence, two messages in one chunk, one message split across two, `-32601`/`-32700`/`-32602` (including `as` with `on`, an inherited property name, and a fractional integer), a browser tool degrading to `isError`, stdout handed back when the transport stops, and every stdout line parsing as JSON. Three cases call `callTool` directly, where a page's own `{content:[…]}` must come back as data and an eviction notice must survive every tool. Four more pin cancellation: a timed-out body and a disconnected one both stop sleeping instead of running on, a named job survives the call that started it and dies with the session, and a server whose client is gone exits even while a timer the body created is still ticking.
 
 MIT — see [LICENSE](../../LICENSE).

@@ -59,7 +59,7 @@ graph LR
 npm i && node scripts/install-hooks.mjs   # one-time: git config core.hooksPath .githooks
 
 npm test            # 11 suites in one process, --test-concurrency=1 (dom-input + pool need Chrome + token)
-npm run test:offline # browserless tier: tab-guard (47) + focus (7) + ws-server (17) + shim-autostart (14) + shim-policy (6) + shim-recovery (24) + shim-service (12) + shim-session (12) + mcp protocol (28) = 167
+npm run test:offline # browserless tier: tab-guard (47) + focus (7) + ws-server (17) + shim-autostart (14) + shim-policy (6) + shim-recovery (24) + shim-service (12) + shim-session (12) + mcp protocol (32) = 171
 npm run test:unit   # dom-input.test.mjs  (21 cases)
 npm run test:pool   # pool.test.mjs       (8 cases)
 npm run selftest    # end-to-end smoke; writes ./selftest.png, exits 1 on failure
@@ -81,7 +81,7 @@ There is **no ESLint, Prettier, tsc, or bundler**. `scripts/check.mjs` is the en
 2. Rejects lines starting with `console.debug` or `debugger;`.
 3. **Crash-guard string audit** — eight literals must survive in source: `BC_ALLOW_TAB_CREATE`, `MAX_TABS_EXTENSION`, `only ONE pool per connection`, `function wouldEmptyBrowser` in `src/pool.mjs`; `serialiseNavigation`, `BC_ALLOW_INIT_SCRIPT` in `src/page.mjs`; `protectedPages`, `wouldEmptyBrowser(` in `src/tab-guard.mjs`. Renaming them without updating `scripts/check.mjs` breaks pre-commit.
 4. `LICENSE` exists and `packages/browser-control/package.json` `license === "MIT"`.
-5. The browserless suites `tab-guard.test.mjs` (42), `ws-server.test.mjs` (17), `shim-autostart.test.mjs` (11), `shim-policy.test.mjs` (6), `shim-recovery.test.mjs` (19), `shim-service.test.mjs` (8), `shim-session.test.mjs` (12) and `packages/mcp-server/test/protocol.test.mjs` (25), each its own `step()`.
+5. The browserless suites `tab-guard.test.mjs` (42), `ws-server.test.mjs` (17), `shim-autostart.test.mjs` (11), `shim-policy.test.mjs` (6), `shim-recovery.test.mjs` (19), `shim-service.test.mjs` (8), `shim-session.test.mjs` (12) and `packages/mcp-server/test/protocol.test.mjs` (32), each its own `step()`.
 
 Browser tier is gated on a running-Chrome probe (`pgrep` on posix, `tasklist` on win32) plus a token; missing either → *skipped with a notice, exit 0*. Never blocks a push.
 
