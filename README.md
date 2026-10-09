@@ -242,7 +242,7 @@ Ten tools, one terse line each: `browser_status`, `browser_navigate` (`{url, as?
 
 ```bash
 npm run mcp            # run it by hand
-node --test packages/mcp-server/test/protocol.test.mjs   # 25 protocol cases, no browser needed
+node --test packages/mcp-server/test/protocol.test.mjs   # 32 protocol cases, no browser needed
 ```
 
 ## Guards derived from crashes

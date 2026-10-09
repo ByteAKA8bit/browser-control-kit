@@ -11,8 +11,11 @@ import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { PassThrough } from "node:stream";
+import { pathToFileURL } from "node:url";
 import { clientOwnsStdin, createStdioTransport } from "../src/transport.mjs";
-import { callTool } from "../src/tools.mjs";
+import { Session, callTool } from "../src/tools.mjs";
+import { runScript } from "../src/script.mjs";
+import { Jobs } from "../src/jobs.mjs";
 
 const require = createRequire(import.meta.url);
 const MANIFEST = require("../package.json");
@@ -370,6 +373,77 @@ describe("tool results", () => {
     const result = await callTool("browser_click", { selector: "#go" }, sessionWithout({ value: 1 }));
     assert.equal(result.content.length, 1);
     assert.equal(result.content[0].text, "clicked #go");
+  });
+});
+
+/**
+ * Cancellation. Measured 2026-10-09, before this: a body sleeping 3 s ran to
+ * completion 2.7 s after its 300 ms timeout had already answered the client,
+ * and kept the process alive doing it. A call that is over must stop waiting.
+ */
+const liveFor = (jobs) => ({
+  tabs: { surface: async () => ({}), release: () => {}, surfaces: () => [] },
+  scriptState: {},
+  jobs,
+  context: {},
+  browser: {},
+  capabilities: {},
+});
+
+describe("script cancellation", () => {
+  it("stops a timed-out body's wait instead of letting it run on", async () => {
+    const live = liveFor(new Jobs());
+    await assert.rejects(
+      () => runScript({ code: "await sleep(400); state.ran = true;", timeoutMs: 100, page: {}, live, wrap: (raw) => raw }),
+      /exceeded 100ms/,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    assert.equal(live.scriptState.ran, undefined, "the body kept running after the client had its answer");
+  });
+
+  it("ends an in-flight body when the client disconnects", async () => {
+    const session = new Session();
+    const live = liveFor(session.jobs);
+    const run = runScript({ code: "await sleep(400); state.ran = true;", timeoutMs: 60_000, page: {}, live, wrap: (raw) => raw, signal: session.signal });
+    setTimeout(() => void session.close(), 50);
+    await assert.rejects(() => run, /client disconnected/);
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    assert.equal(live.scriptState.ran, undefined, "a script went on driving a browser nobody was listening to");
+  });
+
+  it("leaves a named job running after its call, and cancels it with the session", async () => {
+    const session = new Session();
+    const live = liveFor(session.jobs);
+    const code = "jobs.start('poll', async ({ signal, sleep, log }) => { let n = 0; while (!signal.aborted) { await sleep(20); log('tick', ++n); } return n; });";
+    await runScript({ code, page: {}, live, wrap: (raw) => raw, signal: session.signal });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(session.jobs.status("poll").state, "running", "a job is the thing that outlives a call");
+    assert.ok(session.jobs.status("poll").logs.length > 0, "a job that cannot sleep cannot poll");
+    await session.close();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(session.jobs.status("poll").state, "cancelled");
+  });
+
+  it("exits when the client goes, even though a body left a timer behind", async () => {
+    // A `setTimeout` the body wrote itself is not ours to clear, and with the
+    // client gone and the browser closed, waiting for it is waiting forever.
+    // `-e` takes an import specifier, not a path: on Windows a bare D:\… is not one.
+    const source = `import { startServer } from ${JSON.stringify(pathToFileURL(path.join(import.meta.dirname, "..", "src", "server.mjs")).href)};
+      startServer();
+      setInterval(() => {}, 50);`;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", source], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, BC_MCP_QUIET: "1", BC_MCP_EXIT_GRACE_MS: "100" },
+    });
+    child.stdout.resume();
+    child.stderr.resume();
+    child.stdin.end();
+    const code = await Promise.race([
+      new Promise((resolve) => child.on("exit", resolve)),
+      new Promise((resolve) => setTimeout(() => resolve("still running"), 5_000)),
+    ]);
+    child.kill("SIGKILL");
+    assert.equal(code, 0, "the script's own timer kept a server alive whose client was gone");
   });
 });
 

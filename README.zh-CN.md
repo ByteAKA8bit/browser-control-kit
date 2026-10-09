@@ -215,7 +215,7 @@ Agent 总爱把这个仓库现场包成 MCP,然后连接断断续续、标签越
 
 ```bash
 npm run mcp            # 手动跑
-node --test packages/mcp-server/test/protocol.test.mjs   # 28 个协议用例,不需要浏览器
+node --test packages/mcp-server/test/protocol.test.mjs   # 32 个协议用例,不需要浏览器
 ```
 
 ## 它在你机器上留下的东西

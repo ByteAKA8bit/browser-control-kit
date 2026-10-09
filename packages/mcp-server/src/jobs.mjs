@@ -10,6 +10,22 @@
 // this process is the lifetime of everything, jobs included.
 const LOG_LINES = Number(process.env.BC_MCP_JOB_LOG ?? 200);
 
+/** A wait that ends when the job does: a cancelled loop must stop sleeping, not keep its timer alive. */
+function waitFor(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason ?? new Error("cancelled"));
+    const stop = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error("cancelled"));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", stop);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", stop, { once: true });
+  });
+}
+
 /** One job table per session. */
 export class Jobs {
   #jobs = new Map();
@@ -17,7 +33,7 @@ export class Jobs {
   /**
    * Start `fn` under `name`, replacing a finished job of that name.
    * @param {string} name
-   * @param {(ctx: { signal: AbortSignal, log: (...parts: unknown[]) => void }) => Promise<unknown>} fn
+   * @param {(ctx: { signal: AbortSignal, sleep: (ms: number) => Promise<void>, log: (...parts: unknown[]) => void }) => Promise<unknown>} fn
    */
   start(name, fn) {
     const key = String(name ?? "").trim();
@@ -31,7 +47,7 @@ export class Jobs {
       if (job.logs.length > LOG_LINES) job.logs.splice(0, job.logs.length - LOG_LINES); // a loop running for an hour must not grow
     };
     this.#jobs.set(key, job);
-    job.promise = (async () => fn({ signal: controller.signal, log: job.log }))().then(
+    job.promise = (async () => fn({ signal: controller.signal, sleep: (ms) => waitFor(ms, controller.signal), log: job.log }))().then(
       (value) => {
         job.value = value;
         job.state = "done";
@@ -87,12 +103,12 @@ export class Jobs {
   cancel(name) {
     const job = this.#jobs.get(String(name ?? "").trim());
     if (!job || job.state !== "running") return this.status(name);
-    job.controller.abort();
-    return this.status(name);
+    job.controller.abort(new Error(`job "${job.name}" was cancelled`));
+    return this.status(job.name);
   }
 
   /** Stop everything (server shutdown): a job must not outlive the session it drives. */
   cancelAll() {
-    for (const job of this.#jobs.values()) if (job.state === "running") job.controller.abort();
+    for (const job of this.#jobs.values()) if (job.state === "running") job.controller.abort(new Error(`job "${job.name}" was cancelled: the MCP client disconnected`));
   }
 }

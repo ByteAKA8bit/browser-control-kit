@@ -48,7 +48,11 @@ export function startServer({ input = process.stdin, output = process.stdout } =
     log(`${why}, shutting down`);
     transport.stop();
     await session.close();
-    // No timers or sockets of our own: the loop drains the last reply and exits.
+    // Our own waits end with session.close(); a timer the script body created
+    // itself is not ours to clear, and with the client gone and the browser
+    // closed, waiting for it is waiting forever. BC_MCP_EXIT_GRACE_MS=0 waits.
+    const grace = Number(process.env.BC_MCP_EXIT_GRACE_MS ?? 250);
+    if (grace > 0) setTimeout(() => process.exit(0), grace).unref(); // unref'd: a clean process still exits at once
   };
 
   const methods = {

@@ -15,8 +15,24 @@ const require = createRequire(import.meta.url);
 const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
 export const SCRIPT_TIMEOUT_MS = () => Number(process.env.BC_MCP_SCRIPT_MS ?? 120_000);
 
+/** A wait that ends when the call does: a cancelled script must stop sleeping, not run on unseen. */
+function waitFor(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const stop = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", stop);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", stop, { once: true });
+  });
+}
+
 /** Everything the body can name, in the order it is passed in. */
-const SCOPE = ["page", "surface", "release", "surfaces", "state", "jobs", "log", "guard", "context", "browser", "capabilities", "fixtures", "controlPage", "require", "sleep"];
+const SCOPE = ["page", "surface", "release", "surfaces", "state", "jobs", "signal", "log", "guard", "context", "browser", "capabilities", "fixtures", "controlPage", "require", "sleep"];
 
 /** A result the transport can carry: Buffers become images, everything else JSON. */
 function present(value, logs) {
@@ -33,19 +49,25 @@ function present(value, logs) {
 
 /**
  * Run `code` as an async function body with the live session in scope.
- * @param {{ code: string, timeoutMs?: number, page: object, live: object, wrap: (raw: object) => object }} args
+ * @param {{ code: string, timeoutMs?: number, page: object, live: object, wrap: (raw: object) => object, signal?: AbortSignal }} args
  * @returns {Promise<Array<object>>} MCP content blocks
  */
-export async function runScript({ code, timeoutMs, page, live, wrap }) {
+export async function runScript({ code, timeoutMs, page, live, wrap, signal }) {
   const logs = [];
   const log = (...parts) => logs.push(parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" "));
   const guard = live.tabs;
+  // The call's lifetime, ended by its timeout or by the client leaving. Jobs
+  // carry their own signal on purpose: they are what outlives a call.
+  const controller = new AbortController();
+  const gone = () => controller.abort(new Error("browser_script was cancelled: the MCP client disconnected"));
+  signal?.addEventListener("abort", gone, { once: true });
   const scope = {
     page,
     surface: async (name) => wrap(await guard.surface(name)),
     release: (name) => guard.release(name),
     surfaces: () => guard.surfaces(),
     state: live.scriptState,
+    signal: controller.signal,
     jobs: live.jobs,
     log,
     guard,
@@ -55,7 +77,7 @@ export async function runScript({ code, timeoutMs, page, live, wrap }) {
     fixtures: await import("browser-control/fixtures"),
     controlPage: (raw) => wrap(raw),
     require,
-    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    sleep: (ms) => waitFor(ms, controller.signal),
   };
   const body = new AsyncFunction(...SCOPE, code);
   // console.log is what an agent reaches for first; MCP calls are serial, so
@@ -66,7 +88,10 @@ export async function runScript({ code, timeoutMs, page, live, wrap }) {
   try {
     const ms = Number(timeoutMs) > 0 ? Number(timeoutMs) : SCRIPT_TIMEOUT_MS();
     const capped = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`browser_script exceeded ${ms}ms (raise timeoutMs, or BC_MCP_SCRIPT_MS)`)), ms);
+      timer = setTimeout(() => {
+        controller.abort(new Error(`browser_script was cancelled: it exceeded ${ms}ms`));
+        reject(new Error(`browser_script exceeded ${ms}ms (raise timeoutMs, or BC_MCP_SCRIPT_MS)`));
+      }, ms);
       timer.unref?.();
     });
     const value = await Promise.race([body(...SCOPE.map((key) => scope[key])), capped]);
@@ -74,6 +99,8 @@ export async function runScript({ code, timeoutMs, page, live, wrap }) {
   } finally {
     clearTimeout(timer);
     console.log = realLog;
+    // The session signal outlives this call; a listener left on it fires for every later script.
+    signal?.removeEventListener("abort", gone);
   }
 }
 
@@ -84,7 +111,9 @@ export const SCRIPT_DESCRIPTION =
   `In scope: ${SCOPE.join(", ")}. ` +
   "`page` is the same named/scratch page the other tools use, `surface(name)` opens or returns another one, " +
   "`state` is an object that survives between calls, `log()` and console.log are returned with the result. " +
-  "For work that outlives one call — waiting for the operator to log in or pay, polling for a slot, retrying a sold-out ticket, a loop that runs for an hour — " +
-  "hand it to a NAMED job: `jobs.start('snipe', async ({ signal, log }) => { while (!signal.aborted) { … } })` returns at once, " +
+  "The call is cancellable: its timeout, or the client disconnecting, aborts `signal` and makes `sleep()` throw, so a long wait does NOT run on in the background — " +
+  "check `signal.aborted` in your own loops. " +
+  "For work that MUST outlive one call — waiting for the operator to log in or pay, polling for a slot, retrying a sold-out ticket, a loop that runs for an hour — " +
+  "hand it to a NAMED job: `jobs.start('snipe', async ({ signal, sleep, log }) => { while (!signal.aborted) { … await sleep(300); } })` returns at once, " +
   "and a later call reads `jobs.status('snipe')` / `jobs.list()` / `await jobs.wait('snipe', 5000)` / `jobs.cancel('snipe')`. " +
   "Example: `const p = await surface('docs'); await p.goto(url); return p.$$eval('h2', h => h.map(x => x.textContent));`";
