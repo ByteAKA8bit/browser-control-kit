@@ -11,6 +11,7 @@ import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { PassThrough } from "node:stream";
+import { pathToFileURL } from "node:url";
 import { clientOwnsStdin, createStdioTransport } from "../src/transport.mjs";
 import { Session, callTool } from "../src/tools.mjs";
 import { runScript } from "../src/script.mjs";
@@ -426,7 +427,8 @@ describe("script cancellation", () => {
   it("exits when the client goes, even though a body left a timer behind", async () => {
     // A `setTimeout` the body wrote itself is not ours to clear, and with the
     // client gone and the browser closed, waiting for it is waiting forever.
-    const source = `import { startServer } from ${JSON.stringify(path.join(import.meta.dirname, "..", "src", "server.mjs"))};
+    // `-e` takes an import specifier, not a path: on Windows a bare D:\… is not one.
+    const source = `import { startServer } from ${JSON.stringify(pathToFileURL(path.join(import.meta.dirname, "..", "src", "server.mjs")).href)};
       startServer();
       setInterval(() => {}, 50);`;
     const child = spawn(process.execPath, ["--input-type=module", "-e", source], {

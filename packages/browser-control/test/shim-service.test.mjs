@@ -241,7 +241,8 @@ describe("launchd agent plist", () => {
 // "What did installing this put on my machine?" must have one answer, and
 // --uninstall must delete exactly that answer. Both read the same list, so the
 // list is what gets pinned: miss a file here and it is left behind forever.
-describe("footprint", () => {
+// The installer exits 2 off darwin, and path.join there is `\` — the list these pin is posix by definition.
+describe("footprint", { skip: process.platform === "win32" ? "launchd paths are posix; the installer refuses to run here" : false }, () => {
   const home = "/Users/op";
   const paths = footprint({ home });
 
