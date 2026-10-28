@@ -61,10 +61,10 @@ npm i && node scripts/install-hooks.mjs   # Node >= 22. Not Bun: its WebSocket c
 # one-time: install the Playwright Extension, store the token from its status page
 mkdir -p ~/.config/browser-control && pbpaste > ~/.config/browser-control/token && chmod 600 $_
 
-npm run test:offline   # tab governance, focus, websocket codec, shim, MCP protocol — 167 cases, no browser needed
+npm run test:offline   # tab governance, focus, websocket codec, shim, MCP protocol — 183 cases, no browser needed
 npm run test:unit      # DOM input, 21 cases   (needs Chrome + token)
 npm run test:pool      # parallel pool, 8 cases (needs Chrome + token)
-npm test               # all ten suites, --test-concurrency=1
+npm test               # all eleven suites, --test-concurrency=1
 npm run selftest       # end-to-end smoke; writes ./selftest.png
 npm run cleanup        # closes the tabs this tool left behind (--dry-run reports only)
 npm run shim           # /json/* rebuild + CDP proxy; only for BC_MODE=cdp
@@ -138,7 +138,7 @@ await browser.close();   // hands back our tabs and the relay's, then disconnect
 | **Windows are measured, not declared** | "Quiet" has no correct constant — a crawler touches a tab every 200 ms, a thinking agent every 30 s. The guard tracks the gap between operations (an EWMA that ignores long pauses) and states every decision in those beats: reusable after ~5, blanked after ~30, closed after ~120, each clamped to a sane floor and cap | `BC_TAB_RECYCLE_MS`, `BC_TAB_BLANK_MS`, `BC_TAB_IDLE_MS` |
 | **It governs its own footprint, nothing else** | No system-memory probing: every platform reports free memory differently and other applications move the number under you. What this process knows exactly is which of *its* tabs are idle — and it hands those back | — |
 | **Transport ceiling** | The one hard number, and not a style choice: the extension bridge drops the connection past 3 attached tabs. Pin your own with `BC_TAB_BUDGET` | `BC_MAX_TABS_EXTENSION`, `BC_TAB_BUDGET` |
-| **Ownership** | Tabs that existed before `attach()` belong to the operator and are **never closed, navigated or counted**; `window.open` / `target=_blank` popups are adopted as ours | — |
+| **Ownership** | Tabs that existed before `attach()` belong to the operator and are **never closed, navigated or counted**; only a `window.open` / `target=_blank` popup opened by one of *our* tabs is adopted. On raw CDP every attached client sees every tab, so a tab another agent opened is never adopted, evicted or closed — `report().foreignPages` counts what was left alone | — |
 | **Holds** | `TabPool` tabs call `hold()` and are immune to recycling, eviction and reaping | `BC_TAB_EVICT=0` to error instead of evicting |
 | **Named surfaces** | `guard.surface("docs")` binds a name to a page: the same name always returns the same page, and a bound surface is never recycled or reaped. `guard.surface()` is the **scratch page** — one page shared by every unnamed call, so a run of unnamed work costs one tab, not one tab per step; it stays unheld, so it is still recycled, evicted and reaped like any unnamed tab. `guard.release(name)` turns a name back into an ordinary owned tab; `guard.surfaces()` lists `{ name, url, idleMs, blanked }` | — |
 | **Background tabs** | On raw CDP a new tab is opened with `Target.createTarget { background: true }`, so it never becomes the tab you are looking at. The extension relay has no such option (`chrome.tabs.create` always activates), so there it degrades to an ordinary foreground tab and stops asking. `report().backgroundTabs` says which you are getting | — |
@@ -225,7 +225,8 @@ Agents keep wrapping this repo in ad-hoc MCP servers that drop connections and o
 
 | Property | How it is enforced |
 | --- | --- |
-| **No tab sprawl** | The agent has no word for "tab". It names a *surface* — `browser_navigate {url, as: "docs"}` keeps one, `{on: "docs"}` returns to it, omitting both uses the scratch surface — and the server owns the lifetime. There is no tool that opens or closes a tab, so an agent cannot leak one |
+| **No tab sprawl** | The agent has no word for "tab". It names a *surface* — `browser_navigate {url, as: "docs"}` keeps one, `{on: "docs"}` returns to it, omitting both uses the scratch surface — and the server owns tab lifetime. There is no tool that opens or closes a tab, so an agent cannot leak one |
+| **The agent decides when to let go** | `browser_release` hands the whole browser back — this session's tabs and the extension relay page — while `state` and jobs stay; the next call attaches again. There is no default idle timeout, because only the agent knows whether a long task still needs it. An operator who wants a backstop can set `BC_MCP_IDLE_MS` |
 | **Stable connection** | One `attach()` per process, created lazily and re-created if the browser goes away; concurrent first calls share one in-flight attach; stdin EOF is the only shutdown path |
 | **Clean stdout** | JSON-RPC only, logs go to stderr, writes respect backpressure — the usual cause of "the MCP server keeps disconnecting" |
 | **Light** | `browser-control` and playwright are imported lazily on the first browser call: idle RSS measured at 40 MB, ~3 MB over a bare Node process |
@@ -238,11 +239,23 @@ decides whether a tab is opened). What is left is intent: a name. At the transpo
 ceiling, when every tab is a bound surface, the least-recently-used one is released and
 its tab reused, and the tool says which name was lost — reported, not refused.
 
-Ten tools, one terse line each: `browser_status`, `browser_navigate` (`{url, as?, waitUntil?}`), `browser_click`, `browser_type`, `browser_fill`, `browser_text`, `browser_evaluate`, `browser_screenshot`, `browser_wait_for` (each taking an optional `on`), and `browser_surfaces` — which lists the named surfaces for humans and agents alike. An `on` naming a surface that does not exist is a tool error listing the names that do. See [`packages/mcp-server/README.md`](packages/mcp-server/README.md).
+Twelve tools, one terse line each: `browser_status`, `browser_navigate` (`{url, as?, waitUntil?}`), `browser_click`, `browser_type`, `browser_fill`, `browser_text`, `browser_evaluate`, `browser_screenshot`, `browser_wait_for` (each taking an optional `on`), `browser_surfaces` — which lists the named surfaces for humans and agents alike — `browser_release` — which hands the browser back when the work is done — and `browser_script`. An `on` naming a surface that does not exist is a tool error listing the names that do. See [`packages/mcp-server/README.md`](packages/mcp-server/README.md).
+
+**Many agents, many projects.** On the extension transport each MCP server names its
+Chrome tab group from `BC_CLIENT_NAME`, falling back to the directory it was started in,
+so `Playwright · shop` and `Playwright · docs` are distinguishable instead of a row of
+identical groups. Run several agents against the resident shim (`BC_MODE=cdp`, or `auto`
+with the shim installed): one approved connection serves every client, `attach()` opens
+no page, and tabs are created in the background. The extension transport also supports
+concurrent agents — one tab group each — but every connection needs its own `connect.html`
+anchor tab, visible in Chrome for as long as that agent is attached. Each agent hands its own
+back with `browser_release` when its work is done, and the next tool call attaches again. An
+operator who wants a backstop can set `BC_MCP_IDLE_MS`; it is off by default, so a long task is
+never cut short by a guess.
 
 ```bash
 npm run mcp            # run it by hand
-node --test packages/mcp-server/test/protocol.test.mjs   # 32 protocol cases, no browser needed
+node --test packages/mcp-server/test/protocol.test.mjs   # 43 protocol cases, no browser needed
 ```
 
 ## Guards derived from crashes
@@ -255,6 +268,7 @@ On 2026-09-05, Chrome 152 + the Playwright Extension were crashed or made to qui
 | **Concurrent navigation** across tabs crashes the browser | `controlPage` serialises navigation process-wide (`BC_PARALLEL_NAV=1` to opt out) |
 | Churning tabs, or several pools accumulating attached tabs → the extension disconnects and Chrome may quit | **One pool per connection**; size ≤ `BC_MAX_TABS_EXTENSION` (3); create/close is serial with a 400 ms settle |
 | Leaving the browser with no tabs takes the bridge down and Chrome exits | Closing stops while only one tab is left — counting **every** tab we can see, the relay's own included |
+| Two agents attached over CDP each see the other's tabs; adopting every `page` event handed one agent the other's page | A page is ours only when we created it or one of our own tabs opened it; other clients' tabs are counted as foreign and left alone |
 | Every `attach()` leaves the relay's `connect.html` tab behind (sixteen runs left sixteen tabs) | `browser.close()` closes it too, and the guard reclaims on `beforeExit`/`SIGINT`/`SIGTERM`; `BC_KEEP_BRIDGE_TAB=1` to keep it |
 | **The extension accepts one client at a time**: two test files in parallel means one cannot connect and the other is interrupted | Suites run serially (`--test-concurrency=1`) |
 | `setViewport` issues `Emulation.setDeviceMetricsOverride` and shrinks the operator's page | No-op unless `BC_VIEWPORT=1` |

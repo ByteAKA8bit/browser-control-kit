@@ -32,7 +32,7 @@ function waitFor(ms, signal) {
 }
 
 /** Everything the body can name, in the order it is passed in. */
-const SCOPE = ["page", "surface", "release", "surfaces", "state", "jobs", "signal", "log", "guard", "context", "browser", "capabilities", "fixtures", "controlPage", "require", "sleep"];
+const SCOPE = ["page", "surface", "release", "surfaces", "handBack", "state", "jobs", "signal", "log", "guard", "context", "browser", "capabilities", "fixtures", "controlPage", "require", "sleep"];
 
 /** A result the transport can carry: Buffers become images, everything else JSON. */
 function present(value, logs) {
@@ -49,10 +49,10 @@ function present(value, logs) {
 
 /**
  * Run `code` as an async function body with the live session in scope.
- * @param {{ code: string, timeoutMs?: number, page: object, live: object, wrap: (raw: object) => object, signal?: AbortSignal }} args
+ * @param {{ code: string, timeoutMs?: number, page: object, live: object, wrap: (raw: object) => object, signal?: AbortSignal, handBack?: () => Promise<boolean> }} args
  * @returns {Promise<Array<object>>} MCP content blocks
  */
-export async function runScript({ code, timeoutMs, page, live, wrap, signal }) {
+export async function runScript({ code, timeoutMs, page, live, wrap, signal, handBack = async () => false }) {
   const logs = [];
   const log = (...parts) => logs.push(parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" "));
   const guard = live.tabs;
@@ -64,8 +64,9 @@ export async function runScript({ code, timeoutMs, page, live, wrap, signal }) {
   const scope = {
     page,
     surface: async (name) => wrap(await guard.surface(name)),
-    release: (name) => guard.release(name),
+    release: (name) => guard.release(name), // one page name, not the browser
     surfaces: () => guard.surfaces(),
+    handBack,
     state: live.scriptState,
     signal: controller.signal,
     jobs: live.jobs,
@@ -109,8 +110,9 @@ export const SCRIPT_DESCRIPTION =
   "Run JavaScript in this session to do many things in one call — the efficient way to drive a flow. " +
   "The body is an async function: `await` freely, `return` a value (JSON, or a Buffer for a PNG). " +
   `In scope: ${SCOPE.join(", ")}. ` +
-  "`page` is the same named/scratch page the other tools use, `surface(name)` opens or returns another one, " +
+  "`page` is the same named/scratch page the other tools use, `surface(name)` opens or returns another one, `release(name)` drops a page name (not the browser), " +
   "`state` is an object that survives between calls, `log()` and console.log are returned with the result. " +
+  "`handBack()` gives the browser back at the end of the flow (the same as browser_release); call it last. " +
   "The call is cancellable: its timeout, or the client disconnecting, aborts `signal` and makes `sleep()` throw, so a long wait does NOT run on in the background — " +
   "check `signal.aborted` in your own loops. " +
   "For work that MUST outlive one call — waiting for the operator to log in or pay, polling for a slot, retrying a sold-out ticket, a loop that runs for an hour — " +

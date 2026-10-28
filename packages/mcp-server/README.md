@@ -3,11 +3,11 @@
 An MCP stdio server that lets an agent drive **the Chrome the operator is already using** — without ever handing it a tab.
 
 - **Pages have names, not handles.** `browser_navigate { url, as: "docs" }` keeps that page as `docs`; every later call takes `on: "docs"` to come back to it. Omit both and you get the scratch page — **one** page, shared by every unnamed call, so a stretch of unnamed work costs one tab rather than one per step.
-- **You never close anything.** There is no tool that opens or closes a tab, and no tab index anywhere in the surface. Lifetime belongs to `browser-control`'s `TabGuard`: a named page is pinned while it is named, the scratch page is reused, an idle one is blanked and then reclaimed, and a page the operator opened is never touched. An agent cannot leak a tab because it never holds one.
+- **You never manage tabs.** There is no tool that opens, closes or selects a tab, and no tab index anywhere in the surface. Tab lifetime belongs to `browser-control`'s `TabGuard`: a named page is pinned while it is named, the scratch page is reused, an idle one is blanked and then reclaimed, and a page the operator opened is never touched. An agent cannot leak a tab because it never holds one.
 - **No quota, either.** The guard hands back a page this session has stopped using instead of opening another, and decides "stopped using" from the session's own measured rhythm rather than a constant. It does not probe system memory. The transport's ceiling (3 attached tabs on the extension bridge) is the only hard number; when it is reached and every page is named, the least-recently-used name is dropped and its page reused — reported as `surfacesEvicted` on the call that caused it, because losing a name must be visible.
 - **Bounded memory, measured not asserted.** Idle, before any browser work, it is a bare Node process (~40 MB RSS): `browser-control` — and through it `playwright-core` — is imported lazily inside the first tool call that needs a browser. Attached and working it settles around 100 MB. A 600-call soak on 2026-10-06 (150 of them screenshots) measured RSS 133 → 150 → 149 → 103 → 114 MB and 97 MB after 20 s idle — a sawtooth, not a climb — while the shim went 70 → 64 MB and open file descriptors fell 25 → 22 (server) and 23 → 19 (shim). The guard held **one** tab for all 600 calls. Page wrappers live in a `WeakMap` keyed by the page, so a closed tab takes its proxy with it; no timers, no caches, no per-call state.
 - **Zero dependencies of its own.** The JSON-RPC framing, the protocol loop and the tool table are three small modules, no SDK.
-- **The client owns the lifetime.** MCP stdio hands this server a private stdin/stdout pair, so the pipes *are* its lifetime: when the client exits — including when it is killed outright, because the kernel closes its end — stdin ends, the browser session is handed back and the process leaves. There is no idle timeout and no parent-process watching: both would be guesses, and the second one would kill sessions that are started behind a launcher. Spawn it with pipes, never `stdio: "inherit"` — a stdin shared with something else is never closed — and a server handed a terminal refuses to start and says why.
+- **The agent owns the lifetime; the server does not guess.** MCP stdio hands this server a private stdin/stdout pair, so the pipes *are* its lifetime: when the client exits — including when it is killed outright, because the kernel closes its end — stdin ends, the browser session is handed back and the process leaves. A client can also outlive the work, so the agent decides: `browser_release` hands back the browser, its tabs and the relay page while keeping `state` and the job table; the next call attaches again. A long task may keep the browser attached indefinitely — there is no default idle timeout. An operator who wants a backstop can set `BC_MCP_IDLE_MS`; only then is a quiet browser released. No parent-process watching, and no process exit on idle — that would be a guess about the session, not about the browser. Spawn it with pipes, never `stdio: "inherit"` — a stdin shared with something else is never closed — and a server handed a terminal refuses to start and says why.
 
 ## Run
 
@@ -56,13 +56,42 @@ flash is per `attach()`, and a resident server attaches once per session.
 
 The extension transport needs the token (see [`browser-control`](../browser-control/README.md#where-the-token-lives-no-environment-variable-needed)); the CDP transport needs the shim, and `auto` will not start one for you — that is the step that can pop Chrome's approval dialog.
 
+### Many agents, many projects
+
+One MCP server per agent is the normal shape, so give each one a name: the extension titles
+its Chrome tab group with `BC_CLIENT_NAME`, and the default is the directory the server was
+started in. Two projects then read as `Playwright · shop` and `Playwright · docs` instead of
+two identical `Playwright · browser-control-mcp` groups:
+
+```json
+{
+  "mcpServers": {
+    "browser-control-shop": {
+      "command": "node",
+      "args": ["/absolute/path/to/browser-control-kit/packages/mcp-server/bin/browser-control-mcp.mjs"],
+      "env": { "BC_CLIENT_NAME": "shop", "BC_MODE": "cdp" }
+    }
+  }
+}
+```
+
+For several agents at once, prefer the resident shim (`BC_MODE=cdp`, or leave `auto` with the
+shim installed): every client is multiplexed over one approved connection, `attach()` opens
+no page at all, and a new tab is created in the background instead of becoming the operator's
+active tab. The extension transport still works concurrently — each connection gets its own
+tab group — but it necessarily opens one `connect.html` page per attached agent; that page is
+the anchor for the connection, so it cannot be closed while the agent is live. Each agent hands
+its own back by calling `browser_release` when its work is done, and the next call opens a fresh
+connection. An operator who wants a backstop can set `BC_MCP_IDLE_MS`; it is off by default, so a
+long task is never cut short by a guess.
+
 ## The model, in one paragraph
 
-Pages are addressed by name, never by handle. Pass `as` to `browser_navigate` to keep that page under a name, and `on` to come back to it from any later call; leave both out and you get the scratch page, the single page every unnamed call shares. Nothing needs closing — named pages are kept while you use them, the scratch page is reused, idle ones are reclaimed — and `browser_surfaces` lists what is named right now. The server sends exactly this paragraph as `initialize.instructions`, which is why no tool description has to repeat it.
+Pages are addressed by name, never by handle. Pass `as` to `browser_navigate` to keep that page under a name, and `on` to come back to it from any later call; leave both out and you get the scratch page, the single page every unnamed call shares. Tabs need no closing — named pages are kept while you use them, the scratch page is reused, unnamed ones are reclaimed after a quiet spell — and `browser_surfaces` lists what is named right now. The browser itself stays attached until you call `browser_release`, so a long task can keep it as long as it needs; the next call after a release attaches again. The server sends this model, plus the `handBack()` shortcut for scripts, as `initialize.instructions`, which is why no tool description has to repeat it.
 
 ## Tools
 
-Ten, and that is the whole surface.
+Twelve, and that is the whole surface.
 
 | Tool | Arguments | Does |
 | --- | --- | --- |
@@ -76,7 +105,8 @@ Ten, and that is the whole surface.
 | `browser_screenshot` | `selector?`, `on?` | Capture a PNG of the viewport or one element. |
 | `browser_wait_for` | `selector`, `state?`, `timeoutMs?`, `on?` | Wait for a selector to reach a state. |
 | `browser_surfaces` | — | List the named pages with their URL and idle time, plus the scratch page's URL. |
-| `browser_script` | `code`, `on?`, `as?`, `timeoutMs?` | **Run a whole flow in one call.** Async function body against this session: `page`, `surface(name)`, `release`, `surfaces`, `state`, `jobs`, `signal`, `log`, `guard`, `context`, `browser`, `capabilities`, `fixtures`, `controlPage`, `require`, `sleep`. Return JSON, or a Buffer for a PNG. |
+| `browser_release` | — | Hand the whole browser back when your work is done: this session's tabs and the relay page go, `state` and jobs stay, and the next call attaches again. Refused while a named job is running. |
+| `browser_script` | `code`, `on?`, `as?`, `timeoutMs?` | **Run a whole flow in one call.** Async function body against this session: `page`, `surface(name)`, `release(name)`, `surfaces`, `handBack()`, `state`, `jobs`, `signal`, `log`, `guard`, `context`, `browser`, `capabilities`, `fixtures`, `controlPage`, `require`, `sleep`. Return JSON, or a Buffer for a PNG. |
 
 A tool that fails — no browser, no such selector, a page that threw — answers with `isError: true` and a sentence saying why. Only a protocol mistake (unknown tool, missing or mistyped argument, or `as` and `on` in the same call, which would name two different pages) is a JSON-RPC error. An `on` that names a page you never kept is a tool error listing the names that do exist:
 
@@ -113,6 +143,8 @@ Newline-delimited JSON-RPC 2.0 on stdin/stdout; **stdout carries protocol bytes 
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `BC_CLIENT_NAME` | working directory | Name of this agent's Chrome tab group, so many projects stay distinguishable |
+| `BC_MCP_IDLE_MS` | `0` (off) | Opt-in backstop: give the browser back after this long with no tool call and no running job. Off by default so a long task is never cut short; `browser_release` is the normal path |
 | `BC_TAB_RECYCLE_MS` | measured | Pin the quiet period after which an unnamed page is reused rather than a new one opened |
 | `BC_TAB_BLANK_MS` | measured | Pin the idle period after which an unnamed page is parked on `about:blank` |
 | `BC_TAB_BUDGET` | transport ceiling | Pin an explicit page limit |
@@ -132,9 +164,9 @@ Everything `browser-control` reads (`BC_MODE`, `BC_CDP_URL`, `BC_TAB_IDLE_MS`, �
 ## Test
 
 ```bash
-node --test packages/mcp-server/test/protocol.test.mjs   # 32 cases, no browser needed
+node --test packages/mcp-server/test/protocol.test.mjs   # 43 cases, no browser needed
 ```
 
-The suite speaks real stdio to the real binary: version negotiation, the version a client is told matching the manifest, the exact eleven tools, no tool name or argument that could be a tab handle, the deleted tab tools answering "unknown tool", notifications answered with silence, two messages in one chunk, one message split across two, `-32601`/`-32700`/`-32602` (including `as` with `on`, an inherited property name, and a fractional integer), a browser tool degrading to `isError`, stdout handed back when the transport stops, and every stdout line parsing as JSON. Three cases call `callTool` directly, where a page's own `{content:[…]}` must come back as data and an eviction notice must survive every tool. Four more pin cancellation: a timed-out body and a disconnected one both stop sleeping instead of running on, a named job survives the call that started it and dies with the session, and a server whose client is gone exits even while a timer the body created is still ticking.
+The suite speaks real stdio to the real binary: version negotiation, the version a client is told matching the manifest, the exact twelve tools, no tool name or argument that could be a tab handle, the deleted tab tools answering "unknown tool", notifications answered with silence, two messages in one chunk, one message split across two, `-32601`/`-32700`/`-32602` (including `as` with `on`, an inherited property name, and a fractional integer), a browser tool degrading to `isError`, `browser_release` answering without attaching, stdout handed back when the transport stops, and every stdout line parsing as JSON. Three cases call `callTool` directly, where a page's own `{content:[…]}` must come back as data and an eviction notice must survive every tool. Five pin script lifetime: a timed-out body and a disconnected one both stop sleeping instead of running on, a named job survives the call that started it and dies with the session, a body can hand the browser back at the end of its flow, and a server whose client is gone exits even while a timer the body created is still ticking. Eight pin the browser lifecycle: a default-off server never hands a quiet browser back, `browser_release` keeps `state` and reattaches, a running call and a running job both refuse it, and the opt-in timer never takes a browser out from under either.
 
 MIT — see [LICENSE](../../LICENSE).

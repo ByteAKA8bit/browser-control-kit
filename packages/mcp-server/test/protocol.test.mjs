@@ -13,7 +13,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { clientOwnsStdin, createStdioTransport } from "../src/transport.mjs";
-import { Session, callTool } from "../src/tools.mjs";
+import { Session, callTool, clientName } from "../src/tools.mjs";
 import { runScript } from "../src/script.mjs";
 import { Jobs } from "../src/jobs.mjs";
 
@@ -126,6 +126,7 @@ describe("stdio JSON-RPC", () => {
     // the one that was published, so it is read from the manifest, not retyped.
     assert.equal(result.serverInfo.version, MANIFEST.version);
     assert.ok(result.instructions, "initialize carries the addressing model so no tool description has to");
+    assert.match(result.instructions, /browser_release/, "the agent is told how to hand the browser back");
   });
 
   it("falls back to its own version when the client asks for an unknown one", async () => {
@@ -148,6 +149,7 @@ describe("stdio JSON-RPC", () => {
       "browser_evaluate",
       "browser_fill",
       "browser_navigate",
+      "browser_release",
       "browser_screenshot",
       "browser_script",
       "browser_status",
@@ -190,7 +192,7 @@ describe("stdio JSON-RPC", () => {
     const { result } = await client.request("tools/list", {});
     const script = result.tools.find((tool) => tool.name === "browser_script");
     assert.deepEqual(script.inputSchema.required, ["code"]);
-    for (const name of ["page", "surface", "state", "log"]) {
+    for (const name of ["page", "surface", "handBack", "state", "log"]) {
       assert.ok(script.description.includes(name), `the description never mentions ${name}`);
     }
     assert.match(script.description, /survives between calls/, "state is the reason a flow can be resumed");
@@ -331,6 +333,13 @@ describe("stdio JSON-RPC", () => {
     assert.equal(status.mode, "cdp");
     assert.ok(status.reason, "status says why it could not attach");
   });
+
+  it("answers browser_release without trying to attach a browser", async () => {
+    const { result, error } = await client.request("tools/call", { name: "browser_release", arguments: {} });
+    assert.equal(error, undefined);
+    assert.equal(result.isError, undefined, "releasing nothing is not a failure");
+    assert.equal(JSON.parse(result.content[0].text).released, false);
+  });
 });
 
 /**
@@ -390,7 +399,7 @@ const liveFor = (jobs) => ({
   capabilities: {},
 });
 
-describe("script cancellation", () => {
+describe("script lifetime", () => {
   it("stops a timed-out body's wait instead of letting it run on", async () => {
     const live = liveFor(new Jobs());
     await assert.rejects(
@@ -424,6 +433,22 @@ describe("script cancellation", () => {
     assert.equal(session.jobs.status("poll").state, "cancelled");
   });
 
+  it("lets a script hand the browser back in the same call", async () => {
+    let handedBack = 0;
+    const content = await runScript({
+      code: "await handBack(); return 'bye';",
+      page: {},
+      live: liveFor(new Jobs()),
+      wrap: (raw) => raw,
+      handBack: async () => {
+        handedBack += 1;
+        return true;
+      },
+    });
+    assert.equal(handedBack, 1, "the body could end the browser it was using");
+    assert.equal(content[0].text, "bye", "the result still reaches the client");
+  });
+
   it("exits when the client goes, even though a body left a timer behind", async () => {
     // A `setTimeout` the body wrote itself is not ours to clear, and with the
     // client gone and the browser closed, waiting for it is waiting forever.
@@ -444,6 +469,189 @@ describe("script cancellation", () => {
     ]);
     child.kill("SIGKILL");
     assert.equal(code, 0, "the script's own timer kept a server alive whose client was gone");
+  });
+});
+
+describe("browser lifecycle", () => {
+  const fakeLive = (name, onClose) => ({
+    tabs: { stats: { surfacesEvicted: 0 }, report: () => ({}), surface: async () => ({}) },
+    capabilities: { clientName: name },
+    mode: "cdp",
+    context: {},
+    browser: { isConnected: () => true, close: async () => onClose() },
+  });
+
+  it("hands the tabs back after a quiet spell, and attaches again on the next call", async () => {
+    let closed = 0;
+    let attaches = 0;
+    const session = new Session({
+      idleMs: 30,
+      connect: async (name) => {
+        attaches += 1;
+        assert.ok(name, "every connection has a project name for its tab group");
+        return fakeLive(name, () => (closed += 1));
+      },
+    });
+    await session.browser();
+    session.scriptState.kept = "yes";
+    session.activity()(); // a tool call just finished
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    assert.equal(closed, 1, "the idle browser gave its tabs back");
+    const live = await session.browser();
+    assert.equal(live.scriptState.kept, "yes", "state belongs to the session, not the browser");
+    assert.equal(attaches, 2, "the session stayed alive and attached again");
+    await session.close();
+    assert.equal(closed, 2);
+  });
+
+  it("never releases while a tool call is still in flight", async () => {
+    let closed = 0;
+    const session = new Session({ idleMs: 30, connect: async (name) => fakeLive(name, () => (closed += 1)) });
+    await session.browser();
+    const done = session.activity();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(closed, 0, "the browser belonged to a call that had not returned");
+
+    done();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(closed, 1);
+    await session.close();
+  });
+
+  it("finishes closing the old browser before it attaches again", async () => {
+    let closeStarted = false;
+    let finishClose;
+    const closed = new Promise((resolve) => (finishClose = resolve));
+    const session = new Session({
+      idleMs: 20,
+      connect: async (name) => fakeLive(name, () => {
+        closeStarted = true;
+        return closed;
+      }),
+    });
+    await session.browser();
+    session.activity()();
+    for (let i = 0; i < 50 && !closeStarted; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(closeStarted, true, "the idle timer started closing the browser");
+
+    let reattached = false;
+    const again = session.browser().then((live) => {
+      reattached = true;
+      return live;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(reattached, false, "a reattach would overlap the old connection's tab churn");
+
+    finishClose();
+    await again;
+    assert.equal(reattached, true);
+    await session.close();
+  });
+
+  it("never releases a browser a named job is still driving", async () => {
+    let closed = 0;
+    const session = new Session({ idleMs: 30, connect: async (name) => fakeLive(name, () => (closed += 1)) });
+    await session.browser();
+    session.jobs.start("poll", async ({ signal, sleep }) => {
+      while (!signal.aborted) await sleep(10);
+    });
+    session.activity()();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(closed, 0, "a job outlives its call on purpose");
+
+    session.jobs.cancel("poll");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(closed, 1);
+    await session.close();
+  });
+
+  it("does not hand a quiet browser back unless the operator opted in", async () => {
+    const before = process.env.BC_MCP_IDLE_MS;
+    delete process.env.BC_MCP_IDLE_MS;
+    let closed = 0;
+    const session = new Session({ connect: async (name) => fakeLive(name, () => (closed += 1)) });
+    try {
+      await session.browser();
+      session.activity()(); // a tool call just finished, and nothing else will happen
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(closed, 0, "the server guessed the agent was done");
+      const status = await session.status();
+      assert.deepEqual(status.idle, { afterMs: 0, enabled: false, busy: 0 }, "status says no timer is running");
+    } finally {
+      await session.close();
+      if (before === undefined) delete process.env.BC_MCP_IDLE_MS;
+      else process.env.BC_MCP_IDLE_MS = before;
+    }
+    assert.equal(closed, 1, "closing the session is what hands it back");
+  });
+
+  it("hands the browser back on request, and keeps state for the next attach", async () => {
+    let closed = 0;
+    let attaches = 0;
+    const session = new Session({
+      connect: async (name) => {
+        attaches += 1;
+        return fakeLive(name, () => (closed += 1));
+      },
+    });
+    await session.browser();
+    session.scriptState.kept = "yes";
+    const result = await callTool("browser_release", {}, session);
+    assert.equal(result.isError, undefined);
+    assert.equal(JSON.parse(result.content[0].text).released, true);
+    assert.equal(closed, 1, "the explicit release closed the browser");
+    const live = await session.browser();
+    assert.equal(live.scriptState.kept, "yes", "state belongs to the session, not the browser");
+    assert.equal(attaches, 2, "the next call attached again");
+    await session.close();
+    assert.equal(closed, 2);
+  });
+
+  it("refuses an explicit release while a named job still needs the browser", async () => {
+    let closed = 0;
+    const session = new Session({ connect: async (name) => fakeLive(name, () => (closed += 1)) });
+    await session.browser();
+    session.jobs.start("poll", async ({ signal, sleep }) => {
+      while (!signal.aborted) await sleep(10);
+    });
+    const result = await callTool("browser_release", {}, session);
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /poll/);
+    assert.match(result.content[0].text, /jobs\.cancel/, "the agent is told how to get unstuck");
+    assert.equal(closed, 0, "a job outlives its call on purpose");
+    session.jobs.cancel("poll");
+    await session.close();
+    assert.equal(closed, 1);
+  });
+
+  it("refuses an explicit release under another tool call that is still running", async () => {
+    let closed = 0;
+    const session = new Session({ connect: async (name) => fakeLive(name, () => (closed += 1)) });
+    await session.browser();
+    const first = session.activity();
+    const second = session.activity(); // two calls: one of them is not this release
+    await assert.rejects(() => session.handBack(), /still using this browser/);
+    first();
+    second();
+    assert.equal(closed, 0);
+    await session.close();
+    assert.equal(closed, 1);
+  });
+});
+
+describe("client identity", () => {
+  it("names the tab group after BC_CLIENT_NAME, else the working directory", () => {
+    const before = process.env.BC_CLIENT_NAME;
+    try {
+      process.env.BC_CLIENT_NAME = "alpha-project";
+      assert.equal(clientName(), "alpha-project");
+      delete process.env.BC_CLIENT_NAME;
+      assert.match(clientName(), /\S/, "a fallback name is always available");
+    } finally {
+      if (before === undefined) delete process.env.BC_CLIENT_NAME;
+      else process.env.BC_CLIENT_NAME = before;
+    }
   });
 });
 

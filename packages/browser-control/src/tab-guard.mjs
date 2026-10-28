@@ -9,6 +9,7 @@
 // Invariant: the guard may only touch tabs it adopted, and it cannot adopt what
 // it cannot see — a page the extension may not attach to (chrome:// WebUI, the
 // Web Store, another extension's page, file://) never reaches context.pages().
+import { randomUUID } from "node:crypto";
 import { MARKER, MAX_TABS, MAX_TABS_EXTENSION, TAB_SETTLE_MS, wouldEmptyBrowser } from "./pool.mjs";
 import { serialiseNavigation } from "./page.mjs";
 
@@ -100,8 +101,9 @@ export class TabGuard {
     this.stats = { created: 0, recycled: 0, spawned: 0, evicted: 0, reaped: 0, blanked: 0, refused: 0, closed: 0, overflow: 0, surfacesEvicted: 0 };
     this._closeChain = Promise.resolve();
     this._timer = null;
-    this._creating = 0; // tabs opened through newPage() arrive as "page" events too
-    this._onPage = (page) => this.adopt(page, this._creating > 0 ? "created" : "spawned");
+    /** Pages that appeared after attach and are not ours: another client's, or the operator's. */
+    this.foreign = new Set();
+    this._onPage = (page) => void this.#claim(page);
     this.context.on("page", this._onPage);
     if (this.idleAfter() > 0) {
       this._timer = setInterval(() => void this.reap(), REAP_EVERY_MS);
@@ -125,10 +127,33 @@ export class TabGuard {
     process.once("SIGTERM", this._onSignal);
   }
 
+  /**
+   * A page event is not proof of ownership: on raw CDP every attached client
+   * sees every tab, so adopting the event handed agents each other's pages.
+   * Only a popup one of our own tabs opened is ours; everything else is
+   * remembered as foreign and left alone.
+   */
+  async #claim(page) {
+    if (!page || this.owned.has(page) || this.protectedPages.has(page)) return;
+    if ((page.url?.() ?? "").startsWith("chrome-extension://")) return; // the bridge's own tab
+    let opener = null;
+    try {
+      opener = await page.opener?.();
+    } catch {} // the page can vanish while we ask
+    if (this.owned.has(page) || page.isClosed?.()) return; // newPage() adopted it, or it vanished, while we waited
+    if (opener && this.owned.has(opener)) {
+      this.adopt(page, "spawned");
+      return;
+    }
+    this.foreign.add(page);
+    page.on?.("close", () => this.foreign.delete(page));
+  }
+
   /** Start tracking a tab we are responsible for. */
   adopt(page, origin = "spawned") {
     if (!page || this.owned.has(page) || this.protectedPages.has(page)) return page;
-    if (page.url?.().startsWith("chrome-extension://")) return page; // the bridge's own tab
+    if ((page.url?.() ?? "").startsWith("chrome-extension://")) return page; // the bridge's own tab
+    this.foreign.delete(page);
     const now = Date.now();
     this.owned.set(page, { origin, bornAt: now, lastUsed: now, holds: 0 });
     this.stats[origin === "created" ? "created" : "spawned"] += 1;
@@ -194,38 +219,38 @@ export class TabGuard {
     const recycled = this.#idlest();
     if (recycled) return this.#recycle(recycled);
     await this.#admit();
-    this._creating += 1;
-    try {
-      const page = (await this.#backgroundPage()) ?? (await this.context.newPage());
-      await sleep(this.settleMs); // serialise attach churn (see pool.mjs SAFETY GATE)
-      return this.adopt(page, "created");
-    } finally {
-      this._creating -= 1;
-    }
+    const page = (await this.#backgroundPage()) ?? (await this.context.newPage());
+    await sleep(this.settleMs); // serialise attach churn (see pool.mjs SAFETY GATE)
+    return this.adopt(page, "created");
   }
 
   /**
-   * A tab that does NOT become the operator's active tab. Only raw CDP can ask
-   * for one (`Target.createTarget { background: true }`); the extension relay
-   * forwards `chrome.tabs.create` with no such option, so there this returns
-   * null and the caller opens an ordinary — therefore foreground — tab.
-   * One browser session for the whole guard, detached in dispose(); the page
-   * listener and its timer are removed on every path, including the failing one.
+   * A tab that does NOT become the operator's active tab: raw CDP's
+   * `Target.createTarget { background: true }`; the extension relay has no such
+   * option, so it returns null and the caller opens a foreground tab.
+   * One browser session per guard, detached in dispose(); listener and timer are
+   * removed on every path. The URL fragment names OUR target, so another
+   * client's page event cannot be mistaken for it.
    */
   async #backgroundPage() {
     if (this.mode === "extension" || this._background === false) return null;
+    const nonce = `bc-${randomUUID()}`;
     let onPage = null;
     let timer = null;
     try {
       this._bgSession ??= await this.context.browser().newBrowserCDPSession();
       const appeared = new Promise((resolve, reject) => {
-        onPage = resolve;
+        onPage = (page) => {
+          if (page.url?.().includes(nonce)) resolve(page);
+        };
         this.context.on("page", onPage);
         timer = setTimeout(() => reject(new Error("the background target never surfaced as a page")), BACKGROUND_MS);
         timer.unref?.();
       });
-      await this._bgSession.send("Target.createTarget", { url: "about:blank", background: true });
-      return await appeared;
+      await this._bgSession.send("Target.createTarget", { url: `about:blank#${nonce}`, background: true });
+      const page = await appeared;
+      await page.evaluate(() => history.replaceState(null, "", "about:blank")).catch(() => {}); // hide the ownership nonce
+      return page;
     } catch {
       this._background = false; // one refusal is enough; every later tab is an ordinary one
       return null;
@@ -433,6 +458,7 @@ export class TabGuard {
       blankAfterMs: this.blankAfter(),
       idleAfterMs: this.idleAfter(),
       evict: this.evict,
+      foreignPages: this.foreign.size,
       ...this.stats,
       surfaces: this.surfaces(),
       scratch: this._scratch && !this._scratch.isClosed?.() ? (this._scratch.url?.() ?? "") : null,

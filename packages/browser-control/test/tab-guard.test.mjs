@@ -12,13 +12,17 @@ import { readFile } from "node:fs/promises";
 import { TabGuard, guardContext, tabCeiling } from "../src/tab-guard.mjs";
 
 /** Minimal stand-in for a Playwright Page: url, navigation, close, events. */
-function fakePage(url = "https://example.com/") {
+function fakePage(url = "https://example.com/", opener = null) {
   const listeners = new Map();
   return {
     _closed: false,
     _navigations: [],
+    _opener: opener,
     url() {
       return url;
+    },
+    async opener() {
+      return this._opener;
     },
     isClosed() {
       return this._closed;
@@ -60,15 +64,15 @@ function fakeContext(initial = []) {
     once: (event, fn) => context.on(event, fn),
     listeners: () => handlers.length,
     /** A tab that appeared without newPage(): a popup, or a CDP-created target. */
-    emit(url = "about:blank") {
-      const page = fakePage(url);
+    emit(url = "about:blank", opener = null) {
+      const page = fakePage(url, opener);
       pages.push(page);
       for (const fn of [...handlers]) fn(page);
       return page;
     },
-    async newPage(url = "about:blank") {
+    async newPage(url = "about:blank", opener = null) {
       context.opened += 1;
-      return context.emit(url);
+      return context.emit(url, opener);
     },
   };
   return context;
@@ -80,7 +84,7 @@ function fakeCdpBrowser(context, { refuse = false } = {}) {
   session.send = async (method, params) => {
     session.sent.push([method, params]);
     if (refuse) throw new Error("Target.createTarget: Not allowed");
-    context.emit("about:blank");
+    context.emit(params.url);
     return {};
   };
   session.detach = async () => {
@@ -119,13 +123,28 @@ describe("TabGuard ownership", () => {
     guard.dispose();
   });
 
-  it("adopts tabs that appear on their own (window.open, target=_blank)", async () => {
+  it("adopts a popup one of our own tabs opened (window.open, target=_blank)", async () => {
     const context = fakeContext([fakePage()]);
     const guard = guardFor(context, { ceiling: 3 });
-    await context.newPage("https://popup.example/"); // not via guard.newPage()
+    const parent = await guard.newPage();
+    await context.newPage("https://popup.example/", parent); // not via guard.newPage()
     await settled();
-    assert.equal(guard.owned.size, 1);
-    assert.equal(guard.report().tabs[0].origin, "spawned");
+    assert.equal(guard.owned.size, 2);
+    assert.equal(guard.report().tabs.find((tab) => tab.url.includes("popup")).origin, "spawned");
+    guard.dispose();
+  });
+
+  it("leaves a tab another client opened alone, and does not count it", async () => {
+    const context = fakeContext([fakePage()]);
+    const guard = guardFor(context, { ceiling: 1 });
+    const foreign = await context.newPage("https://other-agent.example/"); // no opener
+    await settled();
+
+    assert.equal(guard.owned.size, 0, "another client's page is not ours to evict");
+    assert.equal(guard.report().foreignPages, 1, "and the report says it is there");
+    const mine = await guard.newPage();
+    assert.notEqual(mine, foreign);
+    assert.equal(foreign._closed, false, "the ceiling is ours alone: theirs is untouched");
     guard.dispose();
   });
 
@@ -215,7 +234,7 @@ describe("TabGuard admission", () => {
     const context = fakeContext([fakePage()]);
     const guard = guardFor(context, { ceiling: 1 });
     const asked = await guard.newPage();
-    const popup = await context.newPage("https://popup.example/"); // window.open
+    const popup = await context.newPage("https://popup.example/", asked); // window.open
     await settled();
 
     assert.equal(guard.owned.size, 1, "a popup cannot push us over the ceiling");
@@ -782,7 +801,10 @@ describe("background tabs", () => {
     const listeners = context.listeners();
 
     const page = await guard.newPage();
-    assert.deepEqual(session.sent, [["Target.createTarget", { url: "about:blank", background: true }]]);
+    assert.equal(session.sent.length, 1);
+    assert.equal(session.sent[0][0], "Target.createTarget");
+    assert.match(session.sent[0][1].url, /^about:blank#bc-[0-9a-f-]+$/, "the nonce identifies our own target");
+    assert.equal(session.sent[0][1].background, true);
     assert.equal(context.opened, 0, "an ordinary newPage() is the one that steals the foreground");
     assert.ok(guard.owned.has(page));
     assert.equal(context.listeners(), listeners, "the page listener is removed on the way out");

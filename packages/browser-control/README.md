@@ -83,7 +83,7 @@ So `controlPage()` routes by the probed capabilities:
   - text: the native `HTMLInputElement.prototype.value` setter plus `input`/`change` events (React / Ant Design controlled components accept nothing else)
   - keys: `keydown`/`keyup`, and `Enter` additionally triggers `form.requestSubmit()`
 
-`attach()` returns `capabilities`: `{ mode, rawCdp, focusEmulation, browserPermissions }` — probed, not assumed.
+`attach()` returns `capabilities`: `{ mode, rawCdp, focusEmulation, browserPermissions, clientName }` — probed, not assumed (`clientName` is the tab-group name on the extension transport).
 
 ## Upload / drag (supported on the DOM path too)
 
@@ -118,7 +118,7 @@ const xlsx = makeXlsx([["分類","分野","名称"], ["クラウド","IaaS","AWS
 | `page.setInputFiles / dropFiles / dragAndDrop` | See above; available on the DOM path too |
 | `page.deepCount(selector)` | Match count across shadow roots and frames (diagnostics) |
 | `page.viewportInfo()` | Read-only window size; `setViewport` is inert by default (your window is not ours to resize) |
-| `TabGuard` / `guardContext(context, guard)` / `guardBrowser(browser, guard)` | The tab budget: `newPage()` evicts the LRU tab when over budget, adopts `window.open` popups, reaps idle tabs, `hold()` protects tabs in use, `report()` explains itself. `surface(name)` binds a page to a name and keeps it; `surface()` is the one scratch page every unnamed call shares. `attach()` already wires this up; these exports are for manual use |
+| `TabGuard` / `guardContext(context, guard)` / `guardBrowser(browser, guard)` | The tab budget: `newPage()` evicts the LRU tab when over budget, adopts only `window.open` popups opened by its own tabs (other clients' tabs are left alone and counted in `report().foreignPages`), reaps idle tabs, `hold()` protects tabs in use, `report()` explains itself. `surface(name)` binds a page to a name and keeps it; `surface()` is the one scratch page every unnamed call shares. `attach()` already wires this up; these exports are for manual use |
 | `defaultBudget(mode)` | Budget default: `BC_TAB_BUDGET` wins, otherwise 3 on extension / 4 on cdp |
 | `TabPool` / `parallelMap` (`browser-control/pool`) | Run work across several tabs; `map()` never rejects — failures come back as `{ ok: false, error, ms, tab }` |
 
@@ -127,7 +127,7 @@ const xlsx = makeXlsx([["分類","分野","名称"], ["クラウド","IaaS","AWS
 ## Tests
 
 ```bash
-npm run test:offline   # tab-guard 47 + focus 7 + ws-server 17 + shim-autostart 14 + shim-policy 6 + shim-recovery 24 + shim-service 12 + shim-session 12 = 139 cases, no browser needed
+npm run test:offline   # tab-guard 48 + focus 7 + ws-server 17 + shim-autostart 14 + shim-policy 6 + shim-recovery 24 + shim-service 12 + shim-session 12 = 140 cases, no browser needed
 npm test               # the same plus dom-input 21 and pool 8, --test-concurrency=1
 npm run selftest       # end-to-end smoke, writes ./selftest.png
 npm run cleanup        # closes only the tabs this tool left behind (--dry-run reports only)

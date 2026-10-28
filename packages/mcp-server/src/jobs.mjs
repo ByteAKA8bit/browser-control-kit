@@ -82,6 +82,12 @@ export class Jobs {
     return [...this.#jobs.values()].sort((a, b) => b.startedAt - a.startedAt).map((job) => this.status(job.name));
   }
 
+  /** Is any job still running? An idle release must not take a browser out from under one. */
+  hasRunning() {
+    for (const job of this.#jobs.values()) if (job.state === "running") return true;
+    return false;
+  }
+
   /** Wait for a job to finish, optionally giving up after `timeoutMs` and leaving it running. */
   async wait(name, timeoutMs) {
     const job = this.#jobs.get(String(name ?? "").trim());

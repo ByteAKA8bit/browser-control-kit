@@ -47,7 +47,7 @@ npm i && node scripts/install-hooks.mjs      # Node ≥ 22；不要用 Bun（其
 # 一次性：装 Playwright Extension，把 status 页的 token 存起来
 mkdir -p ~/.config/browser-control && pbpaste > ~/.config/browser-control/token && chmod 600 $_
 
-npm run test:offline     # 标签治理、焦点归还、WebSocket 编解码、shim、MCP 协议 167 例（不需要浏览器，pre-commit 也跑）
+npm run test:offline     # 标签治理、焦点归还、WebSocket 编解码、shim、MCP 协议 183 例（不需要浏览器，pre-commit 也跑）
 npm run test:unit        # DOM 输入 21 例
 npm run test:pool        # 并行 8 例
 npm run selftest         # 端到端自检
@@ -123,7 +123,9 @@ shim side:    node   90849 127.0.0.1:54006->127.0.0.1:9333     ← Playwright
 | 多标签**并发导航**崩浏览器 | `controlPage` 进程级导航串行化（`BC_PARALLEL_NAV=1` 可解） |
 | 反复创建/关闭标签、多个池累积附着标签 → 扩展断连，浏览器可能直接退出 | 每连接**只允许一个池**；`BC_MAX_TABS_EXTENSION=3`；创建/关闭串行 + 400ms 沉降 |
 | 池的标签是浏览器里唯一的标签时，桥一断 Chrome 就退出 | 启动池前要求存在至少一个普通标签 |
+| 两个 agent 同时附在 CDP 上，彼此的标签都可见；接管每个 `page` 事件会让一个 agent 拿到另一个的页面 | 只有我们创建的、或我们自己的标签打开的页面才算我们的；其他客户端的标签记为 foreign，原样不动 |
 | 每次 `attach()` 都会在你浏览器里留下一个**标签组**（扩展行为） | 一个进程只 attach 一次；`npm run cleanup` 收尾 |
+| 每次 `attach()` 都会留下 relay 的 `connect.html` 标签（实测 16 次跑出 16 个） | `browser.close()` 连它一起关；守卫在 `beforeExit`/`SIGINT`/`SIGTERM` 回收；`BC_KEEP_BRIDGE_TAB=1` 保留 |
 | **扩展一次只接受一个客户端**：并发跑两个测试文件时后者连不上、前者被打断 | 测试串行执行（`--test-concurrency=1`） |
 | `setViewport` 会下发 `Emulation.setDeviceMetricsOverride`，把页面锁小、右侧留白 | 默认不生效，需 `BC_VIEWPORT=1` |
 
@@ -146,7 +148,7 @@ await browser.close();   // 自己的标签 + relay 的桥接页,一起还回去
 | **窗口是量出来的,不是定出来的** | "安静"没有正确的常数——爬虫每 200ms 碰一次标签,会思考的 agent 每 30s 碰一次。守卫测量**操作之间的间隔**(EWMA,长时间停顿不计入),并把每个判断表达成"几个节拍":约 5 拍可复用、约 30 拍清空、约 120 拍关闭,各自带下限与上限 | `BC_TAB_RECYCLE_MS`、`BC_TAB_BLANK_MS`、`BC_TAB_IDLE_MS` |
 | **只管自己的占用,不管机器** | 不探测系统内存:各平台的报法都不一样,别人开个大应用就把这个数搬走了。这个进程能精确知道的只有**自己哪些标签是闲的**——那就把它们交回去 | — |
 | **通道上限** | 唯一一个硬数字,而且不是审美问题:扩展桥超过 3 个附着标签就断连。想自己定死用 `BC_TAB_BUDGET` | `BC_MAX_TABS_EXTENSION`、`BC_TAB_BUDGET` |
-| **归属** | `attach()` 之前就存在的标签属于操作者,**永不关闭、不导航、不计数**;`window.open`/`target=_blank` 弹窗算我们的 | — |
+| **归属** | `attach()` 之前就存在的标签属于操作者,**永不关闭、不导航、不计数**;只有**我们自己的**标签打开的 `window.open`/`target=_blank` 弹窗才算我们的。raw CDP 下每个附着客户端都能看见所有标签,所以别的 agent 开的标签永不接管、永不淘汰、永不关闭——`report().foreignPages` 记录被放过的数量 | — |
 | **占用** | `TabPool` 的标签 `hold()` 住,不会被复用、淘汰或回收 | `BC_TAB_EVICT=0` 改为只报错不淘汰 |
 | **具名页面（surface）** | `guard.surface("docs")` 把一个名字绑到一个页面:同名总是返回同一个页面,绑定期间既不会被复用也不会被回收。`guard.surface()` 是**草稿页**——所有不具名的调用共用这一个页面,所以一串不具名的操作只占一个标签,而不是一步一个;它不被 hold,因此照样会被复用、淘汰、回收。`guard.release(name)` 把名字解绑、标签变回普通的自有标签;`guard.surfaces()` 列出 `{ name, url, idleMs, blanked }` | — |
 | **后台开标签** | raw CDP 下新标签用 `Target.createTarget { background: true }` 打开,永远不会变成你正在看的那个标签;扩展 relay 没有这个选项(`chrome.tabs.create` 必然激活),于是退回普通前台标签并且不再重试。`report().backgroundTabs` 告诉你当前是哪一种 | — |
@@ -203,7 +205,8 @@ Agent 总爱把这个仓库现场包成 MCP,然后连接断断续续、标签越
 
 | 特性 | 怎么保证的 |
 | --- | --- |
-| **开不出新标签** | Agent 的词汇里根本没有"标签"。它说的是**具名页面**——`browser_navigate {url, as: "docs"}` 留住一个,`{on: "docs"}` 回到它,两个都不给就用草稿页——生命周期归服务端管。没有任何工具能开或关一个标签,所以 agent 漏不了标签 |
+| **开不出新标签** | Agent 的词汇里根本没有"标签"。它说的是**具名页面**——`browser_navigate {url, as: "docs"}` 留住一个,`{on: "docs"}` 回到它,两个都不给就用草稿页——标签生命周期归服务端管。没有任何工具能开或关一个标签,所以 agent 漏不了标签 |
+| **何时放手由 agent 决定** | `browser_release` 把整个浏览器还回去——这次会话的标签和扩展的锚点页——`state` 和 job 表保留,下一次调用会重新 attach。默认没有空闲超时,因为只有 agent 知道长任务是不是还需要它;操作者想兜底可以设 `BC_MCP_IDLE_MS` |
 | **连接稳定** | 每进程一次 `attach()`,懒创建、断了自动重建,并发首调共享同一次 attach;只有 stdin EOF 才退出 |
 | **stdout 干净** | 只跑 JSON-RPC,日志全走 stderr,写入遵守背压——这正是"MCP 老断"的常见原因 |
 | **轻** | `browser-control` 与 playwright 都是首次用到才懒加载:实测空载 RSS 40 MB,比裸 Node 只多约 3 MB |
@@ -211,11 +214,13 @@ Agent 总爱把这个仓库现场包成 MCP,然后连接断断续续、标签越
 
 任何需要 agent 配合的规则都是一个失效点,所以我们不是去管住标签,而是把标签从它的词汇里拿掉——和 shim(一条被批准的连接,所有客户端都从它代理)、以及"先复用"(是否开标签不再由调用方决定)是同一个动作。剩下的只有意图:一个名字。到了通道上限、每个标签都是具名页面时,最久未用的那个被释放、标签被复用,工具会说出丢掉的是哪个名字——是报告,不是拒绝。
 
-10 个工具,每个一句话描述:`browser_status`、`browser_navigate`(`{url, as?, waitUntil?}`)、`browser_click`、`browser_type`、`browser_fill`、`browser_text`、`browser_evaluate`、`browser_screenshot`、`browser_wait_for`(都可带可选的 `on`),以及 `browser_surfaces`——列出当前的具名页面,人和 agent 都看得懂。`on` 指向不存在的名字时返回工具错误,并列出存在的名字。详见 [`packages/mcp-server/README.md`](packages/mcp-server/README.md)。
+12 个工具,每个一句话描述:`browser_status`、`browser_navigate`(`{url, as?, waitUntil?}`)、`browser_click`、`browser_type`、`browser_fill`、`browser_text`、`browser_evaluate`、`browser_screenshot`、`browser_wait_for`(都可带可选的 `on`)、`browser_surfaces`——列出当前的具名页面,人和 agent 都看得懂——`browser_release`——干完活把浏览器还回去——以及 `browser_script`。`on` 指向不存在的名字时返回工具错误,并列出存在的名字。详见 [`packages/mcp-server/README.md`](packages/mcp-server/README.md)。
+
+**多个 agent,多个项目。** 扩展通道下,每个 MCP server 用 `BC_CLIENT_NAME` 给自己的 Chrome 标签组命名,没设就用启动目录,于是 `Playwright · shop` 和 `Playwright · docs` 一眼可分,而不是一排一模一样的组。多个 agent 同时跑时优先走常驻 shim(`BC_MODE=cdp`,或装了 shim 的 `auto`):一条被批准的连接服务所有客户端,`attach()` 不开任何页面,新标签开在后台。扩展通道也能并发——每个连接一个标签组——但每个连接都必须有自己的 `connect.html` 锚点页,只要 agent 还连着它就一直留在 Chrome 里。每个 agent 干完自己的活时调用 `browser_release` 把它那份还回去,下一次工具调用会重新 attach。操作者若想留一个兜底,可以设 `BC_MCP_IDLE_MS`;它默认关闭,所以长任务不会被一个猜测打断。
 
 ```bash
 npm run mcp            # 手动跑
-node --test packages/mcp-server/test/protocol.test.mjs   # 32 个协议用例,不需要浏览器
+node --test packages/mcp-server/test/protocol.test.mjs   # 43 个协议用例,不需要浏览器
 ```
 
 ## 它在你机器上留下的东西

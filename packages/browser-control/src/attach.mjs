@@ -215,6 +215,9 @@ export async function attach({ mode = DEFAULT_MODE, clientName = "browser-contro
   }
   const context = browser.contexts()[0];
   const capabilities = await probeCapabilities(context, mode);
+  // The extension titles each connection's tab group with this name, so one
+  // agent per project is visible in Chrome instead of every group reading the same.
+  capabilities.clientName = clientName;
   // `pid` is null for a reused shim: we know the port answered, not who owns it.
   if (shim) capabilities.shim = shim;
   if (focus) capabilities.focus = focus;

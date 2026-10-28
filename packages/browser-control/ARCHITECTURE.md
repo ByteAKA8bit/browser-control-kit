@@ -187,8 +187,8 @@ wanted?".
 | Recycle first | `newPage()` hands back an owned tab that has gone quiet, blanked, before it opens one | reuse is free, a renderer is 40–80 MB |
 | Measured windows | the gap between operations is tracked as an EWMA (`cadence`, long pauses ignored); reuse ≈ 5 beats, blank ≈ 30, close ≈ 120, each clamped; `BC_TAB_*_MS` pins any of them | "quiet" has no correct constant |
 | Admission | refused only at the transport ceiling; an idle tab is evicted before anything is opened. No system-memory probe: unmeasurable portably, and refusing frees nothing | own footprint, not the machine's |
-| Ownership | tabs present at `attach()` are `protectedPages`: never closed, counted or marked | the browser is the operator's |
-| Adoption | `window.open` / `target=_blank` popups are adopted and re-trim the ceiling | uninvited tabs still cost RAM |
+| Ownership | tabs present at `attach()` are `protectedPages`: never closed, counted or marked. A tab another attached client opens after that is not adopted either — on raw CDP every client sees every `page` event, so the event alone proves nothing (`report().foreignPages`) | the browser is the operator's, and another agent's tab is not ours to evict |
+| Adoption | only a `window.open` / `target=_blank` popup whose opener is one of our own tabs is adopted; it re-trims the ceiling | uninvited tabs still cost RAM, but somebody else's uninvited tab must be left alone |
 | Holds | `hold(page)` pins a tab; `TabPool` holds its tabs for the run | a working tab must not be reaped |
 | Named surfaces | `surface(name)` binds one page to a name (recycling an idle owned tab first); the same name returns the same page, blanked or not. Bound surfaces are exempt from recycling and reaping; `release(name)` makes the tab ordinary again, `surfaces()` / `report().surfaces` list `{ name, url, idleMs, blanked }` | an agent should express intent, not manage handles |
 | Scratch page | `surface()` with no name is one page shared by every unnamed call, off the cadence entirely (`report().scratch`). It is never held, so recycling, eviction and reaping still apply | at a 30 s cadence nothing looked idle, so every unnamed step opened a tab and evicted the previous one: the operator watched tabs blink |
@@ -198,10 +198,10 @@ wanted?".
 | Last tab | `#close` refuses when ≤ 1 tab remains, counting the relay's own | Chrome exits and takes the bridge with it |
 | Nothing left behind | `browser.close()` also closes the relay's `connect.html`; `beforeExit`/`SIGINT`/`SIGTERM` reclaim | sixteen runs once left sixteen tabs |
 | Serialised closes | one at a time with `BC_TAB_SETTLE_MS` (400 ms) | attach/detach churn crashed Chrome |
-| Background tabs | on raw CDP `newPage()` opens the tab with `Target.createTarget { background: true }` — one browser session per guard, detached in `dispose()`, listener and timer removed on every path; the extension relay has no such option, so it is not asked and one refusal disables it (`report().backgroundTabs`) | a tab that becomes the active tab is the operator losing their place |
+| Background tabs | on raw CDP `newPage()` opens the tab with `Target.createTarget { background: true, url: "about:blank#bc-<nonce>" }`; the nonce identifies our own target when another client's page event arrives first, and is replaced with plain `about:blank` before the caller sees it. One browser session per guard, detached in `dispose()`, listener and timer removed on every path; the extension relay has no such option, so it is not asked and one refusal disables it (`report().backgroundTabs`) | a tab that becomes the active tab is the operator losing their place |
 
-`report()` exposes budget, owned/operator counts, per-tab origin/held/idle/`name`, the
-`surfaces` list, the `scratch` URL and the `surfacesEvicted` counter. Known
+`report()` exposes budget, owned/operator/foreign counts, per-tab origin/held/idle/`name`,
+the `surfaces` list, the `scratch` URL and the `surfacesEvicted` counter. Known
 blind spot: a tab the extension may not attach to (`chrome://`, Web Store, other
 extensions, `file://` without access) never becomes a Playwright page, so the guard
 cannot see it. `cleanup.mjs` finishes the job out of band: it closes only marked/scratch
@@ -252,7 +252,7 @@ packages/browser-control/
   src/focus.mjs              give the operator's frontmost application back after attach (macOS)
   cleanup.mjs                close only what we left behind (--dry-run)
   selftest.mjs               end-to-end smoke; writes selftest.png, exit 1 on failure
-  test/                      tab-guard 47 · focus 7 · ws-server 17 · shim-autostart 14 ·
+  test/                      tab-guard 48 · focus 7 · ws-server 17 · shim-autostart 14 ·
                              shim-policy 6 · shim-recovery 24 · shim-service 12 ·
                              shim-session 12 (browserless) · dom-input 21 ·
                              pool 8 (need Chrome)

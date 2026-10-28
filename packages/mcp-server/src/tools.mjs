@@ -1,24 +1,40 @@
-// The agent-facing surface: one browser session, pages addressed by NAME, ten
-// tools.
+// The agent-facing surface: one browser session, pages addressed by NAME, and
+// twelve tools.
 //
 // Non-goal: tab handles. Agents leak handles, and the earlier version spent
 // three tool descriptions policing them; instead `as` names a page, `on`
 // returns to a named page, and omitting both lands on the scratch page, the
-// one page every unnamed call shares. Lifetime belongs to browser-control's
+// one page every unnamed call shares. Tab lifetime belongs to browser-control's
 // TabGuard — named pinned, unnamed recycled, idle reclaimed — so no tool here
-// can open or close a tab. browser-control (and playwright-core) is imported
-// lazily in #connect(), so merely listing tools costs nothing but a process.
+// opens or closes an individual tab. The browser itself is the agent's call:
+// `browser_release` hands it back, and no timer guesses on the agent's behalf.
+// browser-control (and playwright-core) is imported lazily in #connect(), so
+// merely listing tools costs nothing but a process.
+import path from "node:path";
 import { Jobs } from "./jobs.mjs";
 import { SCRIPT_DESCRIPTION, runScript } from "./script.mjs";
 
 const ATTACH_TIMEOUT_MS = () => Number(process.env.BC_MCP_ATTACH_TIMEOUT_MS ?? 60_000);
 const TEXT_LIMIT = () => Number(process.env.BC_MCP_TEXT_LIMIT ?? 20_000);
 const WAIT_TIMEOUT_MS = () => Number(process.env.BC_MCP_WAIT_MS ?? 20_000);
+// Off by default: only the agent knows whether a long task still needs the browser.
+// BC_MCP_IDLE_MS is an operator's opt-in backstop, never a default guess.
+const IDLE_MS = () => Number(process.env.BC_MCP_IDLE_MS ?? 0);
 // Nothing to tune here on purpose: TabGuard already sizes its own windows.
+
+/**
+ * The tab group's name: `BC_CLIENT_NAME`, else the directory this server was
+ * started in. Chrome shows it on the group, so many agents map to projects.
+ */
+export function clientName() {
+  const explicit = process.env.BC_CLIENT_NAME?.trim();
+  if (explicit) return explicit;
+  return path.basename(process.cwd() || "") || "browser-control-mcp";
+}
 
 /** Shown by a client before the first tool call (MCP `initialize.instructions`). */
 export const INSTRUCTIONS =
-  "Pages are addressed by name, never by handle. Pass `as` to browser_navigate to keep that page under a name, and `on` to come back to it from any later call; leave both out and you get the scratch page, the single page every unnamed call shares. Nothing needs closing — named pages are kept while you use them, the scratch page is reused, idle ones are reclaimed — and browser_surfaces lists what is named right now. For anything longer than one step, prefer browser_script: it runs a whole flow in one call against this same session, and `state` inside it survives between calls.";
+  "Pages are addressed by name, never by handle. Pass `as` to browser_navigate to keep that page under a name, and `on` to come back to it from any later call; leave both out and you get the scratch page, the single page every unnamed call shares. Tabs need no closing, and the browser is not closed for being quiet — a long task may still need it. You decide: call browser_release when your browser work is done (or `handBack()` at the end of a browser_script); it hands back this session's tabs and the extension relay page, keeps `state` and jobs, and the next call attaches again. browser_surfaces lists what is named right now. For anything longer than one step, prefer browser_script: it runs a whole flow in one call against this same session, and `state` inside it survives between calls.";
 
 /** Reject instead of hanging forever when the operator never approves a connection. */
 function withTimeout(promise, ms, what) {
@@ -44,11 +60,23 @@ export class Session {
   #controlPage = null;
   #wrapped = new WeakMap(); // raw page → controlPage proxy, so a call does not rebuild one
   #evicted = 0; // last seen guard.stats.surfacesEvicted, to report only what is new
+  #busy = 0; // tool calls in flight
+  #idleMs; // 0 (the default) means the agent decides when to hand back
+  #idleTimer = null;
+  #releasing = null; // a reattach must wait until the old browser has finished closing
+  #connectImpl; // tests can attach a fake instead of a browser
+  /** Script state outlives a release; only the client ending clears it. */
+  scriptState = {};
   /** Named background work started by browser_script; see src/jobs.mjs. */
   jobs = new Jobs();
   // Aborted once, when the client is gone: an in-flight script stops waiting
   // instead of driving a browser nobody is listening to.
   #shutdown = new AbortController();
+
+  constructor({ idleMs = IDLE_MS(), connect } = {}) {
+    this.#idleMs = idleMs;
+    this.#connectImpl = connect;
+  }
 
   /** Ends with the client: `browser_script` hands this to every body it runs. */
   get signal() {
@@ -58,6 +86,7 @@ export class Session {
   /** The attach() result, connecting at most once at a time. */
   async browser() {
     if (this.#live?.browser.isConnected()) return this.#live;
+    if (this.#releasing) await this.#releasing; // never create tabs while the old connection is still closing
     this.#live = null;
     this.#connecting ??= this.#connect().finally(() => {
       this.#connecting = null;
@@ -66,15 +95,20 @@ export class Session {
   }
 
   async #connect() {
+    const name = clientName();
     // Lazy on purpose: this is the line that pulls in playwright-core.
-    const { attach, controlPage } = await import("browser-control");
     const live = await withTimeout(
-      attach({ clientName: "browser-control-mcp" }),
+      this.#connectImpl
+        ? this.#connectImpl(name)
+        : import("browser-control").then(({ attach }) => attach({ clientName: name })),
       ATTACH_TIMEOUT_MS(),
       "attach()",
     );
+    const { controlPage } = await import("browser-control");
     this.#controlPage = controlPage;
     this.#evicted = live.tabs?.stats?.surfacesEvicted ?? 0;
+    live.scriptState = this.scriptState;
+    live.jobs = this.jobs;
     this.#live = live;
     return live;
   }
@@ -83,9 +117,85 @@ export class Session {
   async live() {
     const live = await this.browser();
     this.#guard(live); // named pages are the whole model; without a guard there is none
-    live.scriptState ??= {}; // survives between browser_script calls, never across restarts
+    live.scriptState ??= this.scriptState;
     live.jobs ??= this.jobs; // one job table per session: a reattach must not orphan a running loop
     return live;
+  }
+
+  /** Tool calls in flight, including the one asking: a release must not race a live call. */
+  get busy() {
+    return this.#busy;
+  }
+
+  /** Mark a tool call in flight; the returned function ends it and re-arms the idle release. */
+  activity() {
+    this.#busy += 1;
+    this.#disarmIdle();
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      this.#busy = Math.max(0, this.#busy - 1);
+      if (this.#busy === 0) this.#armIdle();
+    };
+  }
+
+  /**
+   * Give the browser back without ending the session: tabs and the relay's page
+   * go, `state` and jobs stay, and the next tool call attaches again. Callers
+   * check first that no call or named job still needs it (handBack, idle timer).
+   */
+  async release() {
+    this.#disarmIdle();
+    const live = this.#live;
+    if (!live) return false;
+    this.#live = null;
+    if (live.scriptState) this.scriptState = live.scriptState;
+    const closing = (async () => {
+      try {
+        await live.browser?.close?.(); // guardBrowser returns the tabs and connect.html
+      } catch {} // the browser may already be gone; the next call reattaches
+    })();
+    this.#releasing = closing;
+    try {
+      await closing;
+    } finally {
+      if (this.#releasing === closing) this.#releasing = null;
+    }
+    return true;
+  }
+
+  /**
+   * The agent's explicit hand-back: refuse while another call or a named job is
+   * still using the browser, otherwise release it. Returns false when nothing
+   * was attached.
+   */
+  async handBack() {
+    if (this.#busy > 1) throw new Error("another tool call is still using this browser; hand it back after that call returns");
+    const running = this.jobs.list().filter((job) => job.state === "running").map((job) => job.name);
+    if (running.length) {
+      throw new Error(
+        `named job${running.length > 1 ? "s" : ""} still running: ${running.join(", ")}; cancel with browser_script { code: "jobs.cancel('${running[0]}')" } first, or leave the browser attached`,
+      );
+    }
+    return this.release();
+  }
+
+  #armIdle() {
+    this.#disarmIdle();
+    if (this.#shutdown.signal.aborted || !this.#live || !(this.#idleMs > 0)) return;
+    this.#idleTimer = setTimeout(() => {
+      this.#idleTimer = null;
+      // A job outlives calls on purpose; a browser with one running is not idle.
+      if (this.#busy > 0 || this.jobs.hasRunning()) return this.#armIdle();
+      void this.release();
+    }, this.#idleMs);
+    this.#idleTimer.unref?.(); // never hold the process open just to give tabs back
+  }
+
+  #disarmIdle() {
+    clearTimeout(this.#idleTimer);
+    this.#idleTimer = null;
   }
 
   /** Wrap a raw page the way every tool does, reusing the proxy a page already has. */
@@ -115,7 +225,7 @@ export class Session {
     return {
       surfaces: guard.surfaces(),
       scratch: guard.report().scratch,
-      note: "Nothing here needs closing: named pages are held while you use them, the scratch page is reused by every unnamed call, idle ones are reclaimed.",
+      note: "Tabs need no closing: named pages are held while you use them, the scratch page is reused by every unnamed call, and unnamed tabs are reclaimed after a quiet spell. The browser itself stays attached until you call browser_release or your client disconnects.",
     };
   }
 
@@ -125,9 +235,11 @@ export class Session {
     const live = await this.browser();
     return {
       attached: true,
+      client: clientName(),
       mode: live.mode,
       capabilities: live.capabilities,
       tabGuard: live.tabs?.report() ?? { enforced: false, reason: "BC_TAB_GUARD=0" },
+      idle: { afterMs: this.#idleMs, enabled: this.#idleMs > 0, busy: this.#busy },
       support,
     };
   }
@@ -135,7 +247,7 @@ export class Session {
   /** What status() reports when there is no browser to attach to. */
   async offlineStatus(err) {
     const { transportSupport, DEFAULT_MODE } = await import("browser-control");
-    return { attached: false, reason: flatten(err), mode: DEFAULT_MODE, support: transportSupport() };
+    return { attached: false, client: clientName(), reason: flatten(err), mode: DEFAULT_MODE, support: transportSupport() };
   }
 
   /** Named pages are the guard's table; without a guard there is no table. */
@@ -177,13 +289,17 @@ export class Session {
     return page;
   }
 
-  /** Hand the browser back (shutdown only). */
+  /** Hand the browser back and end the session (client gone). */
   async close() {
+    this.#disarmIdle();
+    await this.#releasing; // a release already in flight must finish its tab hand-back
     const live = this.#live;
     this.#live = null;
     this.#shutdown.abort(new Error("the MCP client disconnected")); // an in-flight script stops sleeping here
     this.jobs.cancelAll(); // a loop must not keep driving a browser nobody is watching
-    await live?.browser.close().catch(() => {}); // the browser may already be gone
+    try {
+      await live?.browser?.close?.(); // the browser may already be gone
+    } catch {} // teardown must finish even when the bridge is already down
   }
 }
 
@@ -227,7 +343,7 @@ const ON = { type: "string", description: "Name of a page you kept with `as`; om
 export const TOOLS = [
   {
     name: "browser_status",
-    description: "Report the transport, its capabilities, and what the page guard is holding right now.",
+    description: "Report the transport, its capabilities, what the page guard is holding, and whether an idle release is configured.",
     inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
     async run(_args, session) {
       try {
@@ -383,9 +499,21 @@ export const TOOLS = [
   },
   {
     name: "browser_surfaces",
-    description: "List the pages you have named, with their URL and how long each has been idle, plus the scratch page.",
+    description: "List the pages you have named, with their URL and how long each has been idle, plus the scratch page. Tabs need no closing; the browser stays attached until you call browser_release.",
     inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
     run: (_args, session) => session.surfaces(),
+  },
+  {
+    name: "browser_release",
+    description:
+      "Hand the whole browser back when your browser work is done: closes this session's tabs and the extension relay page, keeps `state` and the job table, and the next call attaches again. This is the only early release — a quiet browser is never closed on a timer unless the operator set BC_MCP_IDLE_MS. Refused while a named job is still running.",
+    inputSchema: { type: "object", properties: {}, required: [], additionalProperties: false },
+    async run(_args, session) {
+      const released = await session.handBack();
+      return released
+        ? { released: true, note: "this session's tabs and relay page are gone; `state` and the job table stay, and the next call attaches again" }
+        : { released: false, note: "no browser was attached; nothing to release" };
+    },
   },
   {
     name: "browser_script",
@@ -404,7 +532,7 @@ export const TOOLS = [
     async run({ code, on, as, timeoutMs }, session) {
       const { page } = await session.target({ on, as });
       const live = await session.live();
-      return new Payload(await runScript({ code, timeoutMs, page, live, wrap: (raw) => session.wrap(raw), signal: session.signal }));
+      return new Payload(await runScript({ code, timeoutMs, page, live, wrap: (raw) => session.wrap(raw), signal: session.signal, handBack: () => session.handBack() }));
     },
   },
 ];
@@ -444,12 +572,15 @@ export async function callTool(name, args, session) {
   const tool = byName.get(name);
   if (!tool) throw new InvalidParams(`unknown tool "${name}"`);
   validate(tool, args);
+  const done = session.activity?.();
   let payload;
   try {
     const result = await tool.run(args, session);
     payload = result instanceof Payload ? { content: result.content } : text(result);
   } catch (err) {
     payload = { ...text(`${name} failed: ${flatten(err)}`), isError: true };
+  } finally {
+    done?.(); // only now is the browser genuinely idle
   }
   // One place consumes the eviction counter; seven tools used to drop the notice on the floor.
   return withEvictions(payload, session.freshEvictions());
