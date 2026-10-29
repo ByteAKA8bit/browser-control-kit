@@ -28,15 +28,24 @@ const xml = (value) => String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;"
  * install?" and "remove it all" cannot drift apart. `ours` is what --uninstall
  * deletes; the token and npm's global link belong to someone else — named, so
  * they are findable, never touched.
- * @param {{ home?: string, logDir?: string, label?: string, npmPrefix?: string }} where
+ * @param {{ home?: string, logDir?: string, taskDir?: string, label?: string, npmPrefix?: string }} where
  */
-export const footprint = ({ home = os.homedir(), logDir = process.env.BC_SHIM_LOG_DIR, label = LABEL, npmPrefix = path.resolve(path.dirname(process.execPath), "..") } = {}) => {
+export const footprint = ({
+  home = os.homedir(),
+  logDir = process.env.BC_SHIM_LOG_DIR,
+  taskDir = process.env.BC_TASK_DIR,
+  downloadDir = process.env.BC_DOWNLOAD_DIR,
+  label = LABEL,
+  npmPrefix = path.resolve(path.dirname(process.execPath), ".."),
+} = {}) => {
   const cache = logDir ?? path.join(home, ".cache", "browser-control");
   return [
     { path: path.join(home, "Library/LaunchAgents", `${label}.plist`), what: "launchd agent (macOS requires this location)", ours: true },
     { path: path.join(cache, "shim.log"), what: "shim stdout, truncated past BC_SHIM_LOG_MAX", ours: true },
     { path: path.join(cache, "shim.err.log"), what: "shim stderr, truncated past BC_SHIM_LOG_MAX", ours: true },
     { path: cache, what: "the only directory this kit writes to", ours: true, dir: true },
+    { path: taskDir ?? path.join(cache, "tasks"), what: "durable task state and journals — YOURS; --uninstall leaves them, delete the directory to forget the task", ours: false, dir: true },
+    { path: downloadDir ?? path.join(cache, "downloads"), what: "files browser_download saved — YOURS; --uninstall leaves them", ours: false, dir: true },
     { path: path.join(home, ".config", "browser-control", "token"), what: "YOUR extension token — read, never written, never removed", ours: false },
     { path: path.join(npmPrefix, "bin", "browser-control-mcp"), what: "global command, only if you ran `npm link` — `npm rm -g browser-control-mcp` removes it", ours: false },
     { path: path.join(npmPrefix, "lib", "node_modules", "browser-control-mcp"), what: "symlink to this repo, npm's to remove", ours: false, dir: true },

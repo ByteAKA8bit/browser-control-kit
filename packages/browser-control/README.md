@@ -113,7 +113,8 @@ const xlsx = makeXlsx([["分類","分野","名称"], ["クラウド","IaaS","AWS
 | Export | Description |
 | --- | --- |
 | `attach({ mode, clientName, shimUrl, trace, guard })` | Connect to the running browser → `{ browser, context, mode, capabilities, tabs, saveTrace }`; `context` is under the tab budget by default, `tabs` is the `TabGuard`, and `browser.close()` hands our tabs back first. On the extension transport, connecting launches Chrome and takes the screen, so the frontmost application is restored afterwards (macOS; `capabilities.focus` says what happened, `BC_RESTORE_FOCUS=0` opts out) |
-| `controlPage(page, capabilities)` | A puppeteer-flavoured page: multi-arg `evaluate`/`$eval`/`$$eval`, `waitForSelector({visible})`, `setViewport`, `evaluateOnNewDocument`, `createCDPSession` (a no-op shim when CDP is absent), `inputMode()`, `capabilities()`; everything else passes through to the native Playwright `Page` |
+| `controlPage(page, capabilities)` | A puppeteer-flavoured page: multi-arg `evaluate`/`$eval`/`$$eval`, `waitForSelector({visible})`, `setViewport`, `evaluateOnNewDocument`, `createCDPSession` (a no-op shim when CDP is absent), `inputMode()`, `capabilities()`, `snapshot()`, `text()`, `press()`; everything else passes through to the native Playwright `Page` |
+| `page.snapshot({max})` | Every visible, actionable element with role, accessible name, value, state, a link's `href` and a `f<frame>:<n>` ref. `click`/`type`/`fill`/`press`/`text` accept that ref, a CSS selector, or `text=…` (Playwright's text engine) — so an agent addresses intent, not only DOM structure |
 | `blockUrls(page, pattern)` | `page.route` interception (translation services, analytics beacons…) |
 | `page.setInputFiles / dropFiles / dragAndDrop` | See above; available on the DOM path too |
 | `page.deepCount(selector)` | Match count across shadow roots and frames (diagnostics) |
@@ -127,8 +128,8 @@ const xlsx = makeXlsx([["分類","分野","名称"], ["クラウド","IaaS","AWS
 ## Tests
 
 ```bash
-npm run test:offline   # tab-guard 48 + focus 7 + ws-server 17 + shim-autostart 14 + shim-policy 6 + shim-recovery 24 + shim-service 12 + shim-session 12 = 140 cases, no browser needed
-npm test               # the same plus dom-input 21 and pool 8, --test-concurrency=1
+npm run test:offline   # tab-guard 48 + focus 7 + ws-server 17 + shim-autostart 14 + shim-policy 6 + shim-recovery 24 + shim-service 14 + shim-session 12 = 142 cases, no browser needed
+npm test               # the same plus dom-input 23 and pool 8, --test-concurrency=1
 npm run selftest       # end-to-end smoke, writes ./selftest.png
 npm run cleanup        # closes only the tabs this tool left behind (--dry-run reports only)
 ```

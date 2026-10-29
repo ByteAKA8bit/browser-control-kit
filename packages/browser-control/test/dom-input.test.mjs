@@ -26,6 +26,8 @@ const FIXTURE = `
   <button id="noptr">noptr</button>
   <input id="text" />
   <input id="ro" readonly />
+  <select id="pick"><option value="a">Alpha</option><option value="b">Beta</option></select>
+  <a id="link" href="https://example.com/report.pdf">report</a>
   <div id="log"></div>
   <div id="host"></div>
   <iframe id="frame" srcdoc="<button id='inframe'>f</button><input id='framefield' />"></iframe>
@@ -106,6 +108,67 @@ describe("reach", { skip }, () => {
     await page.fill("#framefield", "in-frame");
     const value = await page.mainFrame().childFrames()[0].evaluate(() => document.getElementById("framefield").value);
     assert.equal(value, "in-frame");
+  });
+});
+
+describe("snapshot refs and intent addressing", { skip }, () => {
+  it("lists actionable elements with role, name and a ref", async () => {
+    const snap = await page.snapshot();
+    const plain = snap.frames.flatMap((f) => f.items).find((item) => item.name === "plain" && item.role === "button");
+    assert.ok(plain, JSON.stringify(snap));
+    assert.match(plain.ref, /^f\d+:\d+$/);
+    assert.equal(snap.frames[0].items.find((item) => item.name === "disabled")?.state?.includes("disabled"), true);
+  });
+
+  it("selects a native option by value or visible label", async () => {
+    await page.fill("#pick", "Beta");
+    assert.equal(await page.evaluate(() => document.querySelector("#pick").value), "b");
+    await page.fill("#pick", "a");
+    assert.equal(await page.evaluate(() => document.querySelector("#pick").value), "a");
+    await assert.rejects(() => page.fill("#pick", "Gamma"), /no-option:Gamma/);
+  });
+
+  it("shows a link's href so browser_download can take it", async () => {
+    const snap = await page.snapshot();
+    const link = snap.frames.flatMap((f) => f.items).find((item) => item.name === "report");
+    assert.equal(link.href, "https://example.com/report.pdf");
+  });
+
+  it("clicks an element by ref, including one inside an iframe", async () => {
+    await page.evaluate(() => {
+      document.getElementById("log").textContent = "";
+    });
+    const snap = await page.snapshot();
+    const plain = snap.frames.flatMap((f) => f.items).find((item) => item.name === "plain");
+    const inFrame = snap.frames.flatMap((f) => f.items).find((item) => item.name === "f");
+    assert.ok(plain && inFrame, JSON.stringify(snap));
+    const result = await page.click(plain.ref);
+    assert.equal(result.via, "ref");
+    assert.match(await log(), /plain;/);
+    await page.click(inFrame.ref); // resolving across frames must not throw
+  });
+
+  it("resolves text= the way Playwright does", async () => {
+    await page.evaluate(() => {
+      document.getElementById("log").textContent = "";
+    });
+    await page.click("text=plain");
+    assert.match(await log(), /plain;/);
+  });
+
+  it("reads text through a ref", async () => {
+    const snap = await page.snapshot();
+    const plain = snap.frames.flatMap((f) => f.items).find((item) => item.name === "plain");
+    assert.match(await page.text(plain.ref), /plain/);
+  });
+
+  it("presses a key on a target", async () => {
+    await page.evaluate(() => {
+      window.__keys = [];
+      document.getElementById("text").addEventListener("keydown", (e) => window.__keys.push(e.key));
+    });
+    await page.press("#text", "Escape");
+    assert.deepEqual(await page.evaluate(() => window.__keys), ["Escape"]);
   });
 });
 

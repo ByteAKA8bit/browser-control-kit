@@ -16,7 +16,7 @@
   },
   "scripts": {
     "start": "node bin/browser-control-mcp.mjs",
-    "test": "node --test test/protocol.test.mjs"
+    "test": "node --test test/task.test.mjs test/protocol.test.mjs"
   },
   "dependencies": {
     "browser-control": "0.1.0"

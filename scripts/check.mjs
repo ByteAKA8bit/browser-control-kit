@@ -154,6 +154,7 @@ const OFFLINE_SUITES = [
   ["packages/browser-control", "test/shim-recovery.test.mjs"],
   ["packages/browser-control", "test/shim-service.test.mjs"],
   ["packages/browser-control", "test/shim-session.test.mjs"],
+  ["packages/mcp-server", "test/task.test.mjs"],
   ["packages/mcp-server", "test/protocol.test.mjs"],
 ];
 for (const [pkg, suite] of OFFLINE_SUITES) {

@@ -8,14 +8,20 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
 import { clientOwnsStdin, createStdioTransport } from "../src/transport.mjs";
-import { Session, callTool, clientName } from "../src/tools.mjs";
+import { Session, TOOLS, callTool, clientName } from "../src/tools.mjs";
 import { runScript } from "../src/script.mjs";
 import { Jobs } from "../src/jobs.mjs";
+import { Task } from "../src/task.mjs";
+import { FETCH_IN_PAGE, uploads } from "../src/files.mjs";
 
 const require = createRequire(import.meta.url);
 const MANIFEST = require("../package.json");
@@ -29,6 +35,12 @@ const NO_BROWSER = {
   BC_SHIM_PROBE_MS: "200",
   BC_MCP_ATTACH_TIMEOUT_MS: "5000",
 };
+
+// Every Session reads and writes a task file; keep the operator's ~/.cache out
+// of it. The spawned server inherits this through process.env.
+const TASK_DIR = mkdtempSync(path.join(tmpdir(), "bc-mcp-task-"));
+process.env.BC_TASK_DIR = TASK_DIR;
+after(() => rmSync(TASK_DIR, { recursive: true, force: true }));
 
 /** A client that reads stdout strictly as newline-delimited JSON, like a real one. */
 function startClient(env = {}) {
@@ -134,6 +146,18 @@ describe("stdio JSON-RPC", () => {
     assert.equal(result.protocolVersion, "2025-06-18");
   });
 
+  it("tells a new client where the task stopped", async () => {
+    new Task({ client: "protocol-resume-note", dir: TASK_DIR }).edit({ intent: "renew the passport", next: "upload a photo" });
+    const resumed = startClient({ ...NO_BROWSER, BC_CLIENT_NAME: "protocol-resume-note" });
+    try {
+      const { result } = await resumed.request("initialize", { protocolVersion: "2025-06-18", capabilities: {} });
+      assert.match(result.instructions, /renew the passport/);
+      assert.match(result.instructions, /upload a photo/);
+    } finally {
+      await resumed.stop();
+    }
+  });
+
   it("never replies to a notification", async () => {
     client.writeRaw(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
     const { result, id } = await client.request("ping", {});
@@ -146,16 +170,21 @@ describe("stdio JSON-RPC", () => {
     const names = result.tools.map((tool) => tool.name).sort();
     assert.deepEqual(names, [
       "browser_click",
+      "browser_download",
       "browser_evaluate",
       "browser_fill",
       "browser_navigate",
+      "browser_press",
       "browser_release",
       "browser_screenshot",
       "browser_script",
+      "browser_snapshot",
       "browser_status",
       "browser_surfaces",
+      "browser_task",
       "browser_text",
       "browser_type",
+      "browser_upload",
       "browser_wait_for",
     ]);
     for (const tool of result.tools) {
@@ -349,7 +378,9 @@ describe("stdio JSON-RPC", () => {
  */
 const sessionWithout = ({ value, evicted = 0 }) => ({
   target: async () => ({ page: { evaluate: async () => value, click: async () => {} }, surface: null }),
+  withDialog: async (_page, _behavior, fn) => fn(),
   freshEvictions: () => evicted,
+  freshDialogs: () => [],
 });
 
 describe("tool results", () => {
@@ -469,6 +500,314 @@ describe("script lifetime", () => {
     ]);
     child.kill("SIGKILL");
     assert.equal(code, 0, "the script's own timer kept a server alive whose client was gone");
+  });
+});
+
+describe("durable task", () => {
+  it("shows the same task to a second session", async () => {
+    const first = new Session({ task: new Task({ client: "protocol-task", dir: TASK_DIR }) });
+    const shown = await callTool("browser_task", { intent: "book a table", next: "paste the SMS code", note: "waiting on the operator" }, first);
+    assert.equal(shown.isError, undefined);
+    assert.match(shown.content[0].text, /intent: book a table/);
+    await first.close();
+
+    const second = new Session({ task: new Task({ client: "protocol-task", dir: TASK_DIR }) });
+    const resumed = await callTool("browser_task", {}, second);
+    assert.match(resumed.content[0].text, /next: paste the SMS code/);
+    assert.match(resumed.content[0].text, /waiting on the operator/);
+    await second.close();
+  });
+
+  it("reopens a saved page by name after the process moved on", async () => {
+    const saved = new Task({ client: "protocol-resume", dir: TASK_DIR });
+    saved.rememberSurface("docs", { url: "https://example.com/docs" });
+
+    const page = {
+      current: "about:blank",
+      keyboard: {},
+      async goto(url) {
+        page.current = url;
+        return null;
+      },
+      url: () => page.current,
+    };
+    const live = {
+      tabs: { surfaces: () => [], surface: async () => page, report: () => ({ scratch: null }), stats: { surfacesEvicted: 0 } },
+      capabilities: { mode: "cdp" },
+      context: {},
+      browser: { isConnected: () => true, close: async () => {} },
+    };
+    const session = new Session({ task: new Task({ client: "protocol-resume", dir: TASK_DIR }), connect: async () => live });
+
+    const target = await session.target({ on: "docs" });
+    assert.equal(target.resumed, true);
+    assert.equal(page.current, "https://example.com/docs");
+    await session.close();
+  });
+
+  it("does not leave a name bound to a page that failed to reopen", async () => {
+    new Task({ client: "protocol-retry", dir: TASK_DIR }).rememberSurface("docs", { url: "https://example.com/docs" });
+    let bound = false;
+    let fail = true;
+    const page = {
+      keyboard: {},
+      async goto() {
+        if (fail) throw new Error("net::ERR_CONNECTION_RESET");
+      },
+      url: () => "about:blank",
+    };
+    const guard = {
+      surfaces: () => (bound ? [{ name: "docs" }] : []),
+      surface: async () => {
+        bound = true;
+        return page;
+      },
+      release: () => {
+        bound = false;
+        return true;
+      },
+      report: () => ({ scratch: null }),
+      stats: { surfacesEvicted: 0 },
+    };
+    const live = { tabs: guard, capabilities: { mode: "cdp" }, context: {}, browser: { isConnected: () => true, close: async () => {} }, scriptState: {} };
+    const session = new Session({ task: new Task({ client: "protocol-retry", dir: TASK_DIR }), connect: async () => live });
+
+    await assert.rejects(() => session.target({ on: "docs" }), /reopening it failed/);
+    fail = false;
+    const target = await session.target({ on: "docs" });
+    assert.equal(target.resumed, true, "the second try reopened the saved URL instead of accepting a blank page");
+    await session.close();
+  });
+
+  it("gives a script's surface(name) the same saved URL", async () => {
+    new Task({ client: "protocol-script-resume", dir: TASK_DIR }).rememberSurface("docs", { url: "https://example.com/docs" });
+
+    const page = {
+      current: "about:blank",
+      keyboard: {},
+      async goto(url) {
+        page.current = url;
+        return null;
+      },
+      url: () => page.current,
+    };
+    const live = {
+      tabs: { surfaces: () => [], surface: async () => page, report: () => ({ scratch: null }), stats: { surfacesEvicted: 0 } },
+      capabilities: { mode: "cdp" },
+      context: {},
+      browser: { isConnected: () => true, close: async () => {} },
+      scriptState: {},
+    };
+    const session = new Session({ task: new Task({ client: "protocol-script-resume", dir: TASK_DIR }), connect: async () => live });
+
+    const out = await runScript({
+      code: "const p = await surface('docs'); return p.url();",
+      page,
+      live,
+      wrap: (raw) => raw,
+      surface: (name) => session.openSurface(name),
+    });
+    assert.equal(out[0].text, "https://example.com/docs");
+    await session.close();
+  });
+
+  it("says what the operator must do when attach fails", async () => {
+    const session = new Session({
+      task: new Task({ client: "protocol-needs", dir: TASK_DIR }),
+      connect: async () => {
+        throw new Error("The CDP shim on http://localhost:9333 is listening but has no approved Chrome connection: waiting for the operator");
+      },
+    });
+    const result = await callTool("browser_status", {}, session);
+    const status = JSON.parse(result.content[0].text);
+    assert.equal(status.attached, false);
+    assert.equal(status.needs, "approval");
+    assert.match(status.hint, /allow/i);
+    await session.close();
+  });
+});
+
+describe("page serialisation", () => {
+  const fakeSession = (page) => {
+    const guard = {
+      surfaces: () => [{ name: "docs" }],
+      surface: async () => page,
+      report: () => ({ scratch: null }),
+      stats: { surfacesEvicted: 0 },
+    };
+    const live = {
+      tabs: guard,
+      capabilities: { mode: "cdp" },
+      context: {},
+      browser: { isConnected: () => true, close: async () => {} },
+      scriptState: {},
+    };
+    return new Session({ task: new Task({ client: "protocol-serial", dir: TASK_DIR }), connect: async () => live });
+  };
+
+  it("runs two calls on one page in the order they arrived", async () => {
+    const page = { keyboard: {}, url: () => "https://example.com", async goto() {} };
+    const session = fakeSession(page);
+    await Promise.all([
+      callTool("browser_script", { on: "docs", code: "await sleep(40); state.order = [...(state.order ?? []), 'first'];" }, session),
+      callTool("browser_script", { on: "docs", code: "state.order = [...(state.order ?? []), 'second'];" }, session),
+    ]);
+    assert.deepEqual(session.scriptState.order, ["first", "second"], "the second body must not run inside the first");
+    await session.close();
+  });
+
+  it("does not make another page wait", async () => {
+    const session = new Session({ task: new Task({ client: "protocol-serial-2", dir: TASK_DIR }), connect: async () => ({}) });
+    const order = [];
+    let releaseFirst;
+    const gate = new Promise((resolve) => {
+      releaseFirst = resolve;
+    });
+    const first = session.serial("docs", async () => {
+      order.push("docs-1 start");
+      await gate;
+      order.push("docs-1 end");
+    });
+    const second = session.serial("docs", async () => order.push("docs-2"));
+    const other = session.serial("mail", async () => order.push("mail"));
+    await other;
+    assert.deepEqual(order, ["docs-1 start", "mail"], "different names run in parallel");
+    releaseFirst();
+    await Promise.all([first, second]);
+    assert.deepEqual(order, ["docs-1 start", "mail", "docs-1 end", "docs-2"]);
+    await session.close();
+  });
+});
+
+describe("file tools", () => {
+  const tool = (name) => TOOLS.find((entry) => entry.name === name);
+  const withPage = (page) => ({ target: async () => ({ page }), withDialog: async (_page, _behavior, fn) => fn() });
+
+  it("hands an input the files it was given, inline bytes and paths alike", async () => {
+    const seen = [];
+    const page = {
+      async setInputFiles(selector, files) {
+        seen.push({ selector, files });
+        return { ok: true, count: files.length, via: "fake" };
+      },
+    };
+    const onDisk = path.join(TASK_DIR, "notes.txt");
+    writeFileSync(onDisk, "from disk");
+    const result = await tool("browser_upload").run(
+      { selector: "#resume", files: [onDisk, { name: "cv.txt", text: "hello" }, { name: "logo.bin", base64: Buffer.from("png").toString("base64") }] },
+      withPage(page),
+    );
+    assert.equal(result.count, 3);
+    assert.deepEqual(result.files, ["notes.txt", "cv.txt", "logo.bin"]);
+    assert.equal(seen[0].selector, "#resume");
+    assert.equal(seen[0].files[0].buffer.toString(), "from disk");
+    assert.equal(seen[0].files[1].buffer.toString(), "hello");
+    assert.equal(seen[0].files[2].buffer.toString(), "png");
+  });
+
+  it("saves fetched bytes where the call asked, and reports its size", async () => {
+    const target = path.join(TASK_DIR, "downloads", "invoice.pdf");
+    const page = {
+      evaluate: async (fn, url, ms, max) => {
+        assert.equal(fn, FETCH_IN_PAGE);
+        assert.equal(url, "https://example.com/invoice.pdf");
+        assert.equal(ms, 30_000);
+        assert.ok(max > 0);
+        return { ok: true, base64: Buffer.from("pdf-bytes").toString("base64"), name: "invoice.pdf", type: "application/pdf", bytes: 9 };
+      },
+    };
+    const result = await tool("browser_download").run({ url: "https://example.com/invoice.pdf", path: target }, withPage(page));
+    assert.equal(result.path, target);
+    assert.equal(result.size, 9);
+    assert.equal(result.type, "application/pdf");
+  });
+
+  it("fetches with the page's cookies and names the file from Content-Disposition", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/csv", "content-disposition": 'attachment; filename="report.csv"' });
+      res.end("a,b\n1,2\n");
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const url = `http://127.0.0.1:${server.address().port}/export`;
+      const result = await FETCH_IN_PAGE(url, 5_000, 1_024);
+      assert.equal(result.ok, true);
+      assert.equal(result.name, "report.csv");
+      assert.equal(result.type, "text/csv");
+      assert.equal(Buffer.from(result.base64, "base64").toString(), "a,b\n1,2\n");
+
+      const tooBig = await FETCH_IN_PAGE(url, 5_000, 2);
+      assert.match(tooBig.reason, /over BC_MCP_DOWNLOAD_MAX/);
+    } finally {
+      server.close();
+    }
+  });
+
+  it("asks for a URL and names what an upload entry may be", async () => {
+    await assert.rejects(() => tool("browser_download").run({}, withPage({})), /needs "url"/);
+    assert.throws(() => uploads([{ name: "x" }]), /unsupported file entry/);
+  });
+});
+
+describe("dialogs", () => {
+  const sessionFor = async (raw) => {
+    const live = {
+      tabs: { surfaces: () => [], surface: async () => raw, report: () => ({ scratch: null }), stats: { surfacesEvicted: 0 } },
+      capabilities: { mode: "cdp" },
+      context: {},
+      browser: { isConnected: () => true, close: async () => {} },
+      scriptState: {},
+    };
+    const session = new Session({ task: new Task({ client: "protocol-dialogs", dir: TASK_DIR }), connect: async () => live });
+    await session.browser();
+    return session;
+  };
+  const makeDialog = (answers) => ({
+    type: () => "confirm",
+    message: () => "Delete it?",
+    accept: async () => answers.push("accept"),
+    dismiss: async () => answers.push("dismiss"),
+  });
+
+  it("dismisses an unhandled dialog and tells the next tool result", async () => {
+    const raw = new EventEmitter();
+    raw.keyboard = {};
+    raw.url = () => "https://example.com/form";
+    const session = await sessionFor(raw);
+    const page = session.wrap(raw);
+    const answers = [];
+    await session.withDialog(page, undefined, async () => raw.emit("dialog", makeDialog(answers)));
+    assert.deepEqual(answers, ["dismiss"], "the safe answer, not a hung page");
+    assert.deepEqual(session.freshDialogs(), [{ type: "confirm", message: "Delete it?", accepted: false, url: "https://example.com/form" }]);
+    assert.deepEqual(session.freshDialogs(), [], "a notice is consumed once");
+
+    await session.withDialog(page, undefined, async () => raw.emit("dialog", makeDialog(answers)));
+    raw.emit("console", { type: () => "error", text: () => "Boom: the cart failed" });
+    raw.emit("pageerror", new Error("Uncaught boom"));
+    const result = await callTool("browser_status", {}, session);
+    const status = result.content.map((block) => block.text).join("\n");
+    assert.match(status, /dialog \(confirm, dismissed\).*Delete it\?/);
+    assert.match(status, /Boom: the cart failed/);
+    assert.match(status, /Uncaught boom/);
+    assert.equal(session.recentErrors().length, 2, "diagnostics stay readable on the next call");
+    await session.close();
+  });
+
+  it("accepts when the call asks, and leaves nothing listening afterwards", async () => {
+    const raw = new EventEmitter();
+    raw.keyboard = {};
+    raw.url = () => "https://example.com/form";
+    const session = await sessionFor(raw);
+    const page = session.wrap(raw);
+    const answers = [];
+    await session.withDialog(page, "accept", async () => raw.emit("dialog", makeDialog(answers)));
+    assert.deepEqual(answers, ["accept"]);
+    assert.equal(session.freshDialogs()[0].accepted, true);
+
+    raw.emit("dialog", makeDialog(answers));
+    assert.deepEqual(session.freshDialogs(), [], "no session listener survives the action");
+    assert.deepEqual(answers, ["accept"], "a later dialog is Playwright's to auto-dismiss, not ours to answer");
+    await session.close();
   });
 });
 

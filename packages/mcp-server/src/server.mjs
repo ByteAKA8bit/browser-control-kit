@@ -61,7 +61,7 @@ export function startServer({ input = process.stdin, output = process.stdout } =
       protocolVersion: negotiateProtocol(params.protocolVersion),
       capabilities: { tools: {} },
       serverInfo: SERVER_INFO,
-      instructions: INSTRUCTIONS,
+      instructions: [INSTRUCTIONS, session.task?.resume?.()].filter(Boolean).join("\n\n"),
     }),
     ping: () => ({}),
     "tools/list": () => ({ tools: toolSpecs() }),

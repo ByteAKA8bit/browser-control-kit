@@ -47,8 +47,8 @@ npm i && node scripts/install-hooks.mjs      # Node ≥ 22；不要用 Bun（其
 # 一次性：装 Playwright Extension，把 status 页的 token 存起来
 mkdir -p ~/.config/browser-control && pbpaste > ~/.config/browser-control/token && chmod 600 $_
 
-npm run test:offline     # 标签治理、焦点归还、WebSocket 编解码、shim、MCP 协议 183 例（不需要浏览器，pre-commit 也跑）
-npm run test:unit        # DOM 输入 21 例
+npm run test:offline     # 标签治理、焦点归还、WebSocket 编解码、shim、MCP 任务与协议 213 例（不需要浏览器，pre-commit 也跑）
+npm run test:unit        # DOM 输入 23 例
 npm run test:pool        # 并行 8 例
 npm run selftest         # 端到端自检
 npm run cleanup          # 收尾：关掉本工具留下的标签、清掉探测用的站点权限
@@ -214,7 +214,9 @@ Agent 总爱把这个仓库现场包成 MCP,然后连接断断续续、标签越
 
 任何需要 agent 配合的规则都是一个失效点,所以我们不是去管住标签,而是把标签从它的词汇里拿掉——和 shim(一条被批准的连接,所有客户端都从它代理)、以及"先复用"(是否开标签不再由调用方决定)是同一个动作。剩下的只有意图:一个名字。到了通道上限、每个标签都是具名页面时,最久未用的那个被释放、标签被复用,工具会说出丢掉的是哪个名字——是报告,不是拒绝。
 
-12 个工具,每个一句话描述:`browser_status`、`browser_navigate`(`{url, as?, waitUntil?}`)、`browser_click`、`browser_type`、`browser_fill`、`browser_text`、`browser_evaluate`、`browser_screenshot`、`browser_wait_for`(都可带可选的 `on`)、`browser_surfaces`——列出当前的具名页面,人和 agent 都看得懂——`browser_release`——干完活把浏览器还回去——以及 `browser_script`。`on` 指向不存在的名字时返回工具错误,并列出存在的名字。详见 [`packages/mcp-server/README.md`](packages/mcp-server/README.md)。
+17 个工具,每个一句话描述:`browser_status`、`browser_task`——持久化的任务记录:intent、下一步、日志、`state`,以及最后一次已知的 job——`browser_navigate`(`{url, as?, waitUntil?}`)、`browser_snapshot`——列出页面上每一个可见、可操作的元素及其 ref、role、name、状态,以及链接的 `href`——`browser_click`、`browser_type`、`browser_fill`、`browser_upload`——把本机文件挂到 input 上——`browser_download`——用页面的 cookie 抓取 URL 并保存——`browser_press`、`browser_text`、`browser_evaluate`、`browser_screenshot`、`browser_wait_for`、`browser_surfaces`——列出当前的具名页面,人和 agent 都看得懂——`browser_release`——干完活把浏览器还回去——以及 `browser_script`。操作类工具(`click` / `type` / `fill` / `upload` / `press` / `text`)接受快照里的 `ref`、CSS selector 或 `text=…`,并且都可带可选的 `on`。从未绑定、也从未保存过的 `on` 返回工具错误,并列出存在的名字;保存过的名字会按它最后的 URL 重新打开。同一个页面上的调用按到达顺序执行,不同页面并行。浏览器弹窗(confirm/alert/beforeunload)默认被取消,并写回工具结果;如果要让它继续,在同一次操作调用上传 `dialog:"accept"`。详见 [`packages/mcp-server/README.md`](packages/mcp-server/README.md)。
+
+**任务能活过进程。** `browser_task` 把 intent、下一步、日志和 `state` 写到 `~/.cache/browser-control/tasks/<client>/`,每个具名页面也记住最后的 URL。重启 MCP server、退出再打开 Chrome、或者明天换一个 agent 接手:server 的第一条消息里就带着一行 resume note——intent、下一步、保存的页面、被中断的 job——`browser_task` 有完整日志,`on` 重新打开页面,`state` 已经加载好了。只有一件事故意不恢复——进程结束时还在运行的 job 会被标记为 interrupted,因为重启一个可能已经点过"支付"的循环,可能点第二次。
 
 **多个 agent,多个项目。** 扩展通道下,每个 MCP server 用 `BC_CLIENT_NAME` 给自己的 Chrome 标签组命名,没设就用启动目录,于是 `Playwright · shop` 和 `Playwright · docs` 一眼可分,而不是一排一模一样的组。多个 agent 同时跑时优先走常驻 shim(`BC_MODE=cdp`,或装了 shim 的 `auto`):一条被批准的连接服务所有客户端,`attach()` 不开任何页面,新标签开在后台。扩展通道也能并发——每个连接一个标签组——但每个连接都必须有自己的 `connect.html` 锚点页,只要 agent 还连着它就一直留在 Chrome 里。每个 agent 干完自己的活时调用 `browser_release` 把它那份还回去,下一次工具调用会重新 attach。操作者若想留一个兜底,可以设 `BC_MCP_IDLE_MS`;它默认关闭,所以长任务不会被一个猜测打断。
 

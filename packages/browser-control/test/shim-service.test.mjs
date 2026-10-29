@@ -266,6 +266,18 @@ describe("footprint", { skip: process.platform === "win32" ? "launchd paths are 
     assert.match(token.what, /never written/);
   });
 
+  it("names the task record without claiming the right to delete it", () => {
+    const tasks = paths.find((entry) => entry.path.endsWith("/tasks"));
+    assert.equal(tasks.ours, false, "a days-long task's journal is the operator's work, not an install artifact");
+    assert.match(tasks.what, /YOURS/);
+  });
+
+  it("names saved downloads without claiming the right to delete them", () => {
+    const downloads = paths.find((entry) => entry.path.endsWith("/downloads"));
+    assert.equal(downloads.ours, false, "a downloaded invoice is the operator's file");
+    assert.match(downloads.what, /YOURS/);
+  });
+
   it("follows BC_SHIM_LOG_DIR, so the logs cannot end up somewhere unlisted", () => {
     const moved = footprint({ home, logDir: "/tmp/bc-logs" });
     assert.deepEqual(

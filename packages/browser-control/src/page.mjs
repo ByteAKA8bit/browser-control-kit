@@ -10,7 +10,7 @@
 //   otherwise                      → DOM input from ./dom-input.mjs (actionability,
 //                                    hit testing, open shadow roots), retried in
 //                                    every frame so iframes work too
-import { DEEP_QUERY_ALL, DOM_CLICK, DOM_COUNT, DOM_KEY, DOM_READ_VALUE, DOM_SET_VALUE } from "./dom-input.mjs";
+import { DEEP_QUERY_ALL, DOM_CLICK, DOM_COUNT, DOM_KEY, DOM_READ_VALUE, DOM_SET_VALUE, DOM_SNAPSHOT, DOM_TEXT } from "./dom-input.mjs";
 import { DOM_DRAG, DOM_DROP_FILES, DOM_MAKE_TRANSFER, DOM_SET_FILES } from "./transfer.mjs";
 import { asUpload } from "./fixtures.mjs";
 
@@ -125,6 +125,29 @@ export function controlPage(page, capabilities = {}) {
     return last;
   };
 
+  const REF = /^f(\d+):(\d+)$/;
+  const framesNow = () => [page.mainFrame(), ...page.frames().filter((f) => f !== page.mainFrame())];
+  /** A `f<frame>:<n>` ref from snapshot(), resolved to that frame's `@n`. */
+  const refTarget = (target) => {
+    const match = REF.exec(target ?? "");
+    if (!match) return null;
+    const frame = framesNow()[Number(match[1])];
+    if (!frame) throw new Error(`stale ref ${target}: the page changed since the snapshot; take a fresh one`);
+    return { frame, selector: `@${Number(match[2])}` };
+  };
+  const inFrame = (frame, fn, args) => {
+    const needsTransfer = fn === DOM_SET_FILES || fn === DOM_DROP_FILES;
+    return frame.evaluate(applyInPage, {
+      src: fn.toString(),
+      args: needsTransfer ? [...args, DEEP_SRC, DOM_MAKE_TRANSFER.toString()] : [...args, DEEP_SRC],
+    });
+  };
+  /** A ref that no longer resolves means the page moved on, not that the element never existed. */
+  const refError = (target, action, res) =>
+    res?.reason === "not-found"
+      ? new Error(`stale ref ${target}: the page changed since the snapshot; take a fresh browser_snapshot`)
+      : new Error(`${action}(${target}) failed: ${res?.reason ?? "unknown"}`);
+
   const overrides = {
     goto: (url, options = {}) => navigate(() => page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000, ...options })),
     reload: (options = {}) => navigate(() => page.reload({ waitUntil: "domcontentloaded", timeout: 45_000, ...options })),
@@ -161,6 +184,12 @@ export function controlPage(page, capabilities = {}) {
      * @returns {Promise<{ ok: boolean, via: string, verified: boolean, reason?: string, landedOn?: string }>}
      */
     async click(selector, options = {}) {
+      const ref = refTarget(selector);
+      if (ref) {
+        const res = await inFrame(ref.frame, DOM_CLICK, [ref.selector, options.nth ?? 0]);
+        if (!res?.ok) throw refError(selector, "click", res);
+        return { ok: true, via: "ref" };
+      }
       if (realInput()) {
         const scope = await frameFor(selector, options.timeout ?? 15_000);
         const handle = await scope.$(selector);
@@ -219,6 +248,13 @@ export function controlPage(page, capabilities = {}) {
     },
 
     async type(selector, text, options = {}) {
+      const ref = refTarget(selector);
+      if (ref) {
+        const current = await inFrame(ref.frame, DOM_READ_VALUE, [ref.selector]);
+        const res = await inFrame(ref.frame, DOM_SET_VALUE, [ref.selector, `${current?.value ?? ""}${text}`]);
+        if (!res?.ok) throw refError(selector, "type", res);
+        return { ok: true, via: "ref" };
+      }
       if (realInput()) {
         const scope = await frameFor(selector);
         return scope.locator(selector).first().pressSequentially(text, { delay: options.delay ?? 10, timeout: 20_000 });
@@ -228,14 +264,90 @@ export function controlPage(page, capabilities = {}) {
       if (!res?.ok) throw new Error(`type(${selector}) failed: ${res?.reason ?? "unknown"}`);
     },
 
-    /** Replace a field's value outright (React-safe). */
+    /** Replace a field's value outright (React-safe); a `<select>` picks by value or label. */
     async fill(selector, value) {
+      const ref = refTarget(selector);
+      if (ref) {
+        const res = await inFrame(ref.frame, DOM_SET_VALUE, [ref.selector, value]);
+        if (!res?.ok) throw refError(selector, "fill", res);
+        return { ok: true, via: "ref" };
+      }
       if (realInput()) {
         const scope = await frameFor(selector);
+        const picked = await scope
+          .$eval(
+            selector,
+            (el, wanted) => {
+              if (!el || el.tagName !== "SELECT") return null;
+              const option = [...el.options].find((o) => o.value === wanted || (o.textContent || "").trim() === wanted);
+              return option ? option.value : false;
+            },
+            value,
+          )
+          .catch(() => null);
+        if (picked !== null) {
+          if (picked === false) throw new Error(`fill(${selector}) failed: no-option:${value}`);
+          return scope.selectOption(selector, picked, { timeout: 20_000 });
+        }
         return scope.fill(selector, value, { timeout: 20_000 });
       }
       const res = await inAnyFrame(DOM_SET_VALUE, [selector, value]);
       if (!res?.ok) throw new Error(`fill(${selector}) failed: ${res?.reason ?? "unknown"}`);
+    },
+
+    /** Press a key on a target, or on whatever is focused. */
+    async press(selector, key) {
+      const ref = refTarget(selector);
+      if (ref) {
+        const res = await inFrame(ref.frame, DOM_KEY, [ref.selector, key]);
+        if (!res?.ok) throw refError(selector, "press", res);
+        return { ok: true, via: "ref" };
+      }
+      if (realInput()) {
+        if (selector) {
+          const scope = await frameFor(selector);
+          await scope.locator(selector).first().press(key, { timeout: 15_000 });
+        } else {
+          await page.keyboard.press(key);
+        }
+        return { ok: true, via: "playwright" };
+      }
+      const res = selector ? await inAnyFrame(DOM_KEY, [selector, key]) : await inFrame(page.mainFrame(), DOM_KEY, [null, key]);
+      if (!res?.ok) throw new Error(`press(${key}) failed: ${res?.reason ?? "unknown"}`);
+      return { ok: true, via: "dom" };
+    },
+
+    /** The actionable page: role, name, state and a ref per element, every frame. */
+    async snapshot({ max = 200 } = {}) {
+      const frames = framesNow();
+      const out = [];
+      for (let i = 0; i < frames.length; i += 1) {
+        let res;
+        try {
+          res = await frames[i].evaluate(applyInPage, { src: DOM_SNAPSHOT.toString(), args: [max, DEEP_SRC] });
+        } catch {} // a frame can navigate away mid-snapshot; the rest still count
+        if (!res?.ok || !res.items?.length) continue;
+        out.push({
+          frame: i,
+          url: frames[i].url(),
+          truncated: !!res.truncated,
+          items: res.items.map((item) => ({ ...item, ref: `f${i}:${item.ref}` })),
+        });
+      }
+      return { url: page.url(), title: await page.title().catch(() => ""), frames: out };
+    },
+
+    /** Read visible text from the frame holding the selector (or a ref). */
+    async text(selector) {
+      const ref = refTarget(selector);
+      if (ref) {
+        const res = await inFrame(ref.frame, DOM_TEXT, [ref.selector]);
+        if (!res?.ok) throw refError(selector, "text", res);
+        return res.value;
+      }
+      const res = await inAnyFrame(DOM_TEXT, [selector ?? null]);
+      if (!res?.ok) throw new Error(`text(${selector}) failed: ${res?.reason ?? "unknown"}`);
+      return res.value;
     },
 
     /**

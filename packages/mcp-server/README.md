@@ -87,36 +87,47 @@ long task is never cut short by a guess.
 
 ## The model, in one paragraph
 
-Pages are addressed by name, never by handle. Pass `as` to `browser_navigate` to keep that page under a name, and `on` to come back to it from any later call; leave both out and you get the scratch page, the single page every unnamed call shares. Tabs need no closing — named pages are kept while you use them, the scratch page is reused, unnamed ones are reclaimed after a quiet spell — and `browser_surfaces` lists what is named right now. The browser itself stays attached until you call `browser_release`, so a long task can keep it as long as it needs; the next call after a release attaches again. The server sends this model, plus the `handBack()` shortcut for scripts, as `initialize.instructions`, which is why no tool description has to repeat it.
+Pages are addressed by name, never by handle. Pass `as` to `browser_navigate` to keep that page under a name, and `on` to come back to it from any later call; leave both out and you get the scratch page, the single page every unnamed call shares. Tabs need no closing — named pages are kept while you use them, the scratch page is reused, unnamed ones are reclaimed after a quiet spell — and `browser_surfaces` lists what is named right now. The browser itself stays attached until you call `browser_release`, so a long task can keep it as long as it needs; the next call after a release attaches again. A **task** has a durable home on disk: `browser_task` records the intent, the next step, a journal and `state`, and every named page keeps its last URL, so a server restart or a Chrome restart costs a reread and a navigation rather than a re-walk. The first `initialize` carries a compact resume note — intent, next step, saved pages, interrupted jobs — so a new agent is told where the work stopped before its first tool call. Jobs are the exception to resuming: one that was running when the process ended is reported interrupted, never restarted. The server sends this model, plus the `handBack()` shortcut for scripts, as `initialize.instructions`, which is why no tool description has to repeat it.
 
 ## Tools
 
-Twelve, and that is the whole surface.
+Seventeen, and that is the whole surface.
+
+An element is named three ways: a `ref` from `browser_snapshot` (`f0:3`), a CSS selector, or `text=Save`. A ref belongs to the frame it came from, is acted on by DOM dispatch (so the event is not trusted), and expires at the next snapshot or navigation. `text=` follows Playwright's rules: unquoted is a case-insensitive substring, `text="Save"` is exact.
 
 | Tool | Arguments | Does |
 | --- | --- | --- |
-| `browser_status` | — | Report the transport, its capabilities and what the page guard is holding. |
-| `browser_navigate` | `url`, `as?`, `on?`, `waitUntil?` | Navigate; `as` keeps the page under a name, `on` reuses a named one. |
-| `browser_click` | `selector`, `on?` | Click the first element matching a selector. |
-| `browser_type` | `selector`, `text`, `on?` | Append text to a field. |
-| `browser_fill` | `selector`, `value`, `on?` | Replace a field's value. |
-| `browser_text` | `selector?`, `on?` | Read visible text of the page or one element. |
-| `browser_evaluate` | `expression`, `on?` | Evaluate a JavaScript expression in a page. |
+| `browser_status` | — | Report the transport, its capabilities, what the page guard is holding, the task, and recent console/uncaught page errors. When attach fails it adds `needs` (`approval`, `extension`, `install` or `unknown`) and a one-line hint for the operator. |
+| `browser_task` | `intent?`, `next?`, `status?`, `note?`, `state?`, `journal?`, `reset?` | Read or update the durable task. With no arguments it reports the intent, the next step, `state`, the saved pages, the last-known jobs and the journal tail. |
+| `browser_navigate` | `url`, `as?`, `on?`, `waitUntil?`, `dialog?` | Navigate; `as` keeps the page under a name, `on` reuses a named one. |
+| `browser_snapshot` | `max?`, `on?` | List every visible actionable element with a ref, role, name, value, state, and an `href` for links. |
+| `browser_click` | `selector` \| `ref`, `on?`, `dialog?` | Click an element by ref, CSS, or `text=…`. |
+| `browser_type` | `selector` \| `ref`, `text`, `on?`, `dialog?` | Append text to a field. |
+| `browser_fill` | `selector` \| `ref`, `value`, `on?`, `dialog?` | Replace a field's value; a `<select>` picks the option whose value or visible label matches. |
+| `browser_upload` | `selector` \| `ref`, `files`, `on?`, `dialog?` | Attach files to a file input: paths this server can read, or inline `{name, text}` / `{name, base64}` when the bytes came from elsewhere. |
+| `browser_download` | `url`, `path?`, `timeoutMs?`, `on?` | Fetch a URL with the page's cookies — the `href` a snapshot shows — and save the bytes (default `~/.cache/browser-control/downloads`); returns the path. Chrome's own download event is not exposed on the extension transport, so this is a fetch, not a click. |
+| `browser_press` | `key`, `selector?` \| `ref?`, `on?`, `dialog?` | Press Enter/Escape/Tab/… on a target, or on the focused element. |
+| `browser_text` | `selector?` \| `ref?`, `on?` | Read visible text of the page or one element. |
+| `browser_evaluate` | `expression`, `on?`, `dialog?` | Evaluate a JavaScript expression in a page. |
 | `browser_screenshot` | `selector?`, `on?` | Capture a PNG of the viewport or one element. |
 | `browser_wait_for` | `selector`, `state?`, `timeoutMs?`, `on?` | Wait for a selector to reach a state. |
-| `browser_surfaces` | — | List the named pages with their URL and idle time, plus the scratch page's URL. |
+| `browser_surfaces` | — | List the named pages with their URL and idle time, the saved names this task can reopen, and the scratch page's URL. |
 | `browser_release` | — | Hand the whole browser back when your work is done: this session's tabs and the relay page go, `state` and jobs stay, and the next call attaches again. Refused while a named job is running. |
 | `browser_script` | `code`, `on?`, `as?`, `timeoutMs?` | **Run a whole flow in one call.** Async function body against this session: `page`, `surface(name)`, `release(name)`, `surfaces`, `handBack()`, `state`, `jobs`, `signal`, `log`, `guard`, `context`, `browser`, `capabilities`, `fixtures`, `controlPage`, `require`, `sleep`. Return JSON, or a Buffer for a PNG. |
 
-A tool that fails — no browser, no such selector, a page that threw — answers with `isError: true` and a sentence saying why. Only a protocol mistake (unknown tool, missing or mistyped argument, or `as` and `on` in the same call, which would name two different pages) is a JSON-RPC error. An `on` that names a page you never kept is a tool error listing the names that do exist:
+A tool that fails — no browser, no such selector, a page that threw — answers with `isError: true` and a sentence saying why. Only a protocol mistake (unknown tool, missing or mistyped argument, or `as` and `on` in the same call, which would name two different pages) is a JSON-RPC error. An `on` that names a page this task has never seen is a tool error listing the names that do exist; a name that is only *saved* (not currently bound) is reopened at its last URL instead:
 
 ```text
 browser_text failed: no page is named "a"; these are: b, c, d
 ```
 
+A browser dialog is answered, never silently swallowed: the default is **dismiss** — a confirm that would delete or pay is not accepted on the agent's behalf — and the answer is appended to that call's result. When the action *should* proceed, the same acting call passes `dialog: "accept"`: `browser_click { selector: "#delete", dialog: "accept" }`. The listener exists only for that call.
+
 ## What it leaves on your machine
 
-This server itself writes nothing. The only files exist if you installed the resident shim: `~/Library/LaunchAgents/com.browser-control.shim.plist` and two truncated logs in `~/.cache/browser-control/`. `node scripts/install-shim-service.mjs --status` lists them with sizes, `--uninstall` removes all of them; your `~/.config/browser-control/token` is read and never touched. Nothing is written into the Chrome profile.
+The task record is what this server writes on its own: `~/.cache/browser-control/tasks/<client>/task.json` plus `journal.ndjson` (a reset keeps the old one as `journal-<time>.ndjson`). It holds the intent, the next step, `state`, the saved page URLs and the last-known jobs, and nothing is read from the Chrome profile. `BC_TASK_DIR` moves it, `BC_TASK_ID` separates two agents that share a working directory, and `BC_MCP_TASK=0` turns it off — `state` then lives only as long as the process. `browser_download` saves into `~/.cache/browser-control/downloads` unless the call names a path; `BC_DOWNLOAD_DIR` moves that too.
+
+If you installed the resident shim, its plist and two truncated logs live alongside. `node scripts/install-shim-service.mjs --status` lists the whole footprint with sizes and `--uninstall` removes the shim and its logs; the task directory, saved downloads and your `~/.config/browser-control/token` are named there but never deleted, because they are your work rather than an install artifact.
 
 ## Why `browser_script` exists
 
@@ -156,6 +167,13 @@ Newline-delimited JSON-RPC 2.0 on stdin/stdout; **stdout carries protocol bytes 
 | `BC_MCP_WAIT_MS` | `20000` | Default `browser_wait_for` timeout |
 | `BC_MCP_SCRIPT_MS` | `120000` | Default ceiling for a `browser_script` body; the cap aborts the body's `signal` |
 | `BC_MCP_JOB_LOG` | `200` | Log lines a named job keeps |
+| `BC_TASK_DIR` | `~/.cache/browser-control/tasks` | Where the durable task files live (under `BC_SHIM_LOG_DIR` when that is set) |
+| `BC_TASK_ID` | the client name | Gives a task its own directory when two agents share a working directory |
+| `BC_DOWNLOAD_DIR` | `~/.cache/browser-control/downloads` | Where `browser_download` saves a file when the call names no path |
+| `BC_MCP_DOWNLOAD_MAX` | `67108864` | Largest response `browser_download` will carry into memory; bigger fails with the limit named |
+| `BC_MCP_TASK` | `1` | `0` disables persistence: no task file, `state` lives only in memory, `browser_task` reports the switch |
+| `BC_MCP_TASK_STATE_MAX` | `262144` | Largest `state` (bytes) that is written; a bigger one keeps the previous copy and says so |
+| `BC_MCP_TASK_JOURNAL` | `500` | Journal lines kept; the oldest are dropped past this |
 | `BC_MCP_EXIT_GRACE_MS` | `250` | After the client goes: exit even if a script body left a timer behind (`0` waits for it) |
 | `BC_MCP_QUIET` | — | `1` silences stderr diagnostics |
 
@@ -164,9 +182,11 @@ Everything `browser-control` reads (`BC_MODE`, `BC_CDP_URL`, `BC_TAB_IDLE_MS`, �
 ## Test
 
 ```bash
-node --test packages/mcp-server/test/protocol.test.mjs   # 43 cases, no browser needed
+node --test packages/mcp-server/test/task.test.mjs packages/mcp-server/test/protocol.test.mjs   # 71 cases, no browser needed
 ```
 
-The suite speaks real stdio to the real binary: version negotiation, the version a client is told matching the manifest, the exact twelve tools, no tool name or argument that could be a tab handle, the deleted tab tools answering "unknown tool", notifications answered with silence, two messages in one chunk, one message split across two, `-32601`/`-32700`/`-32602` (including `as` with `on`, an inherited property name, and a fractional integer), a browser tool degrading to `isError`, `browser_release` answering without attaching, stdout handed back when the transport stops, and every stdout line parsing as JSON. Three cases call `callTool` directly, where a page's own `{content:[…]}` must come back as data and an eviction notice must survive every tool. Five pin script lifetime: a timed-out body and a disconnected one both stop sleeping instead of running on, a named job survives the call that started it and dies with the session, a body can hand the browser back at the end of its flow, and a server whose client is gone exits even while a timer the body created is still ticking. Eight pin the browser lifecycle: a default-off server never hands a quiet browser back, `browser_release` keeps `state` and reattaches, a running call and a running job both refuse it, and the opt-in timer never takes a browser out from under either.
+The suite speaks real stdio to the real binary: version negotiation, the version a client is told matching the manifest, the exact seventeen tools, no tool name or argument that could be a tab handle, the deleted tab tools answering "unknown tool", notifications answered with silence, two messages in one chunk, one message split across two, `-32601`/`-32700`/`-32602` (including `as` with `on`, an inherited property name, and a fractional integer), a browser tool degrading to `isError`, `browser_release` answering without attaching, stdout handed back when the transport stops, and every stdout line parsing as JSON. Three cases call `callTool` directly, where a page's own `{content:[…]}` must come back as data and an eviction notice must survive every tool. Two pin ordering: two calls on one page run in the order they arrived, while a call on another page does not wait behind them. Two pin dialogs: an unhandled confirm is dismissed and reported on that call's result, and `dialog:"accept"` installs the listener only for that call. Three cover the file tools: upload entries become `{name, buffer}` (paths, inline text and base64), a fetched attachment lands at the path the call named with its size and `Content-Disposition` filename, and a call without a URL is refused. Five pin script lifetime: a timed-out body and a disconnected one both stop sleeping instead of running on, a named job survives the call that started it and dies with the session, a body can hand the browser back at the end of its flow, and a server whose client is gone exits even while a timer the body created is still ticking. Eight pin the browser lifecycle: a default-off server never hands a quiet browser back, `browser_release` keeps `state` and reattaches, a running call and a running job both refuse it, and the opt-in timer never takes a browser out from under either.
+
+Fourteen more pin the task file — state and journal across a restart, reset clearing the object a script holds, an interrupted job never restarting, an oversized or unreadable record keeping the last copy, saved pages surviving their tabs, and `BC_MCP_TASK=0` writing nothing — and the protocol suite adds the tool's round trip, a saved name reopening at its URL, a failed reopen leaving the name free for a retry, `browser_status` naming what the operator must do, and the resume note in `initialize`.
 
 MIT — see [LICENSE](../../LICENSE).

@@ -61,10 +61,10 @@ npm i && node scripts/install-hooks.mjs   # Node >= 22. Not Bun: its WebSocket c
 # one-time: install the Playwright Extension, store the token from its status page
 mkdir -p ~/.config/browser-control && pbpaste > ~/.config/browser-control/token && chmod 600 $_
 
-npm run test:offline   # tab governance, focus, websocket codec, shim, MCP protocol — 183 cases, no browser needed
-npm run test:unit      # DOM input, 21 cases   (needs Chrome + token)
+npm run test:offline   # tab governance, focus, websocket codec, shim, MCP task + protocol — 213 cases, no browser needed
+npm run test:unit      # DOM input, 23 cases   (needs Chrome + token)
 npm run test:pool      # parallel pool, 8 cases (needs Chrome + token)
-npm test               # all eleven suites, --test-concurrency=1
+npm test               # all twelve suites, --test-concurrency=1
 npm run selftest       # end-to-end smoke; writes ./selftest.png
 npm run cleanup        # closes the tabs this tool left behind (--dry-run reports only)
 npm run shim           # /json/* rebuild + CDP proxy; only for BC_MODE=cdp
@@ -239,7 +239,9 @@ decides whether a tab is opened). What is left is intent: a name. At the transpo
 ceiling, when every tab is a bound surface, the least-recently-used one is released and
 its tab reused, and the tool says which name was lost — reported, not refused.
 
-Twelve tools, one terse line each: `browser_status`, `browser_navigate` (`{url, as?, waitUntil?}`), `browser_click`, `browser_type`, `browser_fill`, `browser_text`, `browser_evaluate`, `browser_screenshot`, `browser_wait_for` (each taking an optional `on`), `browser_surfaces` — which lists the named surfaces for humans and agents alike — `browser_release` — which hands the browser back when the work is done — and `browser_script`. An `on` naming a surface that does not exist is a tool error listing the names that do. See [`packages/mcp-server/README.md`](packages/mcp-server/README.md).
+Seventeen tools, one terse line each: `browser_status`, `browser_task` — the durable record: intent, next step, a journal, `state`, with the last-known jobs — `browser_navigate` (`{url, as?, waitUntil?}`), `browser_snapshot` — every visible actionable element with a ref, role, name, state, and a link's `href` — `browser_click`, `browser_type`, `browser_fill`, `browser_upload` — attach local files to an input — `browser_download` — fetch a URL with the page's cookies and save it — `browser_press`, `browser_text`, `browser_evaluate`, `browser_screenshot`, `browser_wait_for`, `browser_surfaces` — which lists the named surfaces for humans and agents alike — `browser_release` — which hands the browser back when the work is done — and `browser_script`. The acting tools (`browser_click` / `type` / `fill` / `upload` / `press` / `text`) take a `ref` from the snapshot, a CSS selector, or `text=…`; each also takes an optional `on`. An `on` that was never bound and never saved is a tool error listing the names that do; a saved name is reopened at its last URL. Calls that name the same page run in order; different pages run in parallel. A browser dialog is dismissed by default and reported on the result; pass `dialog:"accept"` on the acting call that opens it to proceed. See [`packages/mcp-server/README.md`](packages/mcp-server/README.md).
+
+**A task survives the process.** `browser_task` writes the intent, the next step, a journal and `state` to `~/.cache/browser-control/tasks/<client>/`, and every named page keeps its last URL. Restart the MCP server, quit and reopen Chrome, hand the work to a different agent tomorrow: the server's first message already carries a one-line resume note — intent, next step, saved pages, interrupted jobs — `browser_task` has the journal, `on` reopens the page, and `state` is already loaded. One thing deliberately does not come back — a job that was running when the process ended is reported interrupted, because restarting a loop that may have clicked "pay" could do it twice.
 
 **Many agents, many projects.** On the extension transport each MCP server names its
 Chrome tab group from `BC_CLIENT_NAME`, falling back to the directory it was started in,
